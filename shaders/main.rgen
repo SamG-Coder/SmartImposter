@@ -114,7 +114,7 @@ void main() {
             // always faces the half vector, so the sun's reflection is a Fresnel sheen of the
             // view/sun geometry, not of the averaged hull normal (a lobe on that normal either
             // vanishes or lights every texel at once: frosty trees). Calibrated against the real
-            // leaves with debug view 7: front-lit within 3-10%, back-lit within ~0.7-1.2x per
+            // leaves with debug view 9: front-lit within 3-10%, back-lit within ~0.7-1.2x per
             // species (leaf orientation differs: alder leaves face up, beech droop).
             const float IMP_SHEEN = 1.05;
             vec3 V = -dir;
@@ -166,11 +166,11 @@ void main() {
             col = vec3(ao);
         } else if (dbg == 5u) {
             col = vec3(sh);
-        } else if (dbg == 6u) {
-            col = transTerm; // leaf transmission only
-        } else if (dbg == 7u) {
-            col = specTerm * 16.0; // specular only (x16 for measurement)
         } else if (dbg == 8u) {
+            col = transTerm; // leaf transmission only
+        } else if (dbg == 9u) {
+            col = specTerm * 16.0; // specular only (x16 for measurement)
+        } else if (dbg == 10u) {
             col = alb / PI * E * max(ndl, 0.0) * sh + alb * amb * ao; // diffuse only
         }
     }
