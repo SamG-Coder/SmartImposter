@@ -1,0 +1,17 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt.glsl"
+
+// Any-hit for mesh instances of trees inside the mesh <-> impostor band only (every other mesh
+// instance is FORCE_OPAQUE and never runs this). The tree's twigs are kept with probability
+// meshFade; otherwise the impostor copy of the same tree answers the ray.
+hitAttributeEXT vec2 bary;
+
+layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
+
+void main() {
+    InstInfo ii = insts[gl_InstanceID];
+    float f = meshFade(g, distance(g.camPos.xyz, ii.center));
+    if (lodRand(g, ii.data & 0xFFFFFFu, 1u) >= f) ignoreIntersectionEXT;
+}

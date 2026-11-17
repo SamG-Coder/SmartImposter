@@ -1,0 +1,29 @@
+[package]
+name = "smart_imposter"
+version = "0.1.0"
+edition = "2021"
+description = "Hardware ray-traced forest renderer with parallax octahedral impostors"
+license = "MIT"
+repository = "https://github.com/SamG-Coder/SmartImposter"
+readme = "README.md"
+keywords = ["vulkan", "ray-tracing", "impostor", "foliage", "rendering"]
+
+[dependencies]
+ash = "0.38"
+ash-window = "0.13"
+winit = "0.30"
+raw-window-handle = "0.6"
+glam = { version = "0.29", features = ["bytemuck"] }
+bytemuck = { version = "1", features = ["derive", "extern_crate_alloc"] }
+gpu-allocator = { version = "0.27", default-features = false, features = ["vulkan"] }
+anyhow = "1"
+png = "0.17"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+debug = 1

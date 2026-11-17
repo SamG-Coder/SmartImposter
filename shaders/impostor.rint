@@ -1,0 +1,252 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt.glsl"
+
+// Parallax octahedral impostor, evaluated as procedural geometry by the RT hardware.
+//
+// Every far tree is a single AABB in the TLAS. The RT cores do the traversal; this shader runs
+// only for AABBs the ray actually touches and ray-marches the baked depth of the nearest
+// hemi-octahedral frames (a height field per frame, i.e. parallax occlusion mapping in the
+// frame's orthographic space). Primary rays blend 3 frames; shadow rays march the single frame
+// that faces the sun, which is effectively a per-tree shadow map.
+
+layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
+layout(set = 0, binding = 7) uniform sampler2D ndAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 6) uniform sampler2D albedoAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 11) uniform sampler2D visAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
+
+hitAttributeEXT ImpHit hit;
+
+struct Ctx {
+    uint vid;
+    vec3 c;
+    float R;
+    float N;
+    float res;
+    float lod;
+    float marchLod;
+    float thr;
+};
+
+vec2 atlasUV(Ctx m, vec2 cell, vec2 uv) {
+    float pad = exp2(m.lod) * 0.5 / m.res;
+    return (cell + clamp(uv, vec2(pad), vec2(1.0 - pad))) / m.N;
+}
+
+bool inFrame(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0))); }
+
+// Height-field test in frame space: is the point at or behind the first surface seen from the frame?
+// thick > 0 limits the solid to a shell behind the surface (foliage clumps are not infinitely deep),
+// which stops rays seen from below from hitting the extruded underside of protruding clumps.
+// Geometric test only (any foliage in this column): the stochastic coverage decision is made once
+// per surface crossing in marchFrame, not at every step. Testing coverage at every step gave a ray
+// many chances to be blocked (effective coverage = max along the path): impostor crowns came out
+// denser than the real tree and their shadows solid instead of dappled.
+bool solid(Ctx m, vec2 cell, vec3 s, float bias, float thick) {
+    if (!inFrame(s.xy)) return false;
+    // March fetches use a single mip (m.marchLod, rounded): half the texel reads of trilinear.
+    vec2 dz = textureLod(ndAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, s.xy), m.marchLod).zw;
+    return dz.y > 0.02 && s.z <= dz.x - bias && (thick <= 0.0 || s.z >= dz.x - thick);
+}
+float coverageAt(Ctx m, vec2 cell, vec2 uv) {
+    if (!inFrame(uv)) return 0.0;
+    return textureLod(ndAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, uv), m.marchLod).w;
+}
+
+// March the ray o + d*t, t in [t0, t1], against frame `cell`.
+// frontOnly: only a free -> solid transition counts as a hit. A ray that enters the box already
+// behind the baked surface (side entry) would otherwise hit the extruded "walls" of the height
+// field, which shows up as stretched trunks and streaks. Shadow rays use frontOnly = false:
+// being inside the frame's solid region is exactly "occluded from the light".
+// layered (shadow rays): after passing a foliage layer, keep marching through the crown volume and
+// re-test coverage every LAYER of depth with a fresh random number (a crown has many leaf layers
+// along the light path; Beer-Lambert-like transmittance).
+bool marchFrame(Ctx m, vec2 cell, vec3 o, vec3 d, float t0, float t1, int steps, float bias, bool frontOnly,
+                bool layered, out float tHit, out vec2 uvHit) {
+    vec3 f = frameDir(cell, m.N);
+    vec3 r, u;
+    frameBasis(f, r, u);
+    float s = 0.5 / m.R;
+    vec3 q0 = o - m.c;
+    // Frame-space coordinates are linear in t: S(t) = A + B t  (uv in [0,1], height in [-1,1]).
+    vec3 A = vec3(dot(q0, r) * s + 0.5, dot(q0, u) * s + 0.5, dot(q0, f) / m.R);
+    vec3 B = vec3(dot(d, r) * s, dot(d, u) * s, dot(d, f) / m.R);
+
+    // Primary rays: solid shell of SHELL (in units of R) behind the surface, and enough steps that
+    // one step never moves more than 80% of the shell in depth (binary refinement fixes the rest).
+    const float SHELL = 0.12;
+    const float LAYER = 0.12; // depth between leaf layers along a shadow ray (units of R)
+    float thick = (frontOnly && !layered) ? SHELL : 0.0;
+    if (frontOnly) {
+        float depthSpan = abs(B.z) * (t1 - t0);
+        steps = clamp(int(ceil(depthSpan / (0.8 * SHELL))), 6, steps);
+    }
+
+    float dt = (t1 - t0) / float(steps);
+    float tPrev = t0;
+    bool inside = false;
+    float thr = m.thr;
+    float nextLayerZ = -1e9; // layered: frame depth at which the next leaf layer is tested
+    for (int i = 0; i <= steps; ++i) {
+        float t = t0 + dt * float(i);
+        vec3 S = A + B * t;
+        bool s = solid(m, cell, S, bias, thick);
+        if (layered && inside && s && S.z <= nextLayerZ) {
+            // Another leaf layer deeper in the crown: independent coverage test.
+            thr = fract(thr + 0.6180339887);
+            if (coverageAt(m, cell, S.xy) > thr) {
+                tHit = t;
+                uvHit = S.xy;
+                return true;
+            }
+            nextLayerZ = S.z - LAYER;
+            continue;
+        }
+        if (frontOnly && (inside || i == 0)) {
+            inside = s;
+            if (layered && s && i == 0) nextLayerZ = S.z - LAYER;
+            tPrev = t;
+            continue;
+        }
+        if (s) {
+            float lo = tPrev, hi = t;
+            if (i > 0) {
+                for (int k = 0; k < 6; ++k) {
+                    float mid = 0.5 * (lo + hi);
+                    if (solid(m, cell, A + B * mid, bias, thick)) hi = mid; else lo = mid;
+                }
+            }
+            // One stochastic decision at the crossing: blocked with probability = coverage.
+            vec3 Sc = A + B * hi;
+            if (coverageAt(m, cell, Sc.xy) > thr) {
+                tHit = hi;
+                uvHit = Sc.xy;
+                return true;
+            }
+            // Passed through this layer of foliage. Primary rays: behind this surface now; only a
+            // later re-entry can hit. Layered shadow rays: test the next layer deeper in.
+            if (!frontOnly) return false;
+            inside = true;
+            nextLayerZ = Sc.z - LAYER;
+        }
+        tPrev = t;
+    }
+    return false;
+}
+
+// One of the three hemi-octahedral frames around direction v (pointing from the tree towards the
+// viewer), chosen with probability = its sharpened barycentric weight (the nearest view dominates,
+// blending only near view boundaries).
+vec2 pickFrame(Ctx m, vec3 v, float xi) {
+    vec2 gp = hemiOctEncode(v) * (m.N - 1.0);
+    vec2 base = min(floor(gp), vec2(m.N - 2.0));
+    vec2 fr = gp - base;
+    vec2 cells[3];
+    vec3 w;
+    if (fr.x + fr.y < 1.0) {
+        cells[0] = base; cells[1] = base + vec2(1, 0); cells[2] = base + vec2(0, 1);
+        w = vec3(1.0 - fr.x - fr.y, fr.x, fr.y);
+    } else {
+        cells[0] = base + vec2(1, 1); cells[1] = base + vec2(1, 0); cells[2] = base + vec2(0, 1);
+        w = vec3(fr.x + fr.y - 1.0, 1.0 - fr.y, 1.0 - fr.x);
+    }
+    w = w * w;
+    w = w * w;
+    w /= (w.x + w.y + w.z);
+    return cells[xi < w.x ? 0 : (xi < w.x + w.y ? 1 : 2)];
+}
+
+void main() {
+    // ---- LOD selection for this (pixel, tree): dissolve against the mesh copy, then pick the tier.
+    InstInfo ii = insts[gl_InstanceID];
+    uint tree = ii.data & 0xFFFFFFu;
+    float dTree = distance(g.camPos.xyz, ii.center);
+    if ((ii.data & 0x1000000u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree)) return; // mesh copy wins
+    uint tier = lodRand(g, tree, 2u) < hiFade(g, dTree) ? 1u : 0u;
+    uint vid = (gl_InstanceCustomIndexEXT & 0xFFu) + tier * uint(g.lodParams.w); // atlas slot
+    ImpostorInfo info = imps[vid];
+
+    vec3 o = gl_ObjectRayOriginEXT;
+    vec3 d = gl_ObjectRayDirectionEXT; // not normalised: t stays identical to world-space t
+
+    vec3 inv = 1.0 / d;
+    vec3 ta = (info.bmin.xyz - o) * inv, tb = (info.bmax.xyz - o) * inv;
+    vec3 tmn = min(ta, tb), tmx = max(ta, tb);
+    float boxExit = min(min(tmx.x, tmx.y), tmx.z);
+    float t0 = max(max(max(tmn.x, tmn.y), tmn.z), gl_RayTminEXT);
+    float t1 = min(boxExit, gl_RayTmaxEXT);
+    if (t0 >= t1) return;
+
+    Ctx m;
+    m.vid = vid;
+    m.c = info.centerRadius.xyz;
+    m.R = info.centerRadius.w;
+    m.N = float(info.grid);
+    m.res = float(info.res);
+
+    // Mip selection from the ray footprint at the entry point (ray cone from the camera).
+    vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * t0;
+    float dist = length(wp - g.camPos.xyz);
+    float worldScale = length(gl_ObjectToWorldEXT[0]);
+    float texel = 2.0 * m.R * worldScale / m.res;
+    float footprint = dist * g.camFwd.w;
+    // -0.75 mip bias: sharper than the footprint suggests; the extra aliasing is resolved by TAA.
+    float lodExact = log2(max(footprint / texel, 1e-6));
+    m.lod = clamp(lodExact - 0.75, 0.0, float(info.mips - 1u));
+    m.marchLod = floor(m.lod + 0.5);
+    // Stochastic coverage: one random threshold per (pixel, frame, tree). Partially covered
+    // texels (foliage gaps averaged into mips) are solid with probability = coverage, which
+    // reproduces the see-through and light leakage of the real leaves once frames accumulate.
+    uint seed = hash2(gl_LaunchIDEXT.xy) ^ pcg(g.iparams.z * 7919u + uint(gl_InstanceID) * 104729u);
+    m.thr = mix(0.03, 0.97, rnd(seed));
+
+    vec3 dn = normalize(d);
+    bool shadowRay = (gl_IncomingRayFlagsEXT & gl_RayFlagsTerminateOnFirstHitEXT) != 0u;
+
+    if (shadowRay) {
+        // Occlusion only: march the frame looking down the ray direction (towards the light),
+        // from the far end back to the origin. Any solid sample means the segment is blocked.
+        // "Inside the frame's solid region" means occluded only when the segment leaves the box
+        // towards the light (sun shadows). A short segment that ends inside the box (AO rays)
+        // must actually cross the baked surface.
+        // The segment is marched from the light's side like a camera ray from the sun: the same
+        // stochastic choice among the 3 views around the light direction and the same foliage-shell
+        // crossing test. Light gets through gaps layer by layer as with the real leaves, and the
+        // projection error of any single view is averaged out (a single "nearest view" shadow
+        // volume smeared into long streaks on the ground).
+        vec2 cellS = pickFrame(m, dn, lodRand(g, tree, 4u));
+        // Crisper, dappled shadows: one mip finer than the receiver footprint.
+        m.lod = clamp(lodExact - 1.0, 0.0, float(info.mips - 1u));
+        m.marchLod = floor(m.lod + 0.5);
+        float th;
+        vec2 uvh;
+        if (marchFrame(m, cellS, o, -d, -t1, -t0, 40, 0.0, true, true, th, uvh)) {
+            hit.albedoAo = 0u;
+            hit.normal = 0u;
+            hit.vis = 0u;
+            reportIntersectionEXT(clamp(-th, t0, t1), tier);
+        }
+        return;
+    }
+
+    // Stochastic view selection: march ONE of the frames around the view direction (per pixel,
+    // frame and tree). Each sample is a crisp, single-view image of the tree; TAA averages the
+    // choices over time. Blending three views per sample instead mixes slightly misaligned images:
+    // ghosting and a smeared, painterly look. (Also 3x cheaper.)
+    vec2 cell = pickFrame(m, -dn, lodRand(g, tree, 3u));
+
+    float th;
+    vec2 uvh;
+    if (!marchFrame(m, cell, o, d, t0, t1, 40, 0.0, true, false, th, uvh)) return;
+    vec2 auv = atlasUV(m, cell, uvh);
+    vec4 a = textureLod(albedoAtlas[nonuniformEXT(vid)], auv, m.lod);
+    vec4 nd = textureLod(ndAtlas[nonuniformEXT(vid)], auv, m.lod);
+    vec4 vs = textureLod(visAtlas[nonuniformEXT(vid)], auv, m.lod);
+
+    hit.albedoAo = packUnorm4x8(a);
+    hit.normal = packSnorm2x16(octEncode(octDecode(nd.xy)));
+    hit.vis = packUnorm4x8(vs);
+    reportIntersectionEXT(th, tier); // hit kind carries the tier to the closest-hit shader
+}

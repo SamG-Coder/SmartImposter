@@ -1,0 +1,156 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt.glsl"
+
+layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
+layout(set = 0, binding = 1, r32f) uniform writeonly image2D depthImg;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D curImg;
+layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+
+layout(location = 0) rayPayloadEXT HitPayload pl;
+layout(location = 1) rayPayloadEXT uint vis;
+
+vec3 sunColor() { return vec3(1.0, 0.92, 0.80) * g.sunDir.w; }
+
+float cloudFbm(vec2 p) {
+    float s = 0.0, a = 0.5;
+    for (int i = 0; i < 5; ++i) {
+        s += a * vnoise(p);
+        p = p * 2.07 + vec2(13.1, 7.7);
+        a *= 0.5;
+    }
+    return s;
+}
+
+vec3 skyColor(vec3 d) {
+    vec3 L = g.sunDir.xyz;
+    float y = clamp(d.y, -1.0, 1.0);
+    vec3 zenith = vec3(0.045, 0.14, 0.46);
+    vec3 horizon = vec3(0.40, 0.56, 0.80);
+    vec3 c = mix(horizon, zenith, pow(max(y, 0.0), 0.5));
+    if (y < 0.0) c = mix(horizon, vec3(0.22, 0.24, 0.22), clamp(-y * 4.0, 0.0, 1.0));
+    float s = max(dot(d, L), 0.0);
+    c += vec3(1.0, 0.85, 0.62) * (0.15 * pow(s, 6.0) + 0.45 * pow(s, 64.0));
+
+    // Fair-weather cumulus on a flat cloud layer (static so still frames can accumulate).
+    if (y > 0.0) {
+        vec2 uv = d.xz / (y + 0.06) * 0.55;
+        float n = cloudFbm(uv * 1.3);
+        float cover = smoothstep(0.52, 0.72, n) * smoothstep(0.0, 0.12, y);
+        float shade = clamp((cloudFbm(uv * 1.3 + L.xz * 0.06) - n) * 4.0 + 0.6, 0.0, 1.0); // lit side towards the sun
+        vec3 cloud = mix(vec3(0.55, 0.60, 0.68), vec3(1.25, 1.22, 1.15), shade);
+        c = mix(c, cloud, cover * 0.95);
+    }
+    return c;
+}
+
+float traceShadow(vec3 o, vec3 d, float tmax, uint mask) {
+    vis = 0u;
+    traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
+                mask, 0, 0, 1, o, 0.0, d, tmax, 1);
+    return float(vis);
+}
+
+void main() {
+    uvec2 px = gl_LaunchIDEXT.xy;
+    uvec2 size = gl_LaunchSizeEXT.xy;
+    uint accumN = g.iparams.x;
+    uint dbg = g.iparams.y;
+    uint rng = hash2(px) ^ pcg(g.iparams.z * 9781u + 17u);
+
+    // Moving: one Halton sub-pixel offset per frame for TAA. Still: random per pixel for accumulation.
+    vec2 jitter = accumN > 0u ? vec2(rnd(rng), rnd(rng)) : taaJitter(g.iparams.z);
+    vec2 ndc = (vec2(px) + jitter) / vec2(size) * 2.0 - 1.0;
+    vec3 dir = normalize(g.camFwd.xyz + g.camRight.xyz * (ndc.x * g.camRight.w) - g.camUp.xyz * (ndc.y * g.camUp.w));
+    vec3 org = g.camPos.xyz;
+
+    pl.t = -1.0;
+    pl.sunVis = 1.0;
+    pl.shadowMask = 0xFFu;
+    pl.trans = 0.0;
+    traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org, 0.02, dir, 1.0e5, 0);
+
+    vec3 L = g.sunDir.xyz;
+    vec3 col;
+    if (pl.t < 0.0) {
+        col = skyColor(dir);
+        if (dot(dir, L) > 0.99995) col += vec3(60.0, 52.0, 40.0);
+        if (dbg != 0u) col = vec3(0.35, 0.45, 0.6);
+    } else {
+        vec3 p = org + dir * pl.t;
+        vec3 n = pl.n, ng = pl.ng;
+        if (dot(ng, dir) > 0.0) ng = -ng;
+        if (dot(n, dir) > 0.0) n = -n;
+        bool imp = (pl.flags & FLAG_IMPOSTOR) != 0u;
+        uint mat = pl.flags & 0xFFu;
+        bool leaf = mat == MAT_LEAF;
+        vec3 alb = pl.albedo;
+        float ao = pl.ao;
+        float ndl = dot(n, L);
+
+        // Offset the shadow origin to the side of the surface the light is on (back-lit leaves must
+        // not hit themselves). Impostor hits exclude their own tree from the shadow ray via the
+        // instance mask; their self-shadowing comes from the baked directional visibility.
+        float side = dot(ng, L) >= 0.0 ? 1.0 : -1.0;
+        vec3 so = imp ? p + L * (0.05 + pl.t * 2e-4) : p + ng * side * (0.003 + pl.t * 1.5e-4);
+        float sh = (ndl > 0.0 || leaf) ? traceShadow(so, L, 1.0e4, pl.shadowMask) * pl.sunVis : 0.0;
+
+        vec3 E = sunColor();
+        vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
+        // Leaf transmission: the foliage texture's translucency map times Unreal's "Translucency Tint"
+        // (veins and thick spots transmit less), so back-lit leaves glow with visible veins.
+        if (leaf) direct += vec3(0.2126, 0.2698, 0.1214) * pl.trans * 2.0 / PI * E * max(-ndl, 0.0) * sh;
+        // Waxy leaf tops: GGX specular sun highlight (F0 0.04). An impostor normal is the average of
+        // many randomly oriented leaves, so its aggregate highlight is a very broad, weak lobe; a
+        // sharp lobe on the averaged normal lights every texel at once when the sun is behind the
+        // viewer (frosty white trees).
+        if ((pl.flags & FLAG_GLOSSY) != 0u && ndl > 0.0) {
+            float rough = imp ? 0.95 : 0.35;
+            vec3 V = -dir;
+            vec3 H = normalize(L + V);
+            float NdH = max(dot(n, H), 0.0), NdV = max(dot(n, V), 1e-3);
+            float a = rough * rough, a2 = a * a;
+            float dd = NdH * NdH * (a2 - 1.0) + 1.0;
+            float D = a2 / (PI * dd * dd);
+            float F = 0.04 + 0.96 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+            float k = a * 0.5;
+            float G = ndl / (ndl * (1.0 - k) + k) * NdV / (NdV * (1.0 - k) + k);
+            direct += E * (D * F * G / (4.0 * NdV)) * sh; // (... / (4 NdV NdL)) * NdL
+        }
+
+        // Ambient occlusion. Ground hits use long rays (30 m): the canopy overhead blocks most of
+        // the sky, so the forest floor under the crowns goes properly dark, not just the 4 m around
+        // trunks. Range scaled with distance keeps far terrain cheap.
+        bool terrain = mat == MAT_TERRAIN;
+        float aoRange = terrain ? 30.0 : g.params.w;
+        if (!imp && g.iparams.w > 0u && pl.t < (terrain ? 600.0 : 150.0)) {
+            float occ = 0.0;
+            for (uint i = 0u; i < g.iparams.w; ++i) {
+                vec3 d2 = cosineSample(n, rng);
+                occ += 1.0 - traceShadow(p + ng * 0.01, d2, aoRange, 0xFFu);
+            }
+            ao *= 1.0 - occ / float(g.iparams.w);
+        }
+        // Sky fill is kept well below the sun so shaded crowns go properly dark.
+        vec3 skyUp = vec3(0.13, 0.20, 0.36), ground = vec3(0.05, 0.06, 0.035);
+        vec3 amb = mix(ground, skyUp, n.y * 0.5 + 0.5);
+        col = direct + alb * amb * ao;
+
+        if (dbg == 1u) {
+            vec3 c = imp ? ((pl.flags & FLAG_IMPOSTOR_HI) != 0u ? vec3(1.0, 0.62, 0.12) : vec3(0.95, 0.22, 0.20)) : (mat == MAT_TERRAIN ? vec3(0.45) : vec3(0.25, 0.85, 0.35));
+            col = c * (0.35 + 0.65 * max(ndl, 0.0) * sh);
+        } else if (dbg == 2u) {
+            col = n * 0.5 + 0.5;
+        } else if (dbg == 3u) {
+            col = sqrt(alb) * 1.4;
+        } else if (dbg == 4u) {
+            col = vec3(ao);
+        } else if (dbg == 5u) {
+            col = vec3(sh);
+        }
+    }
+
+    // This frame's sample and hit distance; taa.comp blends it into the history.
+    imageStore(curImg, ivec2(px), vec4(col, 1.0));
+    imageStore(depthImg, ivec2(px), vec4(pl.t < 0.0 ? 1.0e6 : pl.t));
+}

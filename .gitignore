@@ -1,0 +1,16 @@
+# build output
+/target
+/target-*
+
+# Python tooling environment
+/tools/.venv
+__pycache__/
+
+# Third-party assets (Quixel Megaplants / Fab) must not be redistributed:
+# converted trees and exported textures stay local.
+/assets/
+*.mtree
+*.usd
+
+# local renders and screenshots (README images live in docs/images)
+/shots/
