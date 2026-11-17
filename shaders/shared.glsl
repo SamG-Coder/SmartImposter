@@ -9,7 +9,10 @@
 #define FLAG_IMPOSTOR 256u
 #define FLAG_IMPOSTOR_HI 512u
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
-#define MAX_VARIANTS 16 // atlas slots: variants x impostor tiers
+#define MAX_VARIANTS 128 // atlas slots (one per plant variant)
+#define MAX_SPECIES 16
+#define MAX_GROUND_TEX 16 // 3 per ground layer; the last slot is the biome mask
+#define TERRAIN_SIZE 3072.0
 
 // ---------------------------------------------------------------- hashing / random
 uint pcg(uint v) {

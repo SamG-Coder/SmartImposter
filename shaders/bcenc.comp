@@ -1,0 +1,105 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#include "shared.glsl"
+
+// GPU block compression of the baked impostor atlases (one thread per 4x4 block).
+// mode 0: albedo+AO   rgba8 (sqrt albedo, ao)       -> BC3 (colour block + alpha block)
+// mode 1: normal      rgba16f xy (oct, [-1,1])      -> BC5 (x*0.5+0.5, y*0.5+0.5)
+// mode 2: depth+cov   rgba16f zw (depth [-1,1], cov) -> BC5 (depth*0.5+0.5, coverage)
+// mode 3: visibility  rgba8 (a, b/3+0.5)            -> BC3 (rgb = b, a = a)
+// Texels with zero coverage are left out of the endpoint fit, so silhouette blocks keep their
+// precision (their values are never visible: coverage 0 means "no surface").
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform readonly image2D srcA;
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D srcB;
+layout(set = 0, binding = 2, rgba8) uniform readonly image2D srcC;
+layout(set = 0, binding = 3, std430) writeonly buffer Out { uvec4 blocks[]; };
+layout(push_constant) uniform PC { uint mode; uint blocksX; uint blocksY; uint offset; } pc;
+
+uvec2 bc4(float v[16], bool valid[16]) {
+    float mn = 1.0, mx = 0.0;
+    bool any = false;
+    for (int i = 0; i < 16; ++i) if (valid[i]) { mn = min(mn, v[i]); mx = max(mx, v[i]); any = true; }
+    if (!any) { mn = 0.0; mx = 0.0; }
+    uint e0 = uint(round(clamp(mx, 0.0, 1.0) * 255.0));
+    uint e1 = uint(round(clamp(mn, 0.0, 1.0) * 255.0));
+    if (e0 == e1) { if (e0 < 255u) e0++; else e1--; }
+    float f0 = float(e0) / 255.0, f1 = float(e1) / 255.0;
+    uint64_t bits = uint64_t(e0) | (uint64_t(e1) << 8);
+    for (int i = 0; i < 16; ++i) {
+        float t = clamp((v[i] - f1) / (f0 - f1), 0.0, 1.0) * 7.0;
+        uint p = uint(round(t));               // 0 = e1 .. 7 = e0
+        uint idx = p == 7u ? 0u : (p == 0u ? 1u : 8u - p);
+        bits |= uint64_t(idx) << (16 + 3 * i);
+    }
+    return uvec2(uint(bits), uint(bits >> 32));
+}
+
+uint pack565(vec3 c) {
+    uvec3 q = uvec3(round(clamp(c, 0.0, 1.0) * vec3(31.0, 63.0, 31.0)));
+    return (q.r << 11) | (q.g << 5) | q.b;
+}
+vec3 unpack565(uint p) { return vec3(float((p >> 11) & 31u) / 31.0, float((p >> 5) & 63u) / 63.0, float(p & 31u) / 31.0); }
+
+// BC1 colour block in 4-colour mode (inside BC3 the endpoint order does not select a mode).
+uvec2 bc1(vec3 c[16], bool valid[16]) {
+    vec3 mn = vec3(1.0), mx = vec3(0.0);
+    bool any = false;
+    for (int i = 0; i < 16; ++i) if (valid[i]) { mn = min(mn, c[i]); mx = max(mx, c[i]); any = true; }
+    if (!any) { mn = vec3(0.0); mx = vec3(0.0); }
+    vec3 inset = (mx - mn) / 16.0;
+    uint a = pack565(mx - inset), b = pack565(mn + inset);
+    vec3 p0 = unpack565(a), p1 = unpack565(b);
+    vec3 pal[4] = vec3[4](p0, p1, (2.0 * p0 + p1) / 3.0, (p0 + 2.0 * p1) / 3.0);
+    uint idx = 0u;
+    for (int i = 0; i < 16; ++i) {
+        uint best = 0u;
+        float bd = 1e9;
+        for (uint k = 0u; k < 4u; ++k) {
+            vec3 d = c[i] - pal[k];
+            float dd = dot(d, d);
+            if (dd < bd) { bd = dd; best = k; }
+        }
+        idx |= best << (2 * i);
+    }
+    return uvec2(a | (b << 16), idx);
+}
+
+void main() {
+    uvec2 blk = gl_GlobalInvocationID.xy;
+    if (blk.x >= pc.blocksX || blk.y >= pc.blocksY) return;
+    ivec2 base = ivec2(blk) * 4;
+    float ch0[16], ch1[16];
+    vec3 col[16];
+    bool valid[16];
+    for (int i = 0; i < 16; ++i) {
+        ivec2 p = base + ivec2(i & 3, i >> 2);
+        if (pc.mode == 0u) {
+            vec4 a = imageLoad(srcA, p);
+            float cov = imageLoad(srcB, p).w;
+            col[i] = a.rgb; ch0[i] = a.a; valid[i] = cov > 0.0;
+        } else if (pc.mode == 1u) {
+            vec4 b = imageLoad(srcB, p);
+            ch0[i] = b.x * 0.5 + 0.5; ch1[i] = b.y * 0.5 + 0.5; valid[i] = b.w > 0.0;
+        } else if (pc.mode == 2u) {
+            vec4 b = imageLoad(srcB, p);
+            ch0[i] = clamp(b.z * 0.5 + 0.5, 0.0, 1.0); ch1[i] = b.w; valid[i] = b.w > 0.0;
+        } else {
+            vec4 v = imageLoad(srcC, p);
+            col[i] = v.yzw; ch0[i] = v.x; valid[i] = true;
+        }
+    }
+    uvec4 o;
+    if (pc.mode == 1u || pc.mode == 2u) {
+        bool all16[16];
+        for (int i = 0; i < 16; ++i) all16[i] = true;
+        o.xy = bc4(ch0, valid);
+        // coverage (mode 2, channel 1) must keep its zeros: fit over all texels
+        o.zw = pc.mode == 2u ? bc4(ch1, all16) : bc4(ch1, valid);
+    } else {
+        o.xy = bc4(ch0, valid);
+        o.zw = bc1(col, valid);
+    }
+    blocks[pc.offset + blk.y * pc.blocksX + blk.x] = o;
+}

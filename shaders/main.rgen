@@ -1,4 +1,4 @@
-#version 460
+﻿#version 460
 #extension GL_GOOGLE_include_directive : require
 #include "rt.glsl"
 
@@ -67,7 +67,7 @@ void main() {
     pl.t = -1.0;
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;
-    pl.trans = 0.0;
+    pl.trans = vec3(0.0);
     traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org, 0.02, dir, 1.0e5, 0);
 
     vec3 L = g.sunDir.xyz;
@@ -99,13 +99,31 @@ void main() {
         vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
         // Leaf transmission: the foliage texture's translucency map times Unreal's "Translucency Tint"
         // (veins and thick spots transmit less), so back-lit leaves glow with visible veins.
-        if (leaf) direct += vec3(0.2126, 0.2698, 0.1214) * pl.trans * 2.0 / PI * E * max(-ndl, 0.0) * sh;
-        // Waxy leaf tops: GGX specular sun highlight (F0 0.04). An impostor normal is the average of
-        // many randomly oriented leaves, so its aggregate highlight is a very broad, weak lobe; a
-        // sharp lobe on the averaged normal lights every texel at once when the sun is behind the
-        // viewer (frosty white trees).
-        if ((pl.flags & FLAG_GLOSSY) != 0u && ndl > 0.0) {
-            float rough = imp ? 0.95 : 0.35;
+        // A mesh leaf transmits by its own orientation, so back-light spreads over many leaves at
+        // moderate strength. An impostor normal is the crown hull's: max(-ndl) would put the whole
+        // crown's transmission on the side facing away from the sun at full strength (hot spots
+        // that the tonemapper bleaches to yellow-white). Averaged over randomly oriented leaves
+        // the response is a broad lobe with the same total energy and half the peak.
+        float transW = imp ? 0.25 * (1.0 - ndl) : max(-ndl, 0.0);
+        vec3 transTerm = leaf ? pl.trans * 2.0 / PI * E * transW * sh : vec3(0.0);
+        direct += transTerm; // per-species transmission colour
+        vec3 specTerm = vec3(0.0);
+        // Waxy leaf tops: GGX specular sun highlight (F0 0.04).
+        if ((pl.flags & FLAG_GLOSSY) != 0u && imp) {
+            // An impostor texel stands for a crown of glossy leaves in all orientations: some leaf
+            // always faces the half vector, so the sun's reflection is a Fresnel sheen of the
+            // view/sun geometry, not of the averaged hull normal (a lobe on that normal either
+            // vanishes or lights every texel at once: frosty trees). Calibrated against the real
+            // leaves with debug view 7: front-lit within 3-10%, back-lit within ~0.7-1.2x per
+            // species (leaf orientation differs: alder leaves face up, beech droop).
+            const float IMP_SHEEN = 1.05;
+            vec3 V = -dir;
+            float VdH = max(dot(V, normalize(L + V)), 0.0);
+            float F = 0.04 + 0.96 * pow(1.0 - VdH, 5.0);
+            specTerm = E * (IMP_SHEEN * F / (8.0 * PI)) * sh;
+            direct += specTerm;
+        } else if ((pl.flags & FLAG_GLOSSY) != 0u && ndl > 0.0) {
+            float rough = 0.35;
             vec3 V = -dir;
             vec3 H = normalize(L + V);
             float NdH = max(dot(n, H), 0.0), NdV = max(dot(n, V), 1e-3);
@@ -115,7 +133,8 @@ void main() {
             float F = 0.04 + 0.96 * pow(1.0 - max(dot(H, V), 0.0), 5.0);
             float k = a * 0.5;
             float G = ndl / (ndl * (1.0 - k) + k) * NdV / (NdV * (1.0 - k) + k);
-            direct += E * (D * F * G / (4.0 * NdV)) * sh; // (... / (4 NdV NdL)) * NdL
+            specTerm = E * (D * F * G / (4.0 * NdV)) * sh; // (... / (4 NdV NdL)) * NdL
+            direct += specTerm;
         }
 
         // Ambient occlusion. Ground hits use long rays (30 m): the canopy overhead blocks most of
@@ -147,6 +166,12 @@ void main() {
             col = vec3(ao);
         } else if (dbg == 5u) {
             col = vec3(sh);
+        } else if (dbg == 6u) {
+            col = transTerm; // leaf transmission only
+        } else if (dbg == 7u) {
+            col = specTerm * 16.0; // specular only (x16 for measurement)
+        } else if (dbg == 8u) {
+            col = alb / PI * E * max(ndl, 0.0) * sh + alb * amb * ao; // diffuse only
         }
     }
 

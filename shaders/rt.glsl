@@ -16,7 +16,7 @@ struct HitPayload {
     float ao;     // baked / precomputed occlusion
     float sunVis; // baked self-shadowing towards the sun (impostors), 1 for meshes
     uint shadowMask; // instance mask for this hit's shadow rays (impostors exclude themselves)
-    float trans;  // leaf translucency (texture), 0 for opaque materials
+    vec3 trans;   // leaf transmission colour (translucency map x species tint), 0 for opaque
 };
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.
@@ -30,25 +30,31 @@ struct ImpHit {
 uint instSeed(uint ci) { return ci >> 11; }
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
-struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; };
+struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint pad; };
 
+// Per plant variant (= atlas slot).
 struct ImpostorInfo {
     vec4 centerRadius; // bounding sphere in tree space
-    vec4 bmin;
+    vec4 bmin;         // w: species index
     vec4 bmax;
+    vec4 trans;        // rgb: mean leaf transmission colour of the species (for impostor hits)
     uint grid;         // frames per side
     uint res;          // texels per frame side
     uint mips;
-    uint pad;
+    float lodScale;    // LOD distances scale with plant size (trees 1, shrubs/ferns smaller)
 };
+
+// Per species: Unreal material tints (0.5 = neutral) and translucency colour.
+struct SpeciesInfo { vec4 leafTint; vec4 barkTint; vec4 transTint; };
 
 #include "globals.glsl"
 
 // Per TLAS instance (indexed by gl_InstanceID): the tree it belongs to, for LOD cross-fades.
 struct InstInfo {
     vec3 center;  // tree bounding-sphere centre (world)
-    uint data;    // tree index (24 bits) | flags << 24 (bit 0: tree also has mesh instances)
+    uint data;    // tree index (24 bits) | has-mesh flag (bit 24) | variant (bits 25..31)
 };
+uint instVariant(uint data) { return data >> 25; }
 
 // Cross-fade weights. Inside a band, every ray picks one representation per tree with this
 // probability, using the same random number in the mesh any-hit and the impostor intersection

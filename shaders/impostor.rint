@@ -12,7 +12,9 @@
 
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
 layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
-layout(set = 0, binding = 7) uniform sampler2D ndAtlas[MAX_VARIANTS];
+// BC-compressed atlases: albedo+AO (BC3), depth+coverage (BC5), normal (BC5), visibility (BC3, half res)
+layout(set = 0, binding = 7) uniform sampler2D depthAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 14) uniform sampler2D normalAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 6) uniform sampler2D albedoAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 11) uniform sampler2D visAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
@@ -47,12 +49,13 @@ bool inFrame(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessT
 bool solid(Ctx m, vec2 cell, vec3 s, float bias, float thick) {
     if (!inFrame(s.xy)) return false;
     // March fetches use a single mip (m.marchLod, rounded): half the texel reads of trilinear.
-    vec2 dz = textureLod(ndAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, s.xy), m.marchLod).zw;
+    vec2 dz = textureLod(depthAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, s.xy), m.marchLod).rg;
+    dz.x = dz.x * 2.0 - 1.0;
     return dz.y > 0.02 && s.z <= dz.x - bias && (thick <= 0.0 || s.z >= dz.x - thick);
 }
 float coverageAt(Ctx m, vec2 cell, vec2 uv) {
     if (!inFrame(uv)) return 0.0;
-    return textureLod(ndAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, uv), m.marchLod).w;
+    return textureLod(depthAtlas[nonuniformEXT(m.vid)], atlasUV(m, cell, uv), m.marchLod).g;
 }
 
 // March the ray o + d*t, t in [t0, t1], against frame `cell`.
@@ -163,10 +166,14 @@ void main() {
     InstInfo ii = insts[gl_InstanceID];
     uint tree = ii.data & 0xFFFFFFu;
     float dTree = distance(g.camPos.xyz, ii.center);
-    if ((ii.data & 0x1000000u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree)) return; // mesh copy wins
-    uint tier = lodRand(g, tree, 2u) < hiFade(g, dTree) ? 1u : 0u;
-    uint vid = (gl_InstanceCustomIndexEXT & 0xFFu) + tier * uint(g.lodParams.w); // atlas slot
+    uint vid = gl_InstanceCustomIndexEXT & 0xFFu; // atlas slot = plant variant
     ImpostorInfo info = imps[vid];
+    float sc = info.lodScale; // LOD distances scale with plant size
+    if ((ii.data & 0x1000000u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree / sc)) return; // mesh copy wins
+    // Small plants dissolve away over the last 20% of their draw distance (trans.w; 0 = no limit).
+    float cull = info.trans.w;
+    if (cull > 0.0 && lodRand(g, tree, 3u) >= 1.0 - smoothstep(cull * 0.8, cull, dTree)) return;
+    uint tier = 0u; // single atlas per variant (mips serve the far field)
 
     vec3 o = gl_ObjectRayOriginEXT;
     vec3 d = gl_ObjectRayDirectionEXT; // not normalised: t stays identical to world-space t
@@ -242,11 +249,11 @@ void main() {
     if (!marchFrame(m, cell, o, d, t0, t1, 40, 0.0, true, false, th, uvh)) return;
     vec2 auv = atlasUV(m, cell, uvh);
     vec4 a = textureLod(albedoAtlas[nonuniformEXT(vid)], auv, m.lod);
-    vec4 nd = textureLod(ndAtlas[nonuniformEXT(vid)], auv, m.lod);
-    vec4 vs = textureLod(visAtlas[nonuniformEXT(vid)], auv, m.lod);
+    vec2 nxy = textureLod(normalAtlas[nonuniformEXT(vid)], auv, m.lod).rg * 2.0 - 1.0;
+    vec4 vs = textureLod(visAtlas[nonuniformEXT(vid)], auv, max(m.lod - 1.0, 0.0)); // half-res atlas
 
     hit.albedoAo = packUnorm4x8(a);
-    hit.normal = packSnorm2x16(octEncode(octDecode(nd.xy)));
+    hit.normal = packSnorm2x16(octEncode(octDecode(nxy)));
     hit.vis = packUnorm4x8(vs);
     reportIntersectionEXT(th, tier); // hit kind carries the tier to the closest-hit shader
 }

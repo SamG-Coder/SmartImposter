@@ -6,6 +6,7 @@
 
 mod accel;
 mod asset;
+mod catalog;
 mod flypath;
 mod textures;
 mod gpu;
@@ -30,6 +31,8 @@ struct Args {
     width: u32,
     height: u32,
     shot: Option<String>,
+    /// Several cameras in one run (`--views`): x, height above ground, z, yaw, pitch.
+    views: Vec<[f32; 7]>, // + optional mesh LOD distance and debug mode (-1 = unchanged)
     frames: u32,
     cam: Option<[f32; 5]>,
     lod: f32,
@@ -37,7 +40,7 @@ struct Args {
     ao_rays: u32,
     sun: [f32; 2],
     imp: ImpostorSettings,
-    imp_hi: ImpostorSettings,
+    species: Option<String>,
     lod2: f32,
     lod_band: f32,
     lod2_band: f32,
@@ -63,14 +66,15 @@ fn parse_args() -> Args {
         width: 1920,
         height: 1080,
         shot: None,
+        views: Vec::new(),
         frames: 1,
         cam: None,
         lod: 50.0,
         debug: 0,
         ao_rays: 1,
         sun: [35.0, 38.0],
-        imp: ImpostorSettings { grid: 12, res: 384, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12 },
-        imp_hi: ImpostorSettings { grid: 14, res: 576, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12 },
+        imp: ImpostorSettings { grid: 12, texel: 0.055, max_res: 448, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12 },
+        species: None,
         lod2: 100.0,
         lod_band: 12.0,
         lod2_band: 24.0,
@@ -104,6 +108,14 @@ fn parse_args() -> Args {
                 }
             }
             "--shot" => a.shot = Some(next),
+            "--views" => {
+                a.views = next
+                    .split(';')
+                    .map(floats)
+                    .filter(|v| v.len() >= 5)
+                    .map(|v| [v[0], v[1], v[2], v[3], v[4], *v.get(5).unwrap_or(&-1.0), *v.get(6).unwrap_or(&-1.0)])
+                    .collect();
+            }
             "--frames" => a.frames = next.parse().unwrap_or(1),
             "--cam" => {
                 let v = floats(&next);
@@ -120,10 +132,10 @@ fn parse_args() -> Args {
                     a.sun = [v[0], v[1]];
                 }
             }
-            "--imp-res" => a.imp.res = next.parse().unwrap_or(384),
+            "--imp-res" => a.imp.max_res = next.parse().unwrap_or(448),
+            "--imp-texel" => a.imp.texel = next.parse().unwrap_or(0.05),
             "--imp-grid" => a.imp.grid = next.parse().unwrap_or(12),
-            "--imp-hi-res" => a.imp_hi.res = next.parse().unwrap_or(576),
-            "--imp-hi-grid" => a.imp_hi.grid = next.parse().unwrap_or(14),
+            "--species" => a.species = Some(next),
             "--lod2" => a.lod2 = next.parse().unwrap_or(100.0),
             "--lod-band" => a.lod_band = next.parse().unwrap_or(12.0),
             "--lod2-band" => a.lod2_band = next.parse().unwrap_or(24.0),
@@ -247,21 +259,27 @@ impl App {
                     .with_inner_size(winit::dpi::PhysicalSize::new(a.width, a.height)),
             )?,
         );
+        if let Some(prefix) = &a.dump_atlas {
+            std::env::set_var("SI_DUMP_ATLAS", prefix);
+        }
         let t = Instant::now();
-        let pack = asset::load(&a.asset)?;
-        for tr in &pack.trees {
-            println!(
-                "Tree {}: {} parts, {:.0}M triangles expanded, height {:.1} m",
-                tr.name,
-                tr.parts.len(),
-                tr.expanded_tris(&pack.meshes) as f64 / 1e6,
-                tr.bmax.y - tr.bmin.y
-            );
+        let (pack, cat) = catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?;
+        let tris: usize = pack.meshes.iter().map(|m| m.tri_count() as usize).sum();
+        println!(
+            "Catalog: {} species, {} variants, {} unique meshes, {:.1}M unique triangles",
+            cat.species.len(),
+            pack.trees.len(),
+            pack.meshes.len(),
+            tris as f64 / 1e6
+        );
+        for sp in &cat.species {
+            let hs: Vec<String> = sp.variants.clone().map(|v| format!("{:.1}", cat.variants[v].height)).collect();
+            println!("  {:<24} {:?} heights [{}] m", sp.name, sp.kind, hs.join(", "));
         }
         let world = if a.gallery {
-            world::World::gallery(&pack.trees)
+            world::World::gallery(&pack.trees, &cat)
         } else {
-            world::World::generate(&pack.trees, 3072.0, 1024, a.spacing, a.radius)
+            world::World::generate(&pack.trees, &cat, 3072.0, 1024, a.spacing, a.radius)
         };
         println!("World: {} trees, terrain {} tris ({:.2}s)", world.trees.len(), world.terrain.tri_count(), t.elapsed().as_secs_f32());
 
@@ -272,12 +290,12 @@ impl App {
             size.width,
             size.height,
             pack,
+            cat,
             world,
-            if a.imp_hi.res > 0 { vec![a.imp, a.imp_hi] } else { vec![a.imp] },
+            a.imp,
             a.vsync,
             a.validation,
             a.ss,
-            "assets/textures",
         )?;
         let start_y = r.world.height_at(0.0, 0.0) + 1.8;
         let cam = match a.cam {
@@ -355,15 +373,6 @@ impl App {
         if a.fullscreen {
             state.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
-        if let Some(prefix) = &a.dump_atlas {
-            for v in 0..state.r.pack.trees.len() {
-                let (size, albedo, normals, depth) = state.r.dump_atlas(v)?;
-                save_png(&format!("{prefix}_{v}_albedo.png"), size, size, &albedo)?;
-                save_png(&format!("{prefix}_{v}_normal.png"), size, size, &normals)?;
-                save_png(&format!("{prefix}_{v}_depth.png"), size, size, &depth)?;
-            }
-            println!("Atlases written to {prefix}_*.png");
-        }
         state.window.set_title("SmartImposter");
         self.state = Some(state);
         Ok(())
@@ -371,8 +380,28 @@ impl App {
 
     fn frame(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let shot = self.args.shot.clone();
-        let shot_frames = self.args.frames;
+        let shot_frames = self.args.frames.max(1);
+        let views = self.args.views.clone();
         let Some(s) = self.state.as_mut() else { return Ok(()) };
+        // Multi-view capture: `frames` frames per view, then jump to the next camera.
+        let view = (s.rendered / shot_frames) as usize;
+        if !views.is_empty() && s.rendered % shot_frames == 0 && view < views.len() {
+            let v = views[view];
+            s.cam.pos = Vec3::new(v[0], s.r.world.height_at(v[0], v[2]) + v[1], v[2]);
+            s.cam.yaw = v[3].to_radians();
+            s.cam.pitch = v[4].to_radians();
+            s.yaw_target = s.cam.yaw;
+            s.pitch_target = s.cam.pitch;
+            if v[5] >= 0.0 {
+                s.lod = v[5];
+            }
+            if v[6] >= 0.0 {
+                s.debug = v[6] as u32;
+            }
+            s.prev_cam = None;
+            s.r.reset_taa();
+            s.frame_times.clear();
+        }
         if s.r.need_resize {
             let sz = s.window.inner_size();
             s.r.resize(sz.width, sz.height)?;
@@ -497,13 +526,17 @@ impl App {
             prev_up: prev[2],
             prev_fwd: prev[3],
         };
-        let shot_due = shot.is_some() && s.rendered + 1 >= shot_frames;
+        let last_view = views.is_empty() || view + 1 >= views.len();
+        let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
         let (stats, img) = s.r.render(&g, s.cam.pos, s.lod, capture)?;
         s.frame = s.frame.wrapping_add(1);
         s.rendered += 1;
         if let Some(img) = img {
-            let path = if shot_due {
+            let path = if shot_due && !views.is_empty() {
+                let p = shot.clone().unwrap();
+                format!("{}_{view}.png", p.trim_end_matches(".png"))
+            } else if shot_due {
                 shot.clone().unwrap()
             } else {
                 s.shot_counter += 1;
@@ -536,7 +569,9 @@ impl App {
                     s.cam.yaw.to_degrees(),
                     s.cam.pitch.to_degrees()
                 );
-                el.exit();
+                if last_view {
+                    el.exit();
+                }
             }
         }
 

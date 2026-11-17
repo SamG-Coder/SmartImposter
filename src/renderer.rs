@@ -2,6 +2,7 @@
 
 use crate::accel::{self, Accel, Tlas};
 use crate::asset::{MeshData, TreePack};
+use crate::catalog::Catalog;
 use crate::gpu::{align_up, Buffer, Gpu, Image, Swapchain};
 use crate::world::World;
 use anyhow::{Context, Result};
@@ -18,8 +19,14 @@ macro_rules! spv {
     };
 }
 
-/// Atlas slots (tree variants x impostor tiers) bound as sampler arrays.
-pub const MAX_VARIANTS: usize = 16;
+/// Atlas slots (one per plant variant) bound as sampler arrays. Must match shared.glsl.
+pub const MAX_VARIANTS: usize = 128;
+/// Texture sets (4 textures each) bound as a sampler array. Must match shared.glsl.
+pub const MAX_SPECIES: usize = 16;
+/// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
+const TRANS_GAIN: f32 = 8.0;
+/// Ground material textures (binding 16). Must match shared.glsl.
+pub const MAX_GROUND_TEX: usize = 16;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -56,25 +63,64 @@ struct InstInfo {
 }
 
 const INST_HAS_MESH: u32 = 1 << 24;
+const INST_VARIANT_SHIFT: u32 = 25;
 
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lod {
+    Culled, // beyond the variant's draw distance (small plants)
     Impostor,
     Both, // inside the mesh <-> impostor band: both copies in the TLAS, shaders dissolve
     Mesh,
 }
 
+/// Per plant variant (= atlas slot); see rt.glsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ImpostorInfo {
     center_radius: [f32; 4],
     bmin: [f32; 4],
     bmax: [f32; 4],
+    trans: [f32; 4],
     grid: u32,
     res: u32,
     mips: u32,
+    lod_scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct MeshInfoGpu {
+    addr: [u64; 5], // pos, nrm, idx, mat, uv
+    tex_set: u32,
     pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct SpeciesGpu {
+    leaf_tint: [f32; 4],
+    bark_tint: [f32; 4],
+    trans_tint: [f32; 4],
+}
+
+/// One BC-compressed impostor atlas per plant variant.
+struct BcAtlas {
+    albedo: Image, // BC3: sqrt(albedo).rgb, AO
+    normal: Image, // BC5: octahedral normal * 0.5 + 0.5
+    depth: Image,  // BC5: depth * 0.5 + 0.5, coverage
+    vis: Image,    // BC3, half resolution: directional visibility a, b/3 + 0.5
+    grid: u32,
+    res: u32,
+    mips: u32,
+}
+
+impl BcAtlas {
+    fn bytes(&self) -> u64 {
+        let s = (self.grid * self.res) as u64;
+        // BC3/BC5: 1 byte per texel; vis at quarter area; mips +1/3
+        (s * s * 3 + s * s / 4) * 4 / 3
+    }
 }
 
 #[repr(C)]
@@ -91,28 +137,36 @@ struct BakePush {
     pad: u32,
 }
 
+/// Impostor atlas settings. Each variant gets its own resolution: texels of `texel` metres
+/// (scaled by the variant's LOD scale, since small plants become impostors closer to the camera),
+/// rounded to a multiple of 32 and clamped to [32, max_res]. Mip-mapping serves the far field.
 #[derive(Clone, Copy)]
 pub struct ImpostorSettings {
     pub grid: u32,
-    pub res: u32,
+    pub texel: f32,
+    pub max_res: u32,
     pub ss: u32,
     pub ao_rays: u32,
     pub ao_range: f32,
     pub vis_rays: u32,
 }
 
-/// Per tree variant: albedo+AO, normal+depth+coverage, directional self-visibility.
-type Atlas = (Image, Image, Image);
-
 impl ImpostorSettings {
-    pub fn mips(&self) -> u32 {
-        let (mut m, mut r) = (1, self.res);
-        while r % 2 == 0 && r / 2 >= 6 {
-            r /= 2;
-            m += 1;
-        }
-        m
+    pub fn res_for(&self, radius: f32, lod_scale: f32) -> u32 {
+        // Small plants switch to impostors closer, but only down to 0.35x the tree texel density.
+        let r = (2.0 * radius / (self.texel * lod_scale.max(0.35))).round() as u32;
+        (r.div_ceil(32) * 32).clamp(32, self.max_res.max(32))
     }
+}
+
+/// Mip count for a frame resolution: every encoded level must stay a multiple of 4 (BC blocks)
+/// and frames keep at least 8 texels.
+fn atlas_mips(res: u32) -> u32 {
+    let mut m = 1;
+    while (res >> m) >= 8 && (res >> m) % 4 == 0 {
+        m += 1;
+    }
+    m
 }
 
 struct MeshGpu {
@@ -154,6 +208,8 @@ pub struct Renderer {
     pub taa_enabled: bool,
     resize_count: u32,
     mat_tex: Vec<Image>,
+    ground_tex: Vec<Image>,
+    ground_layers: u32,
     mat_sampler: vk::Sampler,
     has_tex: bool,
     sharp_img: Image,
@@ -170,15 +226,20 @@ pub struct Renderer {
     bake_pipe: RtPipeline,
     mip_layout: vk::PipelineLayout,
     mip_pipe: vk::Pipeline,
-    mip_sets: Vec<Vec<vk::DescriptorSet>>, // [slot][level-1]
+    mip_set_layout: vk::DescriptorSetLayout,
+    bcenc_layout: vk::PipelineLayout,
+    bcenc_pipe: vk::Pipeline,
+    bcenc_set_layout: vk::DescriptorSetLayout,
     _meshes: Vec<MeshGpu>,
     mesh_info: Buffer,
+    species_buf: Buffer,
     blas: Vec<Accel>,
     _aabbs: Vec<Buffer>,
     imp_blas: Vec<Accel>,
     imp_info: Buffer,
-    atlases: Vec<Atlas>,
+    atlases: Vec<BcAtlas>,
     sampler: vk::Sampler,
+    pub catalog: Catalog,
     tlas: Tlas,
     ubo: Buffer,
     cb: vk::CommandBuffer,
@@ -186,8 +247,10 @@ pub struct Renderer {
     acquire_sem: vk::Semaphore,
     pub world: World,
     pub pack: TreePack,
-    /// Impostor tiers: [standard (far), high detail (mid range)]. Atlas slot = tier * variants + variant.
-    pub tiers: Vec<ImpostorSettings>,
+    /// Impostor atlas settings (one compressed atlas per variant; slot = variant index).
+    pub imp: ImpostorSettings,
+    /// Write the first baked atlas as PNGs with this prefix (debugging).
+    pub dump_prefix: Option<String>,
     lod_state: Vec<Lod>,
     insts: Vec<vk::AccelerationStructureInstanceKHR>,
     inst_data: Vec<InstInfo>,
@@ -315,29 +378,75 @@ impl Renderer {
         width: u32,
         height: u32,
         pack: TreePack,
+        catalog: Catalog,
         world: World,
-        tiers: Vec<ImpostorSettings>,
+        imp: ImpostorSettings,
         vsync: bool,
         validation: bool,
         render_scale: f32,
-        tex_dir: &str,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let gpu = Gpu::new(display, window, validation)?;
         println!("GPU: {}", gpu.device_name);
-        let (mat_tex, has_tex) = crate::textures::load(&gpu, tex_dir)?;
+        let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog)?;
+        let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground)?;
+        let ground_layers = catalog.ground.len() as u32;
+        {
+            // biome mask in the last ground slot (see World::ground_mask)
+            let t = Instant::now();
+            const MASK_RES: usize = 1024;
+            let mask = world.ground_mask(&pack.trees, &catalog, MASK_RES);
+            while ground_tex.len() < MAX_GROUND_TEX - 1 {
+                ground_tex.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
+            }
+            ground_tex.truncate(MAX_GROUND_TEX - 1);
+            let m = MASK_RES as u32;
+            ground_tex.push(crate::textures::upload_with_mips(&gpu, m, m, &mask, vk::Format::R8G8B8A8_UNORM, "ground mask")?);
+            println!("Ground mask {MASK_RES}^2 in {:.2}s", t.elapsed().as_secs_f32());
+        }
         let swap = gpu.create_swapchain(width, height, vk::SwapchainKHR::null(), vsync)?;
         let render_extent = scaled_extent(swap.extent, render_scale);
         let (out_img, tg, readback) = Self::create_targets(&gpu, swap.extent, render_extent)?;
         let sharp_img = Self::create_sharp(&gpu, swap.extent)?;
 
-        // ---- geometry: tree meshes followed by terrain
+        // ---- geometry: plant meshes followed by terrain
+        assert!(pack.meshes.len() < 2048, "mesh ids are 11 bits in the instance custom index");
         let mut meshes = Vec::new();
         for m in pack.meshes.iter().chain(std::iter::once(&world.terrain)) {
             meshes.push(upload_mesh(&gpu, m)?);
         }
-        let infos: Vec<[u64; 5]> = meshes.iter().map(|m| [m.pos.addr, m.nrm.addr, m.idx.addr, m.mat.addr, m.uv.addr]).collect();
+        let infos: Vec<MeshInfoGpu> = meshes
+            .iter()
+            .enumerate()
+            .map(|(i, m)| MeshInfoGpu {
+                addr: [m.pos.addr, m.nrm.addr, m.idx.addr, m.mat.addr, m.uv.addr],
+                tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
+                pad: 0,
+            })
+            .collect();
         let mesh_info = gpu.upload_buffer(bytemuck::cast_slice(&infos), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh info")?;
+        let mut species: Vec<SpeciesGpu> = catalog
+            .species
+            .iter()
+            .enumerate()
+            .map(|(i, s)| SpeciesGpu {
+                // w: foliage brightness normalisation (textures::FOLIAGE_LUMINANCE)
+                leaf_tint: [s.leaf_tint[0], s.leaf_tint[1], s.leaf_tint[2], leaf_scale.get(i).map(|x| x.0).unwrap_or(1.0)],
+                bark_tint: [s.bark_tint[0], s.bark_tint[1], s.bark_tint[2], 0.0],
+                // Transmitted light = leaf albedo x Unreal's translucency tint (0.5 = neutral) x
+                // the translucency mask normalised to a mean of 0.33 (w) x TRANS_GAIN.
+                trans_tint: [
+                    2.0 * TRANS_GAIN * s.trans_tint[0],
+                    2.0 * TRANS_GAIN * s.trans_tint[1],
+                    2.0 * TRANS_GAIN * s.trans_tint[2],
+                    0.33 / leaf_scale.get(i).map(|x| x.1).unwrap_or(0.33),
+                ],
+            })
+            .collect();
+        if species.is_empty() {
+            species.push(SpeciesGpu { leaf_tint: [0.5, 0.5, 0.5, 1.0], bark_tint: [0.5; 4], trans_tint: [TRANS_GAIN, TRANS_GAIN, TRANS_GAIN, 1.0] });
+        }
+        let species_buf = gpu.upload_buffer(bytemuck::cast_slice(&species), vk::BufferUsageFlags::STORAGE_BUFFER, "species")?;
         let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).collect();
         let geoms: Vec<_> = meshes
             .iter()
@@ -347,74 +456,76 @@ impl Renderer {
         let blas = accel::build_blases(&gpu, &geoms)?;
         println!("BLAS: {} meshes built in {:.2}s", blas.len(), t0.elapsed().as_secs_f32());
 
-        // ---- impostor proxies: one AABB per tree variant (shared by every tier)
+        // ---- impostor proxies and atlases: one per plant variant, resolution from its size
         let nv = pack.trees.len();
-        assert!(nv * tiers.len() <= MAX_VARIANTS, "too many tree variants x impostor tiers");
+        assert!(nv <= MAX_VARIANTS, "too many plant variants ({nv} > {MAX_VARIANTS})");
         let mut aabbs = Vec::new();
         let mut imp_infos = Vec::new();
-        for tier in &tiers {
-            for t in &pack.trees {
-                let pad = Vec3::splat(0.05);
-                let (lo, hi) = (t.bmin - pad, t.bmax + pad);
-                let c = (t.bmin + t.bmax) * 0.5;
-                let r = (t.bmax - t.bmin).length() * 0.5;
-                imp_infos.push(ImpostorInfo {
-                    center_radius: [c.x, c.y, c.z, r],
-                    bmin: [lo.x, lo.y, lo.z, 0.0],
-                    bmax: [hi.x, hi.y, hi.z, 0.0],
-                    grid: tier.grid,
-                    res: tier.res,
-                    mips: tier.mips(),
-                    pad: 0,
-                });
-            }
-        }
-        for t in &pack.trees {
+        let mut atlases = Vec::new();
+        let mut atlas_bytes = 0u64;
+        let mut raw_bytes = 0u64;
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        for (v, t) in pack.trees.iter().enumerate() {
+            let vi = &catalog.variants[v];
+            let sp = &species[vi.species.min(species.len() - 1)];
             let pad = Vec3::splat(0.05);
             let (lo, hi) = (t.bmin - pad, t.bmax + pad);
+            let c = (t.bmin + t.bmax) * 0.5;
+            let r = (t.bmax - t.bmin).length() * 0.5;
+            let res = imp.res_for(r, vi.lod_scale);
+            let mips = atlas_mips(res);
+            imp_infos.push(ImpostorInfo {
+                center_radius: [c.x, c.y, c.z, r],
+                bmin: [lo.x, lo.y, lo.z, 0.0],
+                bmax: [hi.x, hi.y, hi.z, 0.0],
+                // mean transmission (x albedo in impostor.rchit); w = draw distance
+                trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
+                grid: imp.grid,
+                res,
+                mips,
+                lod_scale: vi.lod_scale,
+            });
             let data = [lo.x, lo.y, lo.z, hi.x, hi.y, hi.z];
             aabbs.push(gpu.upload_buffer(
                 bytemuck::cast_slice(&data),
                 vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
                 "aabb",
             )?);
+            let size = imp.grid * res;
+            let a = BcAtlas {
+                albedo: gpu.create_image(size, size, mips, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{} albedo", t.name))?,
+                normal: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{} normal", t.name))?,
+                depth: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{} depth", t.name))?,
+                vis: gpu.create_image(size / 2, size / 2, mips - 1, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{} visibility", t.name))?,
+                grid: imp.grid,
+                res,
+                mips,
+            };
+            atlas_bytes += a.bytes();
+            raw_bytes += (size as u64 * size as u64 * 16) * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
+            atlases.push(a);
         }
+        println!(
+            "Impostor atlases: {} variants, {:.2} GB BC-compressed (uncompressed would be {:.2} GB)",
+            atlases.len(),
+            atlas_bytes as f64 / 1e9,
+            raw_bytes as f64 / 1e9
+        );
         let imp_geoms: Vec<_> = aabbs.iter().map(|b| (accel::aabb_geometry(b.addr), 1)).collect();
         let imp_blas = accel::build_blases(&gpu, &imp_geoms)?;
         let imp_info = gpu.upload_buffer(bytemuck::cast_slice(&imp_infos), vk::BufferUsageFlags::STORAGE_BUFFER, "impostor info")?;
-
-        // ---- impostor atlases, one set per (tier, variant) slot
-        let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
-        let mut atlases = Vec::new();
-        let mut atlas_bytes = 0u64;
-        let mut slot_mips = Vec::new();
-        for (ti, tier) in tiers.iter().enumerate() {
-            let size = tier.grid * tier.res;
-            let mips = tier.mips();
-            for t in &pack.trees {
-                let name = format!("{} tier{}", t.name, ti);
-                let a = gpu.create_image(size, size, mips, vk::Format::R8G8B8A8_UNORM, usage, &format!("{name} albedo"))?;
-                let b = gpu.create_image(size, size, mips, vk::Format::R16G16B16A16_SFLOAT, usage, &format!("{name} normal-depth"))?;
-                let c = gpu.create_image(size, size, mips, vk::Format::R8G8B8A8_UNORM, usage, &format!("{name} visibility"))?;
-                atlases.push((a, b, c));
-                atlas_bytes += (size as u64 * size as u64 * 16) * 4 / 3;
-                slot_mips.push(mips);
-            }
-        }
-        println!("Impostor atlases: {} slots, {:.2} GB", atlases.len(), atlas_bytes as f64 / 1e9);
-        let mips = *slot_mips.iter().max().unwrap();
         gpu.one_time(|cb| {
-            for (a, b, c) in &atlases {
-                for img in [a.raw, b.raw, c.raw] {
+            for a in &atlases {
+                for img in [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw] {
                     gpu.image_barrier(
                         cb,
                         img,
                         vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::GENERAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                         vk::PipelineStageFlags2::NONE,
                         vk::AccessFlags2::NONE,
                         vk::PipelineStageFlags2::ALL_COMMANDS,
-                        vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ,
+                        vk::AccessFlags2::SHADER_READ,
                     );
                 }
             }
@@ -428,7 +539,7 @@ impl Renderer {
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .max_lod(mips as f32),
+                    .max_lod(16.0),
                 None,
             )?
         };
@@ -442,6 +553,7 @@ impl Renderer {
                     .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
                     .address_mode_u(vk::SamplerAddressMode::REPEAT)
                     .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .anisotropy_enable(false)
                     .max_lod(16.0),
                 None,
             )?
@@ -456,6 +568,7 @@ impl Renderer {
         let b = |binding: u32, ty: vk::DescriptorType, count: u32, stages: vk::ShaderStageFlags| {
             vk::DescriptorSetLayoutBinding::default().binding(binding).descriptor_type(ty).descriptor_count(count).stage_flags(stages)
         };
+        let nvar = MAX_VARIANTS as u32;
         let bindings = [
             b(0, vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, 1, rt_all),
             b(1, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
@@ -463,14 +576,17 @@ impl Renderer {
             b(3, vk::DescriptorType::UNIFORM_BUFFER, 1, rt_all),
             b(4, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(5, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
-            b(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS as u32, rt_all),
-            b(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS as u32, rt_all),
+            b(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
+            b(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
             b(8, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
             b(9, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
             b(10, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
-            b(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS as u32, rt_all),
+            b(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
             b(12, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
-            b(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 4, rt_all),
+            b(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 4 * MAX_SPECIES as u32, rt_all),
+            b(14, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
+            b(15, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            b(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_GROUND_TEX as u32, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -486,82 +602,66 @@ impl Renderer {
                 None,
             )?
         };
+        let compute_pipe = |module: &[u8], layout: vk::PipelineLayout| -> Result<vk::Pipeline> {
+            let m = gpu.shader_module(module)?;
+            let p = unsafe {
+                gpu.device
+                    .create_compute_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main"))
+                            .layout(layout)],
+                        None,
+                    )
+                    .map_err(|(_, e)| e)?[0]
+            };
+            unsafe { gpu.device.destroy_shader_module(m, None) };
+            Ok(p)
+        };
         let mip_bindings: Vec<_> = (0..6).map(|i| b(i, vk::DescriptorType::STORAGE_IMAGE, 1, vk::ShaderStageFlags::COMPUTE)).collect();
         let mip_set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&mip_bindings), None)?
         };
-        let mip_layouts = [mip_set_layout];
         let mip_layout = unsafe {
-            gpu.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&mip_layouts), None)?
+            gpu.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[mip_set_layout]), None)?
         };
-        let mip_module = gpu.shader_module(spv!("mip.comp"))?;
-        let mip_pipe = unsafe {
-            gpu.device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::COMPUTE)
-                                .module(mip_module)
-                                .name(c"main"),
-                        )
-                        .layout(mip_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| e)?[0]
-        };
-        unsafe { gpu.device.destroy_shader_module(mip_module, None) };
-
-        let n_mip_sets: u32 = slot_mips.iter().sum();
-        let pool_sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 2 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 26 + 6 * n_mip_sets },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 4 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 6 * MAX_VARIANTS as u32 + 8 },
+        let mip_pipe = compute_pipe(spv!("mip.comp"), mip_layout)?;
+        // BC encoder: 3 scratch atlas levels in, block buffer out.
+        let bcenc_bindings = [
+            b(0, vk::DescriptorType::STORAGE_IMAGE, 1, vk::ShaderStageFlags::COMPUTE),
+            b(1, vk::DescriptorType::STORAGE_IMAGE, 1, vk::ShaderStageFlags::COMPUTE),
+            b(2, vk::DescriptorType::STORAGE_IMAGE, 1, vk::ShaderStageFlags::COMPUTE),
+            b(3, vk::DescriptorType::STORAGE_BUFFER, 1, vk::ShaderStageFlags::COMPUTE),
         ];
-        let desc_pool = unsafe {
-            gpu.device.create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_sizes).max_sets(7 + n_mip_sets),
+        let bcenc_set_layout = unsafe {
+            gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bcenc_bindings), None)?
+        };
+        let bcenc_push = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(16)];
+        let bcenc_layout = unsafe {
+            gpu.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[bcenc_set_layout]).push_constant_ranges(&bcenc_push),
                 None,
             )?
+        };
+        let bcenc_pipe = compute_pipe(spv!("bcenc.comp"), bcenc_layout)?;
+
+        let pool_sizes = [
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 2 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 40 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 4 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+                descriptor_count: 2 * (4 * nvar + 4 * MAX_SPECIES as u32 + MAX_GROUND_TEX as u32),
+            },
+        ];
+        let desc_pool = unsafe {
+            gpu.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_sizes).max_sets(8), None)?
         };
         let sets = unsafe {
             gpu.device
                 .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[set_layout, set_layout]))?
         };
-        let mut mip_sets = Vec::new();
-        for ((a, b, c), &slot_mip_count) in atlases.iter().zip(&slot_mips) {
-            let mut per = Vec::new();
-            for level in 1..slot_mip_count {
-                let set = unsafe {
-                    gpu.device.allocate_descriptor_sets(
-                        &vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&mip_layouts),
-                    )?[0]
-                };
-                let (src, dst) = (level as usize - 1, level as usize);
-                let views = [a.mip_views[src], b.mip_views[src], a.mip_views[dst], b.mip_views[dst], c.mip_views[src], c.mip_views[dst]];
-                let infos: Vec<[vk::DescriptorImageInfo; 1]> = views
-                    .iter()
-                    .map(|v| [vk::DescriptorImageInfo::default().image_view(*v).image_layout(vk::ImageLayout::GENERAL)])
-                    .collect();
-                let writes: Vec<_> = infos
-                    .iter()
-                    .enumerate()
-                    .map(|(i, info)| {
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(set)
-                            .dst_binding(i as u32)
-                            .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                            .image_info(info)
-                    })
-                    .collect();
-                unsafe { gpu.device.update_descriptor_sets(&writes, &[]) };
-                per.push(set);
-            }
-            mip_sets.push(per);
-        }
 
         let main_pipe = create_rt_pipeline(&gpu, pipe_layout, spv!("main.rgen"))?;
         let bake_pipe = create_rt_pipeline(&gpu, pipe_layout, spv!("bake.rgen"))?;
@@ -571,60 +671,29 @@ impl Renderer {
         let resolve_set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&resolve_bindings), None)?
         };
-        let resolve_layouts = [resolve_set_layout];
         let resolve_push = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(16)];
         let resolve_layout = unsafe {
             gpu.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&resolve_layouts).push_constant_ranges(&resolve_push),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[resolve_set_layout]).push_constant_ranges(&resolve_push),
                 None,
             )?
         };
-        let resolve_module = gpu.shader_module(spv!("resolve.comp"))?;
-        let resolve_pipe = unsafe {
-            gpu.device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(
-                            vk::PipelineShaderStageCreateInfo::default()
-                                .stage(vk::ShaderStageFlags::COMPUTE)
-                                .module(resolve_module)
-                                .name(c"main"),
-                        )
-                        .layout(resolve_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| e)?[0]
-        };
-        unsafe { gpu.device.destroy_shader_module(resolve_module, None) };
+        let resolve_pipe = compute_pipe(spv!("resolve.comp"), resolve_layout)?;
         // ---- CAS sharpening (display resolution)
         let sharpen_bindings: Vec<_> = (0..2).map(|i| b(i, vk::DescriptorType::STORAGE_IMAGE, 1, vk::ShaderStageFlags::COMPUTE)).collect();
         let sharpen_set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&sharpen_bindings), None)?
         };
-        let sharpen_layouts = [sharpen_set_layout];
         let sharpen_push = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(4)];
         let sharpen_layout = unsafe {
             gpu.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&sharpen_layouts).push_constant_ranges(&sharpen_push),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[sharpen_set_layout]).push_constant_ranges(&sharpen_push),
                 None,
             )?
         };
-        let sharpen_module = gpu.shader_module(spv!("sharpen.comp"))?;
-        let sharpen_pipe = unsafe {
-            gpu.device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(sharpen_module).name(c"main"))
-                        .layout(sharpen_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| e)?[0]
-        };
-        unsafe { gpu.device.destroy_shader_module(sharpen_module, None) };
+        let sharpen_pipe = compute_pipe(spv!("sharpen.comp"), sharpen_layout)?;
         let sharpen_set = unsafe {
-            gpu.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&sharpen_layouts))?[0]
+            gpu.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[sharpen_set_layout]))?[0]
         };
         let resolve_sets: [vk::DescriptorSet; 2] = unsafe {
             gpu.device
@@ -646,27 +715,14 @@ impl Renderer {
         let taa_set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&taa_bindings), None)?
         };
-        let taa_layouts = [taa_set_layout];
         let taa_push = [vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(4)];
         let taa_layout = unsafe {
             gpu.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&taa_layouts).push_constant_ranges(&taa_push),
+                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[taa_set_layout]).push_constant_ranges(&taa_push),
                 None,
             )?
         };
-        let taa_module = gpu.shader_module(spv!("taa.comp"))?;
-        let taa_pipe = unsafe {
-            gpu.device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    &[vk::ComputePipelineCreateInfo::default()
-                        .stage(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(taa_module).name(c"main"))
-                        .layout(taa_layout)],
-                    None,
-                )
-                .map_err(|(_, e)| e)?[0]
-        };
-        unsafe { gpu.device.destroy_shader_module(taa_module, None) };
+        let taa_pipe = compute_pipe(spv!("taa.comp"), taa_layout)?;
         let taa_sets: [vk::DescriptorSet; 2] = unsafe {
             gpu.device
                 .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[taa_set_layout, taa_set_layout]))?
@@ -688,7 +744,7 @@ impl Renderer {
         };
         let fence = unsafe { gpu.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)? };
         let acquire_sem = unsafe { gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
-        let lod_state = vec![Lod::Both; world.trees.len()];
+        let lod_state = vec![Lod::Culled; world.trees.len()];
 
         let mut r = Renderer {
             gpu,
@@ -706,6 +762,8 @@ impl Renderer {
             taa_enabled: true,
             resize_count: 0,
             mat_tex,
+            ground_tex,
+            ground_layers,
             mat_sampler,
             has_tex,
             sharp_img,
@@ -721,15 +779,20 @@ impl Renderer {
             bake_pipe,
             mip_layout,
             mip_pipe,
-            mip_sets,
+            mip_set_layout,
+            bcenc_layout,
+            bcenc_pipe,
+            bcenc_set_layout,
             _meshes: meshes,
             mesh_info,
+            species_buf,
             blas,
             _aabbs: aabbs,
             imp_blas,
             imp_info,
             atlases,
             sampler,
+            catalog,
             tlas,
             ubo,
             cb,
@@ -737,7 +800,8 @@ impl Renderer {
             acquire_sem,
             world,
             pack,
-            tiers,
+            imp,
+            dump_prefix: std::env::var("SI_DUMP_ATLAS").ok(),
             lod_state,
             insts: Vec::new(),
             inst_data: Vec::new(),
@@ -752,8 +816,7 @@ impl Renderer {
             resolve_pipe,
         };
         let _ = r.set_layout;
-        r.write_set(r.main_set, r.tlas.accel.raw, 0);
-        r.write_set(r.bake_set, r.tlas.accel.raw, 0);
+        r.write_set(r.main_set, r.tlas.accel.raw, None);
         r.write_resolve_set();
         r.bake_impostors()?;
         println!("Renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
@@ -812,44 +875,52 @@ impl Renderer {
         Ok((out, tg, readback))
     }
 
-    /// Write every binding of a ray tracing descriptor set. `bake_variant` selects the atlas
-    /// bound as the bake target (bindings 8/9).
-    fn write_set(&self, set: vk::DescriptorSet, tlas: vk::AccelerationStructureKHR, bake_variant: usize) {
+    /// Write every binding of a ray tracing descriptor set. `bake` = scratch atlas views bound as
+    /// the bake targets (bindings 8/9/10); only the bake pipeline uses them.
+    fn write_set(&self, set: vk::DescriptorSet, tlas: vk::AccelerationStructureKHR, bake: Option<[vk::ImageView; 3]>) {
         let handles = [tlas];
         let mut as_info = vk::WriteDescriptorSetAccelerationStructureKHR::default().acceleration_structures(&handles);
         let img = |v: vk::ImageView| [vk::DescriptorImageInfo::default().image_view(v).image_layout(vk::ImageLayout::GENERAL)];
         let out = img(self.tg.depth.mip_views[0]); // binding 1: hit distance
         let accum = img(self.tg.cur.mip_views[0]); // binding 2: this frame's sample
-        let bake_a = img(self.atlases[bake_variant].0.mip_views[0]);
-        let bake_b = img(self.atlases[bake_variant].1.mip_views[0]);
-        let bake_c = img(self.atlases[bake_variant].2.mip_views[0]);
-        let ubo = [vk::DescriptorBufferInfo::default().buffer(self.ubo.raw).range(vk::WHOLE_SIZE)];
-        let meshes = [vk::DescriptorBufferInfo::default().buffer(self.mesh_info.raw).range(vk::WHOLE_SIZE)];
-        let imps = [vk::DescriptorBufferInfo::default().buffer(self.imp_info.raw).range(vk::WHOLE_SIZE)];
-        let inst_info = [vk::DescriptorBufferInfo::default().buffer(self.inst_info.raw).range(vk::WHOLE_SIZE)];
-        let mat_tex: Vec<vk::DescriptorImageInfo> = self
-            .mat_tex
-            .iter()
-            .map(|t| vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(t.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL))
-            .collect();
-        let sampled = |pick: fn(&Atlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
+        let bake_imgs = bake.map(|v| [img(v[0]), img(v[1]), img(v[2])]);
+        let buf = |b: &Buffer| [vk::DescriptorBufferInfo::default().buffer(b.raw).range(vk::WHOLE_SIZE)];
+        let ubo = buf(&self.ubo);
+        let meshes = buf(&self.mesh_info);
+        let imps = buf(&self.imp_info);
+        let inst_info = buf(&self.inst_info);
+        let species = buf(&self.species_buf);
+        let tex = |list: &[Image], n: usize| -> Vec<vk::DescriptorImageInfo> {
+            (0..n)
+                .map(|i| {
+                    vk::DescriptorImageInfo::default()
+                        .sampler(self.mat_sampler)
+                        .image_view(list[i.min(list.len() - 1)].view)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect()
+        };
+        let mat_tex = tex(&self.mat_tex, 4 * MAX_SPECIES);
+        let ground_tex = tex(&self.ground_tex, MAX_GROUND_TEX);
+        let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
                 .map(|i| {
                     let a = &self.atlases[i.min(self.atlases.len() - 1)];
                     vk::DescriptorImageInfo::default()
                         .sampler(self.sampler)
                         .image_view(pick(a))
-                        .image_layout(vk::ImageLayout::GENERAL)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 })
                 .collect()
         };
-        let albedo = sampled(|a| a.0.view);
-        let nd = sampled(|a| a.1.view);
-        let visib = sampled(|a| a.2.view);
+        let albedo = sampled(|a| a.albedo.view);
+        let depth = sampled(|a| a.depth.view);
+        let visib = sampled(|a| a.vis.view);
+        let normal = sampled(|a| a.normal.view);
         let w = |binding: u32, ty: vk::DescriptorType| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty);
         let mut as_write = w(0, vk::DescriptorType::ACCELERATION_STRUCTURE_KHR).push_next(&mut as_info);
         as_write.descriptor_count = 1;
-        let writes = [
+        let mut writes = vec![
             as_write,
             w(1, vk::DescriptorType::STORAGE_IMAGE).image_info(&out),
             w(2, vk::DescriptorType::STORAGE_IMAGE).image_info(&accum),
@@ -857,25 +928,108 @@ impl Renderer {
             w(4, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&meshes),
             w(5, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&imps),
             w(6, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&albedo),
-            w(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&nd),
-            w(8, vk::DescriptorType::STORAGE_IMAGE).image_info(&bake_a),
-            w(9, vk::DescriptorType::STORAGE_IMAGE).image_info(&bake_b),
-            w(10, vk::DescriptorType::STORAGE_IMAGE).image_info(&bake_c),
+            w(7, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&depth),
             w(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&visib),
             w(12, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&inst_info),
             w(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&mat_tex),
+            w(14, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&normal),
+            w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&species),
+            w(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground_tex),
         ];
+        if let Some(bi) = &bake_imgs {
+            for (k, info) in bi.iter().enumerate() {
+                writes.push(w(8 + k as u32, vk::DescriptorType::STORAGE_IMAGE).image_info(info));
+            }
+        }
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
     }
 
-    /// Bake every (tier, tree variant) slot into its hemi-octahedral atlas using hardware ray tracing.
+    /// Bake every plant variant into its hemi-octahedral atlas with hardware ray tracing, build
+    /// coverage-weighted mips, then BC-compress every level on the GPU (bcenc.comp) into the
+    /// sampled atlases: BC3 albedo+AO, BC5 normal, BC5 depth+coverage, BC3 visibility at half
+    /// resolution. The uncompressed scratch atlas is shared by all variants and freed afterwards.
     fn bake_impostors(&mut self) -> Result<()> {
-        let nv = self.pack.trees.len();
-        for slot in 0..self.atlases.len() {
-            let (tier, v) = (slot / nv, slot % nv);
-            let imp = self.tiers[tier];
-            let mips = imp.mips();
+        let t_all = Instant::now();
+        let imp = self.imp;
+        let max_size = self.atlases.iter().map(|a| a.grid * a.res).max().unwrap_or(32);
+        let smips = self.atlases.iter().map(|a| a.mips).max().unwrap_or(1);
+        let st = vk::ImageUsageFlags::STORAGE;
+        let mut scratch = [
+            self.gpu.create_image(max_size, max_size, smips, vk::Format::R8G8B8A8_UNORM, st, "bake albedo")?,
+            self.gpu.create_image(max_size, max_size, smips, vk::Format::R16G16B16A16_SFLOAT, st, "bake normal-depth")?,
+            self.gpu.create_image(max_size, max_size, smips, vk::Format::R8G8B8A8_UNORM, st, "bake visibility")?,
+        ];
+        self.gpu.one_time(|cb| {
+            for s in &scratch {
+                self.gpu.image_barrier(
+                    cb,
+                    s.raw,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                    vk::PipelineStageFlags2::NONE,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ,
+                );
+            }
+        })?;
+        // Encoded blocks of one variant (all levels of all four atlases): < 4.5 bytes per level-0 texel.
+        let enc_size = max_size as u64 * max_size as u64 * 9 / 2;
+        let mut enc = self.gpu.create_buffer(
+            enc_size,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::GpuOnly,
+            "bc blocks",
+        )?;
+
+        // Transient descriptor sets: mip level L-1 -> L, and encoder inputs at level L.
+        let d = self.gpu.device.clone();
+        let pool_sizes = [
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 9 * smips },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: smips },
+        ];
+        let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_sizes).max_sets(2 * smips), None)? };
+        let alloc = |layout: vk::DescriptorSetLayout| -> Result<vk::DescriptorSet> {
+            Ok(unsafe { d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[layout]))?[0] })
+        };
+        let storage = |set: vk::DescriptorSet, views: &[vk::ImageView]| {
+            let infos: Vec<[vk::DescriptorImageInfo; 1]> =
+                views.iter().map(|v| [vk::DescriptorImageInfo::default().image_view(*v).image_layout(vk::ImageLayout::GENERAL)]).collect();
+            let writes: Vec<_> = infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(set)
+                        .dst_binding(i as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(info)
+                })
+                .collect();
+            unsafe { d.update_descriptor_sets(&writes, &[]) };
+        };
+        let [sa, sb, sc] = &scratch;
+        let mut mip_sets = vec![vk::DescriptorSet::null()];
+        for l in 1..smips as usize {
+            let set = alloc(self.mip_set_layout)?;
+            storage(set, &[sa.mip_views[l - 1], sb.mip_views[l - 1], sa.mip_views[l], sb.mip_views[l], sc.mip_views[l - 1], sc.mip_views[l]]);
+            mip_sets.push(set);
+        }
+        let mut enc_sets = Vec::new();
+        for l in 0..smips as usize {
+            let set = alloc(self.bcenc_set_layout)?;
+            storage(set, &[sa.mip_views[l], sb.mip_views[l], sc.mip_views[l]]);
+            let bi = [vk::DescriptorBufferInfo::default().buffer(enc.raw).range(vk::WHOLE_SIZE)];
+            let wr = [vk::WriteDescriptorSet::default().dst_set(set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&bi)];
+            unsafe { d.update_descriptor_sets(&wr, &[]) };
+            enc_sets.push(set);
+        }
+        let bake_views = [sa.mip_views[0], sb.mip_views[0], sc.mip_views[0]];
+
+        let mut total_tris = 0u64;
+        for v in 0..self.atlases.len() {
             let t0 = Instant::now();
+            let (res, grid, mips) = (self.atlases[v].res, self.atlases[v].grid, self.atlases[v].mips);
             let tree = &self.pack.trees[v];
             let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
             let insts: Vec<_> = tree
@@ -886,30 +1040,30 @@ impl Renderer {
             let mut tlas = Tlas::new(&self.gpu, insts.len() as u32)?;
             tlas.write(&insts);
             self.gpu.one_time(|cb| tlas.cmd_build(&self.gpu, cb, insts.len() as u32))?;
-            self.write_set(self.bake_set, tlas.accel.raw, slot);
+            self.write_set(self.bake_set, tlas.accel.raw, Some(bake_views));
 
             let c = (tree.bmin + tree.bmax) * 0.5;
             let r = (tree.bmax - tree.bmin).length() * 0.5;
             // Bake rays are orthographic: fixed texture footprint = one bake sub-sample (negative
             // spread in tri.rchit), and the material textures switched on.
             let mut bg = Globals::default();
-            bg.cam_fwd[3] = -(2.0 * r / imp.res as f32 / imp.ss as f32);
+            bg.cam_fwd[3] = -(2.0 * r / res as f32 / imp.ss as f32);
             bg.params[1] = self.has_tex as u32 as f32;
             self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&bg));
             let mut push = BakePush {
                 center_radius: [c.x, c.y, c.z, r],
-                grid: imp.grid,
-                res: imp.res,
+                grid,
+                res,
                 frame_offset: 0,
                 ss: imp.ss,
                 ao_rays: imp.ao_rays,
-                ao_range: imp.ao_range,
+                // AO range is in metres for full-size trees; small plants get a proportionally shorter one.
+                ao_range: imp.ao_range * (r / 8.0).clamp(0.2, 1.0),
                 vis_rays: imp.vis_rays,
                 pad: 0,
             };
-            for row in 0..imp.grid {
-                push.frame_offset = row * imp.grid;
-                let d = &self.gpu.device;
+            for row in 0..grid {
+                push.frame_offset = row * grid;
                 self.gpu.one_time(|cb| unsafe {
                     d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::RAY_TRACING_KHR, self.bake_pipe.pipe);
                     d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::RAY_TRACING_KHR, self.pipe_layout, 0, &[self.bake_set], &[]);
@@ -920,91 +1074,212 @@ impl Renderer {
                         &self.bake_pipe.miss,
                         &self.bake_pipe.hit,
                         &vk::StridedDeviceAddressRegionKHR::default(),
-                        imp.res,
-                        imp.res,
-                        imp.grid,
+                        res,
+                        res,
+                        grid,
                     );
                 })?;
             }
 
-            let d = &self.gpu.device;
-            let size = imp.grid * imp.res;
+            let size = grid * res;
+            let a = &self.atlases[v];
             self.gpu.one_time(|cb| unsafe {
-                self.gpu.memory_barrier(
-                    cb,
-                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-                    vk::AccessFlags2::SHADER_WRITE,
-                    vk::PipelineStageFlags2::COMPUTE_SHADER,
-                    vk::AccessFlags2::SHADER_READ,
-                );
+                let rw = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
+                let cs = vk::PipelineStageFlags2::COMPUTE_SHADER;
+                self.gpu.memory_barrier(cb, vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::SHADER_WRITE, cs, rw);
+                // coverage-weighted mips of the uncompressed scratch atlas
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.mip_pipe);
                 for level in 1..mips {
-                    let s = (size >> level).max(1);
-                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.mip_layout, 0, &[self.mip_sets[slot][level as usize - 1]], &[]);
+                    let s = size >> level;
+                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.mip_layout, 0, &[mip_sets[level as usize]], &[]);
                     d.cmd_dispatch(cb, s.div_ceil(8), s.div_ceil(8), 1);
-                    self.gpu.memory_barrier(
+                    self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, cs, rw);
+                }
+                // BC encode every level: (mode, scratch level, target image, target level)
+                let mut jobs = Vec::new();
+                for level in 0..mips {
+                    for (mode, img) in [(0u32, &a.albedo), (1, &a.normal), (2, &a.depth)] {
+                        jobs.push((mode, level, img, level));
+                    }
+                }
+                for level in 1..mips {
+                    jobs.push((3u32, level, &a.vis, level - 1)); // half resolution: from scratch level+1
+                }
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_pipe);
+                let mut offset = 0u32; // in blocks
+                let mut copies = Vec::new();
+                for &(mode, level, img, dst_level) in &jobs {
+                    let s = size >> level;
+                    let bx = s / 4;
+                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_layout, 0, &[enc_sets[level as usize]], &[]);
+                    let pc = [mode, bx, bx, offset];
+                    d.cmd_push_constants(cb, self.bcenc_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&pc));
+                    d.cmd_dispatch(cb, bx.div_ceil(8), bx.div_ceil(8), 1);
+                    copies.push((
+                        img.raw,
+                        vk::BufferImageCopy {
+                            buffer_offset: offset as u64 * 16,
+                            buffer_row_length: 0,
+                            buffer_image_height: 0,
+                            image_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: dst_level,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            },
+                            image_offset: vk::Offset3D::default(),
+                            image_extent: vk::Extent3D { width: s, height: s, depth: 1 },
+                        },
+                    ));
+                    offset += bx * bx;
+                }
+                assert!(offset as u64 * 16 <= enc_size, "bc block buffer too small");
+                self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
+                let targets = [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw];
+                for img in targets {
+                    self.gpu.image_barrier(
                         cb,
-                        vk::PipelineStageFlags2::COMPUTE_SHADER,
-                        vk::AccessFlags2::SHADER_WRITE,
-                        vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                        img,
+                        vk::ImageLayout::UNDEFINED,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
+                        vk::AccessFlags2::NONE,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                    );
+                }
+                for (img, region) in &copies {
+                    d.cmd_copy_buffer_to_image(cb, enc.raw, *img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[*region]);
+                }
+                for img in targets {
+                    self.gpu.image_barrier(
+                        cb,
+                        img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::ALL_COMMANDS,
                         vk::AccessFlags2::SHADER_READ,
                     );
                 }
             })?;
+            if v == 0 {
+                if let Some(prefix) = self.dump_prefix.clone() {
+                    self.dump_scratch(&scratch[0], size, &prefix)?;
+                }
+            }
             tlas.destroy(&self.gpu);
+            let tris = tree.expanded_tris(&self.pack.meshes);
+            total_tris += tris;
             println!(
-                "Baked {} impostor {} ({} twig/trunk instances, {:.0}M tris) -> {}x{} atlas, {} mips in {:.2}s",
-                if tier == 0 { "standard" } else { "high-detail" },
+                "Baked {:<28} {:>4} parts {:>6.1}M tris -> {:>4}px frames, {:>5}^2 atlas, {:>5.1} MB, {:.2}s",
                 tree.name,
                 tree.parts.len(),
-                tree.expanded_tris(&self.pack.meshes) as f64 / 1e6,
+                tris as f64 / 1e6,
+                res,
                 size,
-                size,
-                mips,
+                a.bytes() as f64 / 1e6,
                 t0.elapsed().as_secs_f32()
             );
         }
-        self.write_set(self.bake_set, self.tlas.accel.raw, 0);
+        unsafe {
+            d.device_wait_idle()?;
+            d.destroy_descriptor_pool(pool, None);
+        }
+        for s in scratch.iter_mut() {
+            self.gpu.destroy_image(s);
+        }
+        self.gpu.destroy_buffer(&mut enc);
+        println!(
+            "Baked {} impostors ({:.0}M source triangles) in {:.1}s",
+            self.atlases.len(),
+            total_tris as f64 / 1e6,
+            t_all.elapsed().as_secs_f32()
+        );
         Ok(())
     }
 
-    /// Per tree: mesh only, impostor only, or both while inside the mesh <-> impostor band (the
-    /// shaders then dissolve between the two copies). Rebuilds the TLAS only when a tree changes state.
+    /// Debug: write the albedo of the first baked variant (uncompressed scratch) as a PNG.
+    fn dump_scratch(&self, img: &Image, size: u32, prefix: &str) -> Result<()> {
+        let n = size as u64 * size as u64;
+        let mut buf = self.gpu.create_buffer(n * 4, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "dump")?;
+        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+        let region = vk::BufferImageCopy {
+            image_subresource: layers,
+            image_extent: vk::Extent3D { width: size, height: size, depth: 1 },
+            ..Default::default()
+        };
+        self.gpu.one_time(|cb| unsafe {
+            self.gpu.memory_barrier(cb, vk::PipelineStageFlags2::ALL_COMMANDS, vk::AccessFlags2::SHADER_WRITE, vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
+            self.gpu.device.cmd_copy_image_to_buffer(cb, img.raw, vk::ImageLayout::GENERAL, buf.raw, &[region]);
+        })?;
+        let mut px = buf.mapped()[..(n * 4) as usize].to_vec();
+        for p in px.chunks_mut(4) {
+            for c in p.iter_mut().take(3) {
+                *c = ((*c as f32) * 2.2).min(255.0) as u8;
+            }
+            p[3] = 255;
+        }
+        self.gpu.destroy_buffer(&mut buf);
+        let path = format!("{prefix}_albedo.png");
+        let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
+        let mut enc = png::Encoder::new(file, size, size);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header()?.write_image_data(&px)?;
+        println!("wrote {path}");
+        Ok(())
+    }
+
+    /// Per plant: culled, mesh only, impostor only, or both while inside the mesh <-> impostor
+    /// band (the shaders then dissolve between the two copies). LOD distances scale with the
+    /// variant's size (`lod_scale`); small plants also have a draw distance. Rebuilds the TLAS
+    /// only when a plant changes state.
     fn update_instances(&mut self, cam: Vec3, lod: f32, band: f32) -> Result<FrameStats> {
         let mut changed = self.first_update;
         self.first_update = false;
-        // The shader fade is exactly 1 below a and exactly 0 above b, so "mesh only" / "impostor
-        // only" are safe there; the hysteresis just keeps "both" a little longer.
-        let (a, b) = if lod <= 0.0 { (-1.0, -1.0) } else { (lod - band * 0.5, lod + band * 0.5) };
         let mut near = 0;
         for (i, t) in self.world.trees.iter().enumerate() {
+            let vi = &self.catalog.variants[t.variant as usize];
+            let ls = vi.lod_scale;
+            // The shader fade is exactly 1 below a and exactly 0 above b, so "mesh only" /
+            // "impostor only" are safe there; the hysteresis just keeps "both" a little longer.
+            let (a, b) = if lod <= 0.0 { (-1.0, -1.0) } else { ((lod - band * 0.5) * ls, (lod + band * 0.5) * ls) };
+            let (h1, h2) = (0.5 * ls, 2.0 * ls);
             let d = t.center.distance(cam);
             let cur = self.lod_state[i];
-            let next = match cur {
-                Lod::Mesh if d > a - 0.5 => Lod::Both,
-                Lod::Impostor if d < b + 0.5 => Lod::Both,
-                Lod::Both if d < a - 2.0 => Lod::Mesh,
-                Lod::Both if d > b + 2.0 => Lod::Impostor,
-                s => s,
+            let next = if vi.cull > 0.0 && (d > vi.cull + 3.0 || (cur == Lod::Culled && d > vi.cull)) {
+                Lod::Culled
+            } else {
+                match cur {
+                    Lod::Culled if d < a => Lod::Mesh,
+                    Lod::Culled if d > b => Lod::Impostor,
+                    Lod::Culled => Lod::Both,
+                    Lod::Mesh if d > a - h1 => Lod::Both,
+                    Lod::Impostor if d < b + h1 => Lod::Both,
+                    Lod::Both if d < a - h2 => Lod::Mesh,
+                    Lod::Both if d > b + h2 => Lod::Impostor,
+                    s => s,
+                }
             };
             if next != cur {
                 self.lod_state[i] = next;
                 changed = true;
             }
-            near += (next != Lod::Impostor) as usize;
+            near += matches!(next, Lod::Mesh | Lod::Both) as usize;
         }
         self.near_count = near;
         if changed {
             let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
-            // Band trees: not opaque, so the dissolve any-hit runs (hit record 2).
+            // Band plants: not opaque, so the dissolve any-hit runs (hit record 2).
             let band_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
             let imp_flags = vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
             let terrain_id = self.pack.meshes.len();
             self.insts.clear();
             self.inst_data.clear();
             self.inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
-            // Mask bit 0: meshes and terrain. Bits 1..7: impostors by lattice colour, so shadow
-            // rays leaving an impostor can skip that impostor (its self-shadowing is baked).
+            // Mask bit 0: meshes and terrain. Bits 1..7: impostors by lattice colour.
             self.insts.push(accel::make_instance(
                 &glam::Affine3A::IDENTITY,
                 terrain_id as u32,
@@ -1013,21 +1288,28 @@ impl Renderer {
                 mesh_flags,
                 self.blas[terrain_id].addr,
             ));
-            // Instance budget: beyond it, further trees stay impostors (protects VRAM when the
+            // Instance budget: beyond it, further plants stay impostors (protects VRAM when the
             // LOD distance is pushed very far in a dense forest).
-            const MAX_INSTANCES: usize = 12_000_000;
+            const MAX_INSTANCES: usize = 8_000_000;
             for (i, t) in self.world.trees.iter().enumerate() {
-                let seed = ((t.seed as u32) & 0x1FFF) << 11;
-                let parts = self.pack.trees[t.variant as usize].parts.len();
-                if self.lod_state[i] == Lod::Mesh && self.insts.len() + parts > MAX_INSTANCES {
-                    self.lod_state[i] = Lod::Impostor;
-                }
                 let state = self.lod_state[i];
+                if state == Lod::Culled {
+                    continue;
+                }
+                let seed = ((t.seed as u32) & 0x1FFF) << 11;
+                let variant = &self.pack.trees[t.variant as usize];
+                // Over budget: this plant is emitted as an impostor only (its LOD state is kept,
+                // so it does not oscillate between states).
+                let state = if state != Lod::Impostor && self.insts.len() + variant.parts.len() > MAX_INSTANCES {
+                    Lod::Impostor
+                } else {
+                    state
+                };
                 let center = t.center.to_array();
-                let tree = i as u32 & 0xFF_FFFF;
+                let tree = (i as u32 & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
                 if state != Lod::Impostor {
                     let (flags, sbt) = if state == Lod::Mesh { (mesh_flags, 0) } else { (band_flags, 2) };
-                    for p in &self.pack.trees[t.variant as usize].parts {
+                    for p in &variant.parts {
                         let m = t.xform * p.xform;
                         self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
                         self.inst_data.push(InstInfo { center, data: tree });
@@ -1047,14 +1329,14 @@ impl Renderer {
                 }
             }
             if self.insts.len() > self.tlas.capacity as usize {
-                let cap = (self.insts.len() as f32 * 1.5) as u32;
+                let cap = ((self.insts.len() as f32 * 1.5) as usize).min(MAX_INSTANCES + 500_000) as u32;
                 println!("Growing TLAS capacity to {cap} instances");
                 unsafe { self.gpu.device.device_wait_idle()? };
                 let mut old = std::mem::replace(&mut self.tlas, Tlas::new(&self.gpu, cap)?);
                 old.destroy(&self.gpu);
                 let mut old_info = std::mem::replace(&mut self.inst_info, Self::create_inst_info(&self.gpu, cap)?);
                 self.gpu.destroy_buffer(&mut old_info);
-                self.write_set(self.main_set, self.tlas.accel.raw, 0);
+                self.write_set(self.main_set, self.tlas.accel.raw, None);
             }
             self.tlas.write(&self.insts);
             let bytes: &[u8] = bytemuck::cast_slice(&self.inst_data);
@@ -1071,6 +1353,11 @@ impl Renderer {
     /// Supersampled tracing resolution.
     pub fn render_extent(&self) -> (u32, u32) {
         (self.render_extent.width, self.render_extent.height)
+    }
+
+    /// Drop the TAA history (camera cut).
+    pub fn reset_taa(&mut self) {
+        self.taa_reset = true;
     }
 
     pub fn render_scale(&self) -> f32 {
@@ -1156,8 +1443,7 @@ impl Renderer {
         self.out_img = o;
         self.tg = tg;
         self.readback = r;
-        self.write_set(self.main_set, self.tlas.accel.raw, 0);
-        self.write_set(self.bake_set, self.tlas.accel.raw, 0);
+        self.write_set(self.main_set, self.tlas.accel.raw, None);
         self.write_resolve_set();
         self.taa_reset = true;
         Ok(())
@@ -1209,10 +1495,8 @@ impl Renderer {
         if lod <= 0.0 {
             g.lod_params[0] = 0.0; // all impostors: no dissolve band
         }
-        if self.tiers.len() < 2 {
-            g.lod_params[1] = 0.0; // no high-detail tier
-        }
-        g.lod_params[3] = self.pack.trees.len() as f32;
+        g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
+        g.lod_params[3] = self.ground_layers as f32; // scanned ground layers loaded (4 = full set)
         g.params[1] = self.has_tex as u32 as f32; // material textures available
         let globals = &g;
         let stats = self.update_instances(cam, lod, g.lod_params[0])?;
@@ -1398,67 +1682,5 @@ impl Renderer {
             None
         };
         Ok((stats, image))
-    }
-
-    /// Read back mip 0 of a variant's atlases as display-friendly RGBA8 images
-    /// (albedo, normals, depth/coverage).
-    pub fn dump_atlas(&mut self, variant: usize) -> Result<(u32, Vec<u8>, Vec<u8>, Vec<u8>)> {
-        let size = self.tiers[0].grid * self.tiers[0].res;
-        let n = size as u64 * size as u64;
-        let mut ba = self.gpu.create_buffer(n * 4, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "dump a")?;
-        let mut bb = self.gpu.create_buffer(n * 8, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "dump b")?;
-        let (a, b, _) = &self.atlases[variant];
-        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
-        let region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: layers,
-            image_offset: vk::Offset3D::default(),
-            image_extent: vk::Extent3D { width: size, height: size, depth: 1 },
-        };
-        let d = &self.gpu.device;
-        self.gpu.one_time(|cb| unsafe {
-            d.cmd_copy_image_to_buffer(cb, a.raw, vk::ImageLayout::GENERAL, ba.raw, &[region]);
-            d.cmd_copy_image_to_buffer(cb, b.raw, vk::ImageLayout::GENERAL, bb.raw, &[region]);
-        })?;
-        let albedo = ba.mapped()[..(n * 4) as usize].to_vec();
-        let halves: Vec<u16> = bytemuck::pod_collect_to_vec(&bb.mapped()[..(n * 8) as usize]);
-        let mut normals = vec![0u8; (n * 4) as usize];
-        let mut depth = vec![0u8; (n * 4) as usize];
-        for i in 0..n as usize {
-            let px = [half_to_f32(halves[i * 4]), half_to_f32(halves[i * 4 + 1]), half_to_f32(halves[i * 4 + 2]), half_to_f32(halves[i * 4 + 3])];
-            let cov = px[3].clamp(0.0, 1.0);
-            normals[i * 4] = ((px[0] * 0.5 + 0.5) * 255.0 * cov) as u8;
-            normals[i * 4 + 1] = ((px[1] * 0.5 + 0.5) * 255.0 * cov) as u8;
-            normals[i * 4 + 2] = (cov * 255.0) as u8;
-            normals[i * 4 + 3] = 255;
-            let dd = ((px[2] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0 * cov) as u8;
-            depth[i * 4] = dd;
-            depth[i * 4 + 1] = dd;
-            depth[i * 4 + 2] = dd;
-            depth[i * 4 + 3] = 255;
-        }
-        let mut albedo_vis = albedo;
-        for px in albedo_vis.chunks_mut(4) {
-            for c in px.iter_mut().take(3) {
-                *c = ((*c as f32) * 2.2).min(255.0) as u8;
-            }
-            px[3] = 255;
-        }
-        self.gpu.destroy_buffer(&mut ba);
-        self.gpu.destroy_buffer(&mut bb);
-        Ok((size, albedo_vis, normals, depth))
-    }
-}
-
-fn half_to_f32(h: u16) -> f32 {
-    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
-    let exp = ((h >> 10) & 0x1f) as i32;
-    let man = (h & 0x3ff) as f32;
-    match exp {
-        0 => sign * man * 2f32.powi(-24),
-        31 => sign * f32::INFINITY,
-        _ => sign * (1.0 + man / 1024.0) * 2f32.powi(exp - 15),
     }
 }

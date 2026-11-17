@@ -6,6 +6,7 @@ layout(location = 0) rayPayloadInEXT HitPayload pl;
 hitAttributeEXT ImpHit hit;
 
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
 
 void main() {
     vec4 a = unpackUnorm4x8(hit.albedoAo);
@@ -36,6 +37,6 @@ void main() {
     // 1.13: averaged impostor normals correlate less with the sunlit spots than real leaves do
     // (a sunlit leaf usually also faces the sun); calibrated with tools/compare.ps1.
     pl.sunVis = 1.13;
-    pl.trans = 0.33 * leafiness; // mean of the foliage translucency map
+    pl.trans = pl.albedo * imps[ci & 0xFFu].trans.rgb * leafiness; // albedo x species mean transmission
     pl.shadowMask = 0xFFu; // includes this tree: traced self-shadowing
 }

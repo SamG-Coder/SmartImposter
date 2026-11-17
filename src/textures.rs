@@ -1,5 +1,5 @@
 //! Material textures exported from the Unreal Megaplant (tools/ue_export.py): decode, upload,
-//! generate mips on the GPU.
+//! generate mips on the GPU. Also the per-species sets and the ground layers.
 
 use crate::gpu::{color_range, Gpu, Image};
 use anyhow::{bail, Context, Result};
@@ -7,7 +7,7 @@ use ash::vk;
 use gpu_allocator::MemoryLocation;
 use std::path::{Path, PathBuf};
 
-/// Texture roles in binding order, matched by file-name suffix, with their formats.
+/// Species texture roles in binding order, matched by file-name suffix, with their formats.
 const ROLES: [(&str, vk::Format); 4] = [
     ("_CA.png", vk::Format::R8G8B8A8_SRGB),   // foliage colour + alpha
     ("_NT.png", vk::Format::R8G8B8A8_UNORM),  // foliage normal + translucency
@@ -15,7 +15,7 @@ const ROLES: [(&str, vk::Format); 4] = [
     ("_NAH.png", vk::Format::R8G8B8A8_UNORM), // bark normal + AO + height
 ];
 
-fn find(dir: &Path, suffix: &str, foliage: bool) -> Option<PathBuf> {
+pub fn find(dir: &Path, suffix: &str, foliage: bool) -> Option<PathBuf> {
     std::fs::read_dir(dir).ok()?.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| {
         let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
         n.ends_with(suffix) && n.contains("Foliage") == foliage && (n.contains("Foliage") || n.contains("Bark"))
@@ -39,7 +39,7 @@ fn decode_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     Ok((info.width, info.height, rgba))
 }
 
-fn upload_with_mips(gpu: &Gpu, w: u32, h: u32, rgba: &[u8], format: vk::Format, name: &str) -> Result<Image> {
+pub fn upload_with_mips(gpu: &Gpu, w: u32, h: u32, rgba: &[u8], format: vk::Format, name: &str) -> Result<Image> {
     let mips = 32 - w.max(h).leading_zeros();
     let img = gpu.create_image(
         w,
@@ -103,27 +103,167 @@ fn upload_with_mips(gpu: &Gpu, w: u32, h: u32, rgba: &[u8], format: vk::Format, 
     Ok(img)
 }
 
-/// Load the 4 material textures from `dir`. Returns 1x1 neutral placeholders (and false) when
-/// they are not there, so the renderer falls back to procedural leaf colours.
-pub fn load(gpu: &Gpu, dir: &str) -> Result<(Vec<Image>, bool)> {
-    let dir = Path::new(dir);
-    let paths: Vec<Option<PathBuf>> =
-        ROLES.iter().enumerate().map(|(i, (suffix, _))| find(dir, suffix, i < 2)).collect();
-    let have_all = paths.iter().all(|p| p.is_some());
+/// Halve an RGBA8 image with a 2x2 box filter until it fits in `max` texels per side.
+fn shrink(mut w: u32, mut h: u32, mut px: Vec<u8>, max: u32) -> (u32, u32, Vec<u8>) {
+    while w.max(h) > max && w >= 2 && h >= 2 {
+        let (nw, nh) = (w / 2, h / 2);
+        let mut out = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh as usize {
+            for x in 0..nw as usize {
+                for c in 0..4 {
+                    let at = |xx: usize, yy: usize| px[(yy * w as usize + xx) * 4 + c] as u32;
+                    let s = at(2 * x, 2 * y) + at(2 * x + 1, 2 * y) + at(2 * x, 2 * y + 1) + at(2 * x + 1, 2 * y + 1);
+                    out[(y * nw as usize + x) * 4 + c] = ((s + 2) / 4) as u8;
+                }
+            }
+        }
+        (w, h, px) = (nw, nh, out);
+    }
+    (w, h, px)
+}
+
+/// One texture to load: path (None = 1x1 placeholder of `fill`) and format.
+struct Job {
+    path: Option<PathBuf>,
+    format: vk::Format,
+    fill: [u8; 4],
+}
+
+/// Mean linear luminance of an sRGB RGBA8 image over its opaque texels (all texels when the
+/// alpha channel is empty).
+fn mean_luminance(px: &[u8]) -> f32 {
+    stats(px, px).0
+}
+
+/// (mean linear luminance of `px`, mean blue channel of `px`) over the texels that are opaque in
+/// `mask` (all texels when the mask has no alpha).
+fn stats(px: &[u8], mask: &[u8]) -> (f32, f32) {
+    let lin = |c: u8| {
+        let c = c as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    };
+    let same_size = mask.len() == px.len();
+    let has_alpha = same_size && mask.chunks(4).any(|p| p[3] > 128);
+    let (mut sum, mut sum_b, mut n) = (0.0f64, 0.0f64, 0u64);
+    for (i, p) in px.chunks(4).enumerate().step_by(7) {
+        if has_alpha && mask[i * 4 + 3] <= 128 {
+            continue;
+        }
+        sum += (0.2126 * lin(p[0]) + 0.7152 * lin(p[1]) + 0.0722 * lin(p[2])) as f64;
+        sum_b += p[2] as f64 / 255.0;
+        n += 1;
+    }
+    if n == 0 { (0.0, 0.0) } else { ((sum / n as f64) as f32, (sum_b / n as f64) as f32) }
+}
+
+/// Decode all PNGs on worker threads (capped at `max` texels per side), then upload with mips.
+/// Also returns each texture's mean linear luminance (0 for placeholders).
+fn load_jobs(gpu: &Gpu, jobs: &[Job], max: u32) -> Result<(Vec<Image>, Vec<(f32, f32)>)> {
+    let t = std::time::Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let decoded: Vec<std::sync::Mutex<Option<Result<(u32, u32, Vec<u8>)>>>> = jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= jobs.len() {
+                    break;
+                }
+                if let Some(p) = &jobs[i].path {
+                    let r = decode_rgba(p).with_context(|| format!("decoding {}", p.display())).map(|(w, h, px)| shrink(w, h, px, max));
+                    *decoded[i].lock().unwrap() = Some(r);
+                }
+            });
+        }
+    });
     let mut out = Vec::new();
-    for (i, (_, format)) in ROLES.iter().enumerate() {
-        if have_all {
-            let path = paths[i].as_ref().unwrap();
-            let t = std::time::Instant::now();
-            let (w, h, rgba) = decode_rgba(path).with_context(|| format!("decoding {}", path.display()))?;
-            out.push(upload_with_mips(gpu, w, h, &rgba, *format, &path.display().to_string())?);
-            println!("Texture {} {}x{} ({:.2}s)", path.file_name().unwrap().to_string_lossy(), w, h, t.elapsed().as_secs_f32());
-        } else {
-            out.push(upload_with_mips(gpu, 1, 1, &[128, 128, 255, 255], *format, "placeholder")?);
+    let mut lums = Vec::new();
+    let mut bytes = 0u64;
+    let mut prev: Vec<u8> = Vec::new(); // foliage NT follows foliage CA: use its alpha as the mask
+    for (job, slot) in jobs.iter().zip(decoded) {
+        match slot.into_inner().unwrap() {
+            Some(r) => {
+                let (w, h, px) = r?;
+                let st = if job.format == vk::Format::R8G8B8A8_UNORM { stats(&px, &prev) } else { (mean_luminance(&px), 0.0) };
+                lums.push(st);
+                bytes += w as u64 * h as u64 * 4 * 4 / 3;
+                let name = job.path.as_ref().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+                out.push(upload_with_mips(gpu, w, h, &px, job.format, &name)?);
+                prev = px;
+            }
+            None => {
+                lums.push((0.0, 0.0));
+                prev.clear();
+                out.push(upload_with_mips(gpu, 1, 1, &job.fill, job.format, "placeholder")?);
+            }
         }
     }
-    if !have_all {
-        println!("Material textures not found in {} - using procedural leaf colours", dir.display());
+    let loaded = jobs.iter().filter(|j| j.path.is_some()).count();
+    if loaded > 0 {
+        println!("Textures: {loaded} loaded ({:.0} MB on GPU) in {:.2}s", bytes as f64 / 1e6, t.elapsed().as_secs_f32());
     }
-    Ok((out, have_all))
+    Ok((out, lums))
+}
+
+fn tex_max() -> u32 {
+    std::env::var("SI_TEX_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)
+}
+
+/// Foliage brightness every species is normalised to (mean linear luminance of the leaf
+/// texture). Megaplant colour maps are authored very differently (Unreal's material darkens the
+/// pale ones), so the raw textures range from ~0.04 to ~0.2.
+const FOLIAGE_LUMINANCE: f32 = 0.09; // Black Alder's, which the lighting was tuned on
+
+/// 4 textures per species (foliage CA, foliage NT, bark C, bark NAH); missing ones get neutral
+/// placeholders. Returns the textures, per species (foliage brightness scale, translucency mask
+/// mean), and false when no species has foliage textures (procedural leaf colours).
+pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<(Vec<Image>, Vec<(f32, f32)>, bool)> {
+    let fills = [[40, 70, 20, 255], [128, 128, 85, 255], [70, 58, 46, 255], [128, 128, 255, 255]];
+    let mut jobs = Vec::new();
+    for s in &cat.species {
+        for (i, (_, format)) in ROLES.iter().enumerate() {
+            let path = s.textures[i].clone().filter(|p| p.exists());
+            jobs.push(Job { path, format: *format, fill: fills[i] });
+        }
+    }
+    if jobs.is_empty() {
+        for (i, (_, format)) in ROLES.iter().enumerate() {
+            jobs.push(Job { path: None, format: *format, fill: fills[i] });
+        }
+    }
+    let has = cat.species.iter().any(|s| s.textures[0].as_ref().is_some_and(|p| p.exists()));
+    if !has {
+        println!("Material textures not found - using procedural leaf colours");
+    }
+    let (images, lums) = load_jobs(gpu, &jobs, tex_max())?;
+    let scales: Vec<(f32, f32)> = cat
+        .species
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let l = lums.get(i * 4).map(|x| x.0).unwrap_or(0.0);
+            let tb = lums.get(i * 4 + 1).map(|x| x.1).unwrap_or(0.0);
+            let k = if l > 0.0 { (FOLIAGE_LUMINANCE / l).clamp(0.25, 1.6) } else { 1.0 };
+            println!("  {:<24} foliage luminance {:.3} -> x{:.2}, translucency mean {:.2}", s.name, l, k, tb);
+            (k, if tb > 0.0 { tb } else { 0.33 })
+        })
+        .collect();
+    Ok((images, scales, has))
+}
+
+/// Ground layers: albedo (sRGB), normal, ORM per layer, in catalog order.
+pub fn load_ground(gpu: &Gpu, ground: &[crate::catalog::GroundMaterial]) -> Result<Vec<Image>> {
+    let mut jobs = Vec::new();
+    for g in ground {
+        jobs.push(Job { path: Some(g.albedo.clone()), format: vk::Format::R8G8B8A8_SRGB, fill: [0; 4] });
+        jobs.push(Job { path: Some(g.normal.clone()), format: vk::Format::R8G8B8A8_UNORM, fill: [0; 4] });
+        jobs.push(Job { path: Some(g.orm.clone()), format: vk::Format::R8G8B8A8_UNORM, fill: [0; 4] });
+    }
+    if jobs.is_empty() {
+        jobs.push(Job { path: None, format: vk::Format::R8G8B8A8_SRGB, fill: [60, 60, 40, 255] });
+    } else {
+        println!("Ground layers: {}", ground.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", "));
+    }
+    Ok(load_jobs(gpu, &jobs, tex_max())?.0)
 }
