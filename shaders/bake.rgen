@@ -60,7 +60,7 @@ void main() {
         vec2 uv = (vec2(px) + (vec2(sx, sy) + 0.5) / float(pc.ss)) / float(pc.res);
         vec3 o = c + r * ((uv.x - 0.5) * 2.0 * R) + u * ((uv.y - 0.5) * 2.0 * R) + f * (1.05 * R);
         pl.t = -1.0;
-        traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, o, 0.0, -f, 2.1 * R, 0);
+        traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, o, 0.0, -f, 2.1 * R, 0); // not opaque: alpha-tested cards run tri.rahit
         if (pl.t < 0.0) continue;
 
         hits++;
@@ -75,7 +75,7 @@ void main() {
         for (uint a = 0u; a < pc.aoRays; ++a) {
             vec3 d2 = cosineSample(n, rng);
             vis = 0u;
-            traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsOpaqueEXT,
+            traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                         0xFF, 0, 0, 1, p + ng * 0.003, 0.0, d2, pc.aoRange, 1);
             occ += 1.0 - float(vis);
         }
@@ -88,7 +88,7 @@ void main() {
             vec3 dir = uniformSphere(rng);
             float side = dot(ng, dir) >= 0.0 ? 1.0 : -1.0;
             vis = 0u;
-            traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsOpaqueEXT,
+            traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT,
                         0xFF, 0, 0, 1, p + ng * side * 0.003, 0.0, dir, 2.2 * R, 1);
             va += float(vis);
             vb += float(vis) * dir;
@@ -108,5 +108,9 @@ void main() {
     float inv = 1.0 / float(hits);
     imageStore(bakeAlbedo, texel, vec4(sqrt(alb * inv), aosum * inv));
     imageStore(bakeND, texel, vec4(octEncode(normalize(nsum)), hsum * inv, float(hits) / float(pc.ss * pc.ss)));
-    imageStore(bakeVis, texel, vec4(vaSum * inv, clamp(vbSum * inv / 3.0 + 0.5, 0.0, 1.0)));
+    // Visibility atlas: x = a, z = b.y (up: sky occlusion). y = length of the averaged normal
+    // (normal spread: 1 = flat surface, ~0.5 = blades in all directions; Lambert over the texel is
+    // |mean n| * max(dot(mean n^, L), 0)). w = b.z (unused).
+    vec3 vb = clamp(vbSum * inv / 3.0 + 0.5, 0.0, 1.0);
+    imageStore(bakeVis, texel, vec4(vaSum * inv, clamp(length(nsum) * inv, 0.0, 1.0), vb.y, vb.z));
 }

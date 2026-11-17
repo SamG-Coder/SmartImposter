@@ -30,7 +30,7 @@ struct ImpHit {
 uint instSeed(uint ci) { return ci >> 11; }
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
-struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint pad; };
+struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)
 
 // Per plant variant (= atlas slot).
 struct ImpostorInfo {

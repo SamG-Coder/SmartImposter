@@ -11,6 +11,8 @@ pub enum Kind {
     Tree,
     Shrub,
     Plant,
+    /// Megascans grass patches (alpha-tested cards, tools/grass_to_mtree.py)
+    Grass,
 }
 
 pub struct Species {
@@ -33,6 +35,8 @@ pub struct Variant {
     pub lod_scale: f32,
     /// Draw distance in metres (0 = unlimited).
     pub cull: f32,
+    /// Impostor texel size multiplier (grass patches are wide and low: coarser atlases).
+    pub texel_scale: f32,
 }
 
 /// A scanned ground surface: albedo, normal (DirectX), occlusion/roughness/metal.
@@ -48,6 +52,8 @@ pub struct Catalog {
     pub variants: Vec<Variant>,
     /// Texture set (= species index) of every mesh in the merged pack.
     pub mesh_species: Vec<u32>,
+    /// Meshes whose leaf texture alpha is an opacity mask (cards): alpha-tested in tri.rahit.
+    pub mesh_alpha: Vec<bool>,
     /// Ground layers in shader order: forest floor, mossy grass, uncut grass, dried grass.
     pub ground: Vec<GroundMaterial>,
 }
@@ -89,7 +95,7 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         jsons.retain(|p| only.split(',').any(|k| p.file_stem().unwrap().to_string_lossy().contains(k)));
     }
     let mut pack = TreePack { meshes: Vec::new(), trees: Vec::new() };
-    let mut cat = Catalog { species: Vec::new(), variants: Vec::new(), mesh_species: Vec::new(), ground: find_ground() };
+    let mut cat = Catalog { species: Vec::new(), variants: Vec::new(), mesh_species: Vec::new(), mesh_alpha: Vec::new(), ground: find_ground() };
 
     if jsons.is_empty() {
         // Legacy single-species scene.
@@ -106,9 +112,10 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         });
         for t in &p.trees {
             let (lod_scale, cull) = lod_for(t.bmax.y - t.bmin.y);
-            cat.variants.push(Variant { species: 0, kind: Kind::Tree, height: t.bmax.y - t.bmin.y, lod_scale, cull });
+            cat.variants.push(Variant { species: 0, kind: Kind::Tree, height: t.bmax.y - t.bmin.y, lod_scale, cull, texel_scale: 1.0 });
         }
         cat.mesh_species = vec![0; p.meshes.len()];
+        cat.mesh_alpha = vec![false; p.meshes.len()];
         return Ok((p, cat));
     }
 
@@ -120,8 +127,10 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         let kind = match j["kind"].as_str().unwrap_or("tree") {
             "shrub" => Kind::Shrub,
             "plant" => Kind::Plant,
+            "grass" => Kind::Grass,
             _ => Kind::Tree,
         };
+        let alpha = j["alpha"].as_bool().unwrap_or(false);
         let base = json.parent().unwrap_or(Path::new("."));
         let tex = |key: &str| j["textures"][key].as_str().map(|s| base.join(s.replace('\\', "/")));
         let mesh_base = pack.meshes.len() as u32;
@@ -131,11 +140,18 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
                 part.mesh += mesh_base;
             }
             let height = t.bmax.y - t.bmin.y;
-            let (lod_scale, cull) = lod_for(height);
-            cat.variants.push(Variant { species: si, kind, height, lod_scale, cull });
+            let (mut lod_scale, cull) = lod_for(height);
+            let texel_scale = if kind == Kind::Grass { 1.6 } else { 1.0 };
+            if kind == Kind::Grass {
+                // Blades are thinner than an atlas texel: keep patches as real cards to ~20 m,
+                // where the blades are sub-pixel and the impostor reads as the same sward.
+                lod_scale = lod_scale.max(0.4);
+            }
+            cat.variants.push(Variant { species: si, kind, height, lod_scale, cull, texel_scale });
             pack.trees.push(t);
         }
         cat.mesh_species.extend(std::iter::repeat(si as u32).take(p.meshes.len()));
+        cat.mesh_alpha.extend(std::iter::repeat(alpha).take(p.meshes.len()));
         pack.meshes.extend(p.meshes);
         cat.species.push(Species {
             name: j["species"].as_str().unwrap_or("?").to_string(),

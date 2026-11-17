@@ -52,6 +52,13 @@ struct Targets {
     cur: Image,
     depth: Image,
     hist: [Image; 2],
+    // DLSS Ray Reconstruction inputs (render resolution), written by main.rgen when DLSS is on
+    viewz: Image,  // r32f linear view depth
+    motion: Image, // rg16f pixel motion, previous - current
+    nrm: Image,    // rgba16f world normal, roughness
+    diff: Image,   // rgba8 diffuse albedo
+    spec: Image,   // rgba8 specular albedo
+    dlss_out: Image, // rgba16f denoised + upscaled HDR (display resolution)
 }
 
 /// Per TLAS instance data for the LOD cross-fade shaders (indexed by gl_InstanceID).
@@ -93,8 +100,11 @@ struct ImpostorInfo {
 struct MeshInfoGpu {
     addr: [u64; 5], // pos, nrm, idx, mat, uv
     tex_set: u32,
-    pad: u32,
+    flags: u32, // MESH_ALPHA_TESTED
 }
+
+/// Mesh flag: the leaf texture's alpha is an opacity mask (alpha-tested in tri.rahit).
+const MESH_ALPHA_TESTED: u32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -203,6 +213,14 @@ pub struct Renderer {
     taa_pipe: vk::Pipeline,
     taa_sets: [vk::DescriptorSet; 2],
     resolve_sets: [vk::DescriptorSet; 2],
+    dlss_resolve_set: vk::DescriptorSet,
+    /// NGX initialised and Ray Reconstruction available.
+    dlss_ok: bool,
+    /// Active DLSS mode (index into dlss::MODES), None = TAA + supersampling.
+    dlss_mode: Option<usize>,
+    last_frame: Instant,
+    /// Jitter sign convention passed to NGX (SI_DLSS_JITTER="+x,+y" overrides for testing).
+    dlss_jitter_sign: (f32, f32),
     parity: usize,
     taa_reset: bool,
     pub taa_enabled: bool,
@@ -263,6 +281,33 @@ pub struct Renderer {
     render_extent: vk::Extent2D,
     resolve_layout: vk::PipelineLayout,
     resolve_pipe: vk::Pipeline,
+}
+
+/// World -> view for NGX: row-major, row vectors (v_view = v_world * M), x right, y up, z forward.
+fn world_to_view(g: &Globals) -> [f32; 16] {
+    let p = Vec3::from_slice(&g.cam_pos[..3]);
+    let r = Vec3::from_slice(&g.cam_right[..3]);
+    let u = Vec3::from_slice(&g.cam_up[..3]);
+    let f = Vec3::from_slice(&g.cam_fwd[..3]);
+    [
+        r.x, u.x, f.x, 0.0, //
+        r.y, u.y, f.y, 0.0, //
+        r.z, u.z, f.z, 0.0, //
+        -r.dot(p), -u.dot(p), -f.dot(p), 1.0,
+    ]
+}
+
+/// View -> clip (DirectX-style perspective, depth 0..1), matching the camera's tan(fov/2) values.
+fn view_to_clip(g: &Globals) -> [f32; 16] {
+    let (sx, sy) = (1.0 / g.cam_right[3], 1.0 / g.cam_up[3]);
+    let (n, f) = (0.02f32, 1.0e5f32);
+    let a = f / (f - n);
+    [
+        sx, 0.0, 0.0, 0.0, //
+        0.0, sy, 0.0, 0.0, //
+        0.0, 0.0, a, 1.0, //
+        0.0, 0.0, -n * a, 0.0,
+    ]
 }
 
 fn scaled_extent(e: vk::Extent2D, scale: f32) -> vk::Extent2D {
@@ -384,10 +429,22 @@ impl Renderer {
         vsync: bool,
         validation: bool,
         render_scale: f32,
+        dlss_mode: Option<usize>,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let gpu = Gpu::new(display, window, validation)?;
         println!("GPU: {}", gpu.device_name);
+        let dlss_ok = match crate::dlss::init(&gpu.entry, &gpu.instance, gpu.pdev, &gpu.device) {
+            Ok(()) => {
+                println!("DLSS Ray Reconstruction available");
+                true
+            }
+            Err(e) => {
+                println!("DLSS Ray Reconstruction off: {e}");
+                false
+            }
+        };
+        let dlss_mode = if dlss_ok { dlss_mode } else { None };
         let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog)?;
         let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground)?;
         let ground_layers = catalog.ground.len() as u32;
@@ -405,7 +462,10 @@ impl Renderer {
             println!("Ground mask {MASK_RES}^2 in {:.2}s", t.elapsed().as_secs_f32());
         }
         let swap = gpu.create_swapchain(width, height, vk::SwapchainKHR::null(), vsync)?;
-        let render_extent = scaled_extent(swap.extent, render_scale);
+        let render_extent = match dlss_mode {
+            Some(m) => scaled_extent(swap.extent, crate::dlss::MODES[m].1),
+            None => scaled_extent(swap.extent, render_scale),
+        };
         let (out_img, tg, readback) = Self::create_targets(&gpu, swap.extent, render_extent)?;
         let sharp_img = Self::create_sharp(&gpu, swap.extent)?;
 
@@ -421,7 +481,7 @@ impl Renderer {
             .map(|(i, m)| MeshInfoGpu {
                 addr: [m.pos.addr, m.nrm.addr, m.idx.addr, m.mat.addr, m.uv.addr],
                 tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
-                pad: 0,
+                flags: if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 },
             })
             .collect();
         let mesh_info = gpu.upload_buffer(bytemuck::cast_slice(&infos), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh info")?;
@@ -472,11 +532,12 @@ impl Renderer {
             let (lo, hi) = (t.bmin - pad, t.bmax + pad);
             let c = (t.bmin + t.bmax) * 0.5;
             let r = (t.bmax - t.bmin).length() * 0.5;
-            let res = imp.res_for(r, vi.lod_scale);
+            let res = imp.res_for(r / vi.texel_scale, vi.lod_scale);
             let mips = atlas_mips(res);
             imp_infos.push(ImpostorInfo {
                 center_radius: [c.x, c.y, c.z, r],
-                bmin: [lo.x, lo.y, lo.z, 0.0],
+                // w: 1 = foliage only (grass, ferns: no bark, so never classify texels as bark by colour)
+                bmin: [lo.x, lo.y, lo.z, matches!(vi.kind, crate::catalog::Kind::Grass | crate::catalog::Kind::Plant) as u32 as f32],
                 bmax: [hi.x, hi.y, hi.z, 0.0],
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
@@ -587,6 +648,13 @@ impl Renderer {
             b(14, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
             b(15, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_GROUND_TEX as u32, rt_all),
+            // DLSS Ray Reconstruction G-buffer (main.rgen): view depth, motion, normal+roughness,
+            // diffuse albedo, specular albedo
+            b(17, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
+            b(18, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
+            b(19, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
+            b(20, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
+            b(21, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -647,7 +715,7 @@ impl Renderer {
 
         let pool_sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 2 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 40 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 64 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 4 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 },
             vk::DescriptorPoolSize {
@@ -656,7 +724,7 @@ impl Renderer {
             },
         ];
         let desc_pool = unsafe {
-            gpu.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_sizes).max_sets(8), None)?
+            gpu.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().pool_sizes(&pool_sizes).max_sets(9), None)?
         };
         let sets = unsafe {
             gpu.device
@@ -695,14 +763,18 @@ impl Renderer {
         let sharpen_set = unsafe {
             gpu.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[sharpen_set_layout]))?[0]
         };
-        let resolve_sets: [vk::DescriptorSet; 2] = unsafe {
+        let [rs0, rs1, rs2]: [vk::DescriptorSet; 3] = unsafe {
             gpu.device
                 .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[resolve_set_layout, resolve_set_layout]),
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(desc_pool)
+                        .set_layouts(&[resolve_set_layout, resolve_set_layout, resolve_set_layout]),
                 )?
                 .try_into()
                 .unwrap()
         };
+        let resolve_sets = [rs0, rs1];
+        let dlss_resolve_set = rs2;
 
         // ---- TAA (render resolution): current sample + depth + history ping-pong + globals
         let taa_bindings = [
@@ -757,6 +829,16 @@ impl Renderer {
             taa_pipe,
             taa_sets,
             resolve_sets,
+            dlss_resolve_set,
+            dlss_ok,
+            dlss_mode,
+            last_frame: Instant::now(),
+            dlss_jitter_sign: {
+                let v = std::env::var("SI_DLSS_JITTER").unwrap_or_default();
+                // NGX wants the projection offset, the opposite of where the samples sit (measured:
+                // sharpest with both flipped). "+x"/"+y" restore the raw sample offset for testing.
+                (if v.contains("+x") { 1.0 } else { -1.0 }, if v.contains("+y") { 1.0 } else { -1.0 })
+            },
             parity: 0,
             taa_reset: true,
             taa_enabled: true,
@@ -818,6 +900,7 @@ impl Renderer {
         let _ = r.set_layout;
         r.write_set(r.main_set, r.tlas.accel.raw, None);
         r.write_resolve_set();
+        r.create_dlss_feature()?;
         r.bake_impostors()?;
         println!("Renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
         Ok(r)
@@ -844,16 +927,35 @@ impl Renderer {
         )?;
         let (w, h) = (render.width, render.height);
         let st = vk::ImageUsageFlags::STORAGE;
+        let ss = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED; // also read by NGX
         let tg = Targets {
-            cur: gpu.create_image(w, h, 1, vk::Format::R16G16B16A16_SFLOAT, st, "frame sample")?,
+            cur: gpu.create_image(w, h, 1, vk::Format::R16G16B16A16_SFLOAT, ss, "frame sample")?,
             depth: gpu.create_image(w, h, 1, vk::Format::R32_SFLOAT, st, "hit distance")?,
             hist: [
                 gpu.create_image(w, h, 1, vk::Format::R16G16B16A16_SFLOAT, st, "taa history 0")?,
                 gpu.create_image(w, h, 1, vk::Format::R16G16B16A16_SFLOAT, st, "taa history 1")?,
             ],
+            viewz: gpu.create_image(w, h, 1, vk::Format::R32_SFLOAT, ss, "view depth")?,
+            motion: gpu.create_image(w, h, 1, vk::Format::R16G16_SFLOAT, ss, "motion")?,
+            nrm: gpu.create_image(w, h, 1, vk::Format::R16G16B16A16_SFLOAT, ss, "normal roughness")?,
+            diff: gpu.create_image(w, h, 1, vk::Format::R8G8B8A8_UNORM, ss, "diffuse albedo")?,
+            spec: gpu.create_image(w, h, 1, vk::Format::R8G8B8A8_UNORM, ss, "specular albedo")?,
+            dlss_out: gpu.create_image(extent.width, extent.height, 1, vk::Format::R16G16B16A16_SFLOAT, ss, "dlss output")?,
         };
         gpu.one_time(|cb| {
-            for img in [out.raw, tg.cur.raw, tg.depth.raw, tg.hist[0].raw, tg.hist[1].raw] {
+            for img in [
+                out.raw,
+                tg.cur.raw,
+                tg.depth.raw,
+                tg.hist[0].raw,
+                tg.hist[1].raw,
+                tg.viewz.raw,
+                tg.motion.raw,
+                tg.nrm.raw,
+                tg.diff.raw,
+                tg.spec.raw,
+                tg.dlss_out.raw,
+            ] {
                 gpu.image_barrier(
                     cb,
                     img,
@@ -936,6 +1038,10 @@ impl Renderer {
             w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&species),
             w(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground_tex),
         ];
+        let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
+        for (k, info) in gbuf.iter().enumerate() {
+            writes.push(w(17 + k as u32, vk::DescriptorType::STORAGE_IMAGE).image_info(info));
+        }
         if let Some(bi) = &bake_imgs {
             for (k, info) in bi.iter().enumerate() {
                 writes.push(w(8 + k as u32, vk::DescriptorType::STORAGE_IMAGE).image_info(info));
@@ -1032,10 +1138,15 @@ impl Renderer {
             let (res, grid, mips) = (self.atlases[v].res, self.atlases[v].grid, self.atlases[v].mips);
             let tree = &self.pack.trees[v];
             let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+            let alpha_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
             let insts: Vec<_> = tree
                 .parts
                 .iter()
-                .map(|p| accel::make_instance(&p.xform, p.mesh, 0xFF, 0, flags, self.blas[p.mesh as usize].addr))
+                .map(|p| {
+                    let alpha = self.catalog.mesh_alpha.get(p.mesh as usize).copied().unwrap_or(false);
+                    let (f, sbt) = if alpha { (alpha_flags, 2) } else { (flags, 0) };
+                    accel::make_instance(&p.xform, p.mesh, 0xFF, sbt, f, self.blas[p.mesh as usize].addr)
+                })
                 .collect();
             let mut tlas = Tlas::new(&self.gpu, insts.len() as u32)?;
             tlas.write(&insts);
@@ -1049,6 +1160,7 @@ impl Renderer {
             let mut bg = Globals::default();
             bg.cam_fwd[3] = -(2.0 * r / res as f32 / imp.ss as f32);
             bg.params[1] = self.has_tex as u32 as f32;
+            bg.lod_params[2] = -1.0; // bake: tri.rahit only alpha-tests, no LOD dissolve
             self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&bg));
             let mut push = BakePush {
                 center_radius: [c.x, c.y, c.z, r],
@@ -1308,11 +1420,13 @@ impl Renderer {
                 let center = t.center.to_array();
                 let tree = (i as u32 & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
                 if state != Lod::Impostor {
-                    let (flags, sbt) = if state == Lod::Mesh { (mesh_flags, 0) } else { (band_flags, 2) };
+                    let band = if state == Lod::Both { INST_HAS_MESH } else { 0 }; // tri.rahit: dissolve
                     for p in &variant.parts {
+                        let alpha = self.catalog.mesh_alpha[p.mesh as usize];
+                        let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                         let m = t.xform * p.xform;
                         self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
-                        self.inst_data.push(InstInfo { center, data: tree });
+                        self.inst_data.push(InstInfo { center, data: tree | band });
                     }
                 }
                 if state != Lod::Mesh {
@@ -1391,6 +1505,16 @@ impl Renderer {
             ];
             unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
         }
+        // DLSS path: tonemap the denoised, upscaled output (already display resolution).
+        let (dsrc, ddst) = (info(&self.tg.dlss_out), info(&self.out_img));
+        let writes = [0u32, 1].map(|bnd| {
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.dlss_resolve_set)
+                .dst_binding(bnd)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(if bnd == 0 { &dsrc } else { &ddst })
+        });
+        unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
         let (src, dst) = (info(&self.out_img), info(&self.sharp_img));
         let writes = [0u32, 1].map(|bnd| {
             vk::WriteDescriptorSet::default()
@@ -1431,14 +1555,23 @@ impl Renderer {
         self.gpu.destroy_image(&mut self.out_img);
         self.gpu.destroy_image(&mut self.sharp_img);
         self.sharp_img = Self::create_sharp(&self.gpu, self.swap.extent)?;
-        for img in [&mut self.tg.cur, &mut self.tg.depth] {
+        for img in [
+            &mut self.tg.cur,
+            &mut self.tg.depth,
+            &mut self.tg.viewz,
+            &mut self.tg.motion,
+            &mut self.tg.nrm,
+            &mut self.tg.diff,
+            &mut self.tg.spec,
+            &mut self.tg.dlss_out,
+        ] {
             self.gpu.destroy_image(img);
         }
         for img in self.tg.hist.iter_mut() {
             self.gpu.destroy_image(img);
         }
         self.gpu.destroy_buffer(&mut self.readback);
-        self.render_extent = scaled_extent(self.swap.extent, self.render_scale);
+        self.render_extent = self.wanted_render_extent();
         let (o, tg, r) = Self::create_targets(&self.gpu, self.swap.extent, self.render_extent)?;
         self.out_img = o;
         self.tg = tg;
@@ -1446,7 +1579,58 @@ impl Renderer {
         self.write_set(self.main_set, self.tlas.accel.raw, None);
         self.write_resolve_set();
         self.taa_reset = true;
+        self.create_dlss_feature()?;
         Ok(())
+    }
+
+    /// Render resolution: the DLSS mode's input resolution when Ray Reconstruction is on,
+    /// otherwise the supersampling scale.
+    fn wanted_render_extent(&self) -> vk::Extent2D {
+        match self.dlss_mode {
+            Some(m) => scaled_extent(self.swap.extent, crate::dlss::MODES[m].1),
+            None => scaled_extent(self.swap.extent, self.render_scale),
+        }
+    }
+
+    /// (Re)create the NGX Ray Reconstruction feature for the current resolutions.
+    fn create_dlss_feature(&mut self) -> Result<()> {
+        let Some(m) = self.dlss_mode else { return Ok(()) };
+        let (r, o) = (self.render_extent, self.swap.extent);
+        let res = self.gpu.one_time(|cb| crate::dlss::create(cb, (r.width, r.height), (o.width, o.height), m))?;
+        match res {
+            Ok(()) => println!(
+                "DLSS Ray Reconstruction: {} ({}x{} -> {}x{})",
+                crate::dlss::MODES[m].0,
+                r.width,
+                r.height,
+                o.width,
+                o.height
+            ),
+            Err(e) => {
+                println!("{e}; falling back to TAA");
+                self.dlss_mode = None;
+                self.recreate_targets()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Turn DLSS Ray Reconstruction on (with a quality mode index into dlss::MODES) or off.
+    pub fn set_dlss(&mut self, mode: Option<usize>) -> Result<()> {
+        let mode = if self.dlss_ok { mode } else { None };
+        if mode == self.dlss_mode {
+            return Ok(());
+        }
+        self.dlss_mode = mode;
+        self.recreate_targets()
+    }
+
+    pub fn dlss_mode(&self) -> Option<usize> {
+        self.dlss_mode
+    }
+
+    pub fn dlss_available(&self) -> bool {
+        self.dlss_ok
     }
 
     /// Change the supersampling factor (1 = native, 2 = 2x2 rays per pixel).
@@ -1498,6 +1682,15 @@ impl Renderer {
         g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
         g.lod_params[3] = self.ground_layers as f32; // scanned ground layers loaded (4 = full set)
         g.params[1] = self.has_tex as u32 as f32; // material textures available
+        let dlss = self.dlss_mode.is_some();
+        if dlss {
+            g.iparams[0] = 0; // no still-camera accumulation: DLSS keeps its own history (and needs the Halton jitter)
+            g.lod_params[2] = 1.0; // main.rgen writes the G-buffer
+            // Texture mip bias for upscaling: footprint of an output pixel, not a render pixel.
+            g.cam_fwd[3] *= self.render_extent.height as f32 / self.swap.extent.height as f32;
+        } else {
+            g.lod_params[2] = 0.0;
+        }
         let globals = &g;
         let stats = self.update_instances(cam, lod, g.lod_params[0])?;
         self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(globals));
@@ -1532,6 +1725,54 @@ impl Renderer {
                 rh,
                 1,
             );
+            if dlss {
+                // DLSS Ray Reconstruction: denoise + upscale the noisy frame to display resolution.
+                self.gpu.memory_barrier(
+                    cb,
+                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER | vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::TRANSFER_READ,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                );
+                let si = |img: &Image| crate::dlss::SiImage { image: img.raw, view: img.view, format: img.format, width: img.width, height: img.height };
+                let (jx, jy) = crate::dlss::jitter(globals.iparams[2]);
+                let now = Instant::now();
+                let e = crate::dlss::SiDlssEval {
+                    color: si(&self.tg.cur),
+                    output: si(&self.tg.dlss_out),
+                    depth: si(&self.tg.viewz),
+                    motion: si(&self.tg.motion),
+                    normal_rough: si(&self.tg.nrm),
+                    diff_albedo: si(&self.tg.diff),
+                    spec_albedo: si(&self.tg.spec),
+                    // offset of this frame's samples from the pixel centres, render pixels
+                    jitter_x: (jx - 0.5) * self.dlss_jitter_sign.0,
+                    jitter_y: (jy - 0.5) * self.dlss_jitter_sign.1,
+                    render_w: rw,
+                    render_h: rh,
+                    reset: self.taa_reset as i32,
+                    world_to_view: world_to_view(globals),
+                    view_to_clip: view_to_clip(globals),
+                    frame_time_ms: (now - self.last_frame).as_secs_f32() * 1000.0,
+                };
+                self.last_frame = now;
+                self.taa_reset = false;
+                if let Err(err) = crate::dlss::evaluate(cb, &e) {
+                    eprintln!("{err}");
+                }
+                self.gpu.memory_barrier(
+                    cb,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_WRITE | vk::AccessFlags2::MEMORY_WRITE,
+                    vk::PipelineStageFlags2::COMPUTE_SHADER,
+                    vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                );
+                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), globals.params[2].to_bits(), (globals.iparams[1] == 0) as u32];
+                d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
+                d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.dlss_resolve_set], &[]);
+                d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
+                d.cmd_dispatch(cb, w.div_ceil(8), h.div_ceil(8), 1);
+            } else {
             // TAA: blend this frame into the reprojected history (render resolution).
             self.gpu.memory_barrier(
                 cb,
@@ -1567,6 +1808,7 @@ impl Renderer {
             d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.resolve_sets[p]], &[]);
             d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
             d.cmd_dispatch(cb, w.div_ceil(8), h.div_ceil(8), 1);
+            }
             // CAS sharpening on the display image.
             self.gpu.memory_barrier(
                 cb,

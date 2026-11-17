@@ -14,3 +14,6 @@ __pycache__/
 
 # local renders and screenshots (README images live in docs/images)
 /shots/
+
+# local build settings (e.g. DLSS_SDK path) - the NVIDIA DLSS SDK is not redistributed
+/.cargo/config.toml

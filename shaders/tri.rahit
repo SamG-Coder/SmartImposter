@@ -2,17 +2,36 @@
 #extension GL_GOOGLE_include_directive : require
 #include "rt.glsl"
 
-// Any-hit for mesh instances of trees inside the mesh <-> impostor band only (every other mesh
-// instance is FORCE_OPAQUE and never runs this). The tree's twigs are kept with probability
-// meshFade; otherwise the impostor copy of the same tree answers the ray.
+// Any-hit for non-opaque mesh instances:
+//  * alpha-tested cards (Megascans grass): the leaf texture's alpha is the opacity mask;
+//  * plants inside the mesh <-> impostor band: the parts are kept with probability meshFade,
+//    otherwise the impostor copy of the same plant answers the ray.
+// Every other mesh instance is FORCE_OPAQUE and never runs this.
 hitAttributeEXT vec2 bary;
 
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[]; };
 layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
 layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
+layout(set = 0, binding = 13) uniform sampler2D matTex[4 * MAX_SPECIES];
 
 void main() {
+    MeshInfo m = meshes[gl_InstanceCustomIndexEXT & 0x7FFu];
+    if ((m.flags & 1u) != 0u && g.params.y > 0.5) {
+        uvec3 tri = UVec3Ref(m.idx).v[gl_PrimitiveID];
+        Vec2Ref UV = Vec2Ref(m.uv);
+        vec2 uv = UV.v[tri.x] * (1.0 - bary.x - bary.y) + UV.v[tri.y] * bary.x + UV.v[tri.z] * bary.y;
+        // Coarse ray-cone mip (texture ~2048 texels per metre of card); negative spread = bake footprint.
+        float spread = g.camFwd.w;
+        float footprint = spread > 0.0 ? gl_HitTEXT * spread : -spread;
+        float lod = clamp(log2(max(footprint * 2048.0, 1e-4)), 0.0, 9.0);
+        float a = textureLod(matTex[nonuniformEXT(m.texSet * 4u)], uv, lod).a;
+        // Box-filtered mips thin the blades' coverage: lower the cutoff with distance.
+        if (a < mix(0.5, 0.25, clamp(lod / 6.0, 0.0, 1.0))) ignoreIntersectionEXT;
+    }
+    if (g.lodParams.z < -0.5) return; // impostor bake: no LOD dissolve
     InstInfo ii = insts[gl_InstanceID];
+    if ((ii.data & 0x1000000u) == 0u) return; // plain mesh instance (alpha-tested only)
     float f = meshFade(g, distance(g.camPos.xyz, ii.center) / imps[instVariant(ii.data)].lodScale);
     if (lodRand(g, ii.data & 0xFFFFFFu, 1u) >= f) ignoreIntersectionEXT;
 }

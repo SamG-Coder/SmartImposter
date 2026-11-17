@@ -17,7 +17,7 @@ struct Globals {
     vec4 prevFwd;
 };
 
-// Sub-pixel jitter for TAA: Halton(2,3), 16-frame cycle, in [0,1)^2.
+// Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).
 float halton(uint i, uint b) {
     float f = 1.0, r = 0.0;
     while (i > 0u) {
@@ -27,6 +27,6 @@ float halton(uint i, uint b) {
     }
     return r;
 }
-vec2 taaJitter(uint frame) { uint i = (frame % 16u) + 1u; return vec2(halton(i, 2u), halton(i, 3u)); }
+vec2 taaJitter(uint frame) { uint i = (frame % 32u) + 1u; return vec2(halton(i, 2u), halton(i, 3u)); }
 
 #endif

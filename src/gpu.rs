@@ -92,6 +92,15 @@ impl Gpu {
             let entry = ash::Entry::load().context("loading vulkan-1.dll")?;
             let mut exts: Vec<*const c_char> = ash_window::enumerate_required_extensions(display)?.to_vec();
             let mut layers: Vec<*const c_char> = vec![];
+            // Extensions NVIDIA NGX (DLSS Ray Reconstruction) needs, where the driver offers them.
+            let (ngx_inst, ngx_dev) = crate::dlss::required_extensions();
+            let avail_inst = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+            for e in &ngx_inst {
+                let have = avail_inst.iter().any(|a| a.extension_name_as_c_str().map(|n| n == e.as_c_str()).unwrap_or(false));
+                if have && !exts.iter().any(|x| CStr::from_ptr(*x) == e.as_c_str()) {
+                    exts.push(e.as_ptr());
+                }
+            }
             if validation {
                 exts.push(ash::ext::debug_utils::NAME.as_ptr());
                 layers.push(c"VK_LAYER_KHRONOS_validation".as_ptr());
@@ -197,7 +206,21 @@ impl Gpu {
                 .push_next(&mut rt_f);
             let prio = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
-            let ext_ptrs: Vec<*const c_char> = dev_exts.iter().map(|e| e.as_ptr()).collect();
+            let mut ext_ptrs: Vec<*const c_char> = dev_exts.iter().map(|e| e.as_ptr()).collect();
+            let avail_dev = instance.enumerate_device_extension_properties(pdev)?;
+            for e in &ngx_dev {
+                // Core 1.2 bufferDeviceAddress is enabled; the EXT version must not be enabled with it.
+                if e.as_c_str() == c"VK_EXT_buffer_device_address" {
+                    continue;
+                }
+                let have = avail_dev.iter().any(|a| a.extension_name_as_c_str().map(|n| n == e.as_c_str()).unwrap_or(false));
+                if have && !ext_ptrs.iter().any(|x| CStr::from_ptr(*x) == e.as_c_str()) {
+                    ext_ptrs.push(e.as_ptr());
+                }
+            }
+            if !ngx_dev.is_empty() {
+                println!("NGX extensions: {}", ngx_dev.iter().map(|e| e.to_string_lossy()).collect::<Vec<_>>().join(" "));
+            }
             let device = instance.create_device(
                 pdev,
                 &vk::DeviceCreateInfo::default().queue_create_infos(&qci).enabled_extension_names(&ext_ptrs).push_next(&mut f2),

@@ -7,6 +7,7 @@
 mod accel;
 mod asset;
 mod catalog;
+mod dlss;
 mod flypath;
 mod textures;
 mod gpu;
@@ -57,6 +58,8 @@ struct Args {
     ss: f32,
     fullscreen: bool,
     no_taa: bool,
+    /// DLSS Ray Reconstruction mode (index into dlss::MODES), None = TAA + supersampling.
+    dlss: Option<usize>,
     sharpen: f32,
 }
 
@@ -91,6 +94,7 @@ fn parse_args() -> Args {
         ss: 1.5,
         fullscreen: false,
         no_taa: false,
+        dlss: Some(1),
         sharpen: 0.5,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -151,6 +155,16 @@ fn parse_args() -> Args {
                 i -= 1;
             }
             "--sharpen" => a.sharpen = next.parse().unwrap_or(0.5),
+            "--dlss" => {
+                a.dlss = match next.to_ascii_lowercase().as_str() {
+                    "off" | "none" | "0" => None,
+                    "dlaa" => Some(0),
+                    "balanced" => Some(2),
+                    "performance" | "perf" => Some(3),
+                    "ultra" | "ultra-performance" => Some(4),
+                    _ => Some(1),
+                };
+            }
             "--no-taa" => {
                 a.no_taa = true;
                 i -= 1;
@@ -228,6 +242,8 @@ struct State {
     vel: Vec3,
     base_speed: f32,
     cinematic: bool,
+    /// Last DLSS mode, restored by L.
+    dlss_last: usize,
 }
 
 struct App {
@@ -296,6 +312,7 @@ impl App {
             a.vsync,
             a.validation,
             a.ss,
+            a.dlss,
         )?;
         let start_y = r.world.height_at(0.0, 0.0) + 1.8;
         let cam = match a.cam {
@@ -336,6 +353,7 @@ impl App {
             vel: Vec3::ZERO,
             base_speed: 10.0,
             cinematic: false,
+            dlss_last: a.dlss.unwrap_or(1),
         };
         if std::env::var("SI_FOREST_MAP").is_ok() {
             // Coarse tree-count map, 50 m cells over [-700, 700]^2, north (-Z) at the top.
@@ -586,18 +604,24 @@ impl App {
                 format!("manual {:.0} m/s{}{}", s.base_speed, if s.cinematic { ", cinematic" } else { "" }, if s.captured { "" } else { ", click to look" })
             };
             s.window.set_title(&format!(
-                "SmartImposter | {:.0} fps ({:.2} ms) | SS {:.1}x (K) | TAA {} (T) | sharpen {:.2} (H) | {} | {} near trees (mesh) / {} total | {} TLAS instances | mesh < {:.0} m ([ ]) | hi impostor < {:.0} m (; ') | {}",
+                "SmartImposter | {:.0} fps ({:.2} ms) | {} | sharpen {:.2} (H) | {} | {} near plants (mesh) / {} total | {} TLAS instances | mesh < {:.0} m ([ ]) | {}",
                 fps,
                 1000.0 / fps,
-                s.r.render_scale(),
-                if s.r.taa_enabled { "on" } else { "off" },
+                match s.r.dlss_mode() {
+                    Some(m) => format!("DLSS-RR {} (L off, J mode)", dlss::MODES[m].0),
+                    None => format!(
+                        "SS {:.1}x (K) | TAA {} (T){}",
+                        s.r.render_scale(),
+                        if s.r.taa_enabled { "on" } else { "off" },
+                        if s.r.dlss_available() { " | DLSS off (L)" } else { "" }
+                    ),
+                },
                 s.r.sharpness,
                 cam_mode,
                 stats.near_trees,
                 s.r.world.trees.len(),
                 stats.instances,
                 s.lod,
-                s.lod2,
                 mode,
             ));
             s.fps_time = Instant::now();
@@ -629,6 +653,22 @@ impl App {
             KeyCode::KeyC => s.cinematic = !s.cinematic,
             KeyCode::KeyT => s.r.taa_enabled = !s.r.taa_enabled,
             KeyCode::KeyH => s.r.sharpness = if s.r.sharpness >= 0.99 { 0.0 } else { (s.r.sharpness + 0.25).min(1.0) },
+            KeyCode::KeyL => {
+                let next = if s.r.dlss_mode().is_some() { None } else { Some(s.dlss_last) };
+                if let Err(e) = s.r.set_dlss(next) {
+                    eprintln!("DLSS switch failed: {e:?}");
+                }
+                s.prev_cam = None;
+            }
+            KeyCode::KeyJ => {
+                if let Some(m) = s.r.dlss_mode() {
+                    s.dlss_last = (m + 1) % dlss::MODES.len();
+                    if let Err(e) = s.r.set_dlss(Some(s.dlss_last)) {
+                        eprintln!("DLSS mode change failed: {e:?}");
+                    }
+                    s.prev_cam = None;
+                }
+            }
             KeyCode::KeyK => {
                 let next = match s.r.render_scale() {
                     x if x < 1.25 => 1.5,

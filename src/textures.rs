@@ -244,7 +244,9 @@ pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<(Vec<Ima
         .map(|(i, s)| {
             let l = lums.get(i * 4).map(|x| x.0).unwrap_or(0.0);
             let tb = lums.get(i * 4 + 1).map(|x| x.1).unwrap_or(0.0);
-            let k = if l > 0.0 { (FOLIAGE_LUMINANCE / l).clamp(0.25, 1.6) } else { 1.0 };
+            // Grass is matched to the ground textures it stands on (the scans are 2-7x brighter).
+            let target = if s.kind == crate::catalog::Kind::Grass { 0.085 } else { FOLIAGE_LUMINANCE }; // ~ the ground scans
+            let k = if l > 0.0 { (target / l).clamp(0.12, 1.6) } else { 1.0 };
             println!("  {:<24} foliage luminance {:.3} -> x{:.2}, translucency mean {:.2}", s.name, l, k, tb);
             (k, if tb > 0.0 { tb } else { 0.33 })
         })

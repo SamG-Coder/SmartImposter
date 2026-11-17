@@ -160,16 +160,30 @@ impl World {
         let heather = cat.variants_of("Heather");
         let huck = cat.variants_of("Huckleberry");
         let fern = cat.variants_of("Fern");
+        // Megascans grass patches (tools/grass_to_mtree.py)
+        let g_clumps = cat.variants_of("Grass_Clumps");
+        let g_wild = cat.variants_of("Wild_Grass");
+        let g_tall = cat.variants_of("Tall_Grass");
+        let g_tufted = cat.variants_of("Tufted_Grass");
+        let g_dry = cat.variants_of("Dry_Grass");
+        let g_cotton = cat.variants_of("Cotton_Grass");
         // Anything not covered by the biome rules (e.g. a newly added species) is spread evenly.
         let known: Vec<usize> =
-            [&beech, &alder, &poplar, &aspen, &hazel, &heather, &huck, &fern].iter().flat_map(|v| v.iter().copied()).collect();
+            [&beech, &alder, &poplar, &aspen, &hazel, &heather, &huck, &fern, &g_clumps, &g_wild, &g_tall, &g_tufted, &g_dry, &g_cotton]
+                .iter()
+                .flat_map(|v| v.iter().copied())
+                .collect();
         let other_trees: Vec<usize> = (0..trees.len()).filter(|v| !known.contains(v) && cat.variants[*v].kind == Kind::Tree).collect();
-        let other_small: Vec<usize> = (0..trees.len()).filter(|v| !known.contains(v) && cat.variants[*v].kind != Kind::Tree).collect();
+        let other_small: Vec<usize> =
+            (0..trees.len()).filter(|v| !known.contains(v) && matches!(cat.variants[*v].kind, Kind::Shrub | Kind::Plant)).collect();
+        let other_grass: Vec<usize> = (0..trees.len()).filter(|v| !known.contains(v) && cat.variants[*v].kind == Kind::Grass).collect();
 
         let under_radius = radius.min(900.0);
         // (layer, grid spacing, radius)
-        let layers = [(0u32, spacing, radius), (1, 3.4, under_radius), (2, 2.1, under_radius)];
-        let mut counts = [0usize; 3];
+        // Grass patches are ~3 m across: 2.3 m spacing lets neighbours overlap into a continuous sward.
+        let grass_radius = radius.min(600.0);
+        let layers = [(0u32, spacing, radius), (1, 3.4, under_radius), (2, 2.1, under_radius), (3, 2.3, grass_radius)];
+        let mut counts = [0usize; 4];
         for (layer, step, rad) in layers {
             let count = (rad * 2.0 / step) as i32;
             let hs = |gx: i32, gz: i32, k: u32| hash(gx, gz, k + layer * 100);
@@ -212,6 +226,31 @@ impl World {
                             }
                             pick(&[(w_heather, &heather), (w_huck, &huck), (w_other, &other_small)], r1, r2)
                         }
+                        3 => {
+                            // Grass: open ground and forest edges, thinning under the canopy.
+                            let open = 1.0 - b.dens;
+                            let dry = smoothstep(-0.1, 0.45, fbm(x / 140.0, z / 140.0, 3, 83) + 0.5 * (0.5 - b.wet));
+                            let patchy = smoothstep(-0.3, 0.25, fbm(x / 18.0, z / 18.0, 3, 97));
+                            // Near-full cover in open meadow so neighbouring patches merge into one sward.
+                            let w = (open * 1.15 + 0.35 * b.edge) * (0.85 + 0.15 * patchy) * smoothstep(0.0, 0.25, open + 0.5 * b.edge);
+                            if r_place > w.min(0.97) {
+                                continue;
+                            }
+                            let tallz = smoothstep(0.1, 0.5, fbm(x / 45.0, z / 45.0, 3, 101));
+                            pick(
+                                &[
+                                    (1.6 * (1.0 - dry) * (1.0 - 0.6 * b.wet), &g_wild),
+                                    (1.6 * (1.0 - dry), &g_clumps),
+                                    (1.4 * dry * (1.0 - b.wet), &g_dry),
+                                    (2.0 * b.wet * b.wet, &g_cotton),
+                                    (0.9 * tallz + 0.8 * b.edge, &g_tall),
+                                    (0.6 * tallz * (1.0 - dry) + 0.3 * b.edge, &g_tufted),
+                                    (0.5, &other_grass),
+                                ],
+                                r1,
+                                r2,
+                            )
+                        }
                         _ => {
                             let clump = smoothstep(-0.25, 0.3, fbm(x / 22.0, z / 22.0, 3, 71));
                             let w = b.dens.powf(1.3) * (0.35 + 0.65 * b.wet) * clump + 0.06 * b.edge;
@@ -225,7 +264,19 @@ impl World {
                     let yaw = hs(gx, gz, 6) * std::f32::consts::TAU;
                     let scale = if layer == 0 { 0.8 + 0.4 * hs(gx, gz, 7) } else { 0.7 + 0.6 * hs(gx, gz, 7) };
                     let y = world.height_at(x, z) - if layer == 0 { 0.15 } else { 0.03 };
-                    let xform = Affine3A::from_scale_rotation_translation(Vec3::splat(scale), Quat::from_rotation_y(yaw), Vec3::new(x, y, z));
+                    let mut rot = Quat::from_rotation_y(yaw);
+                    if layer == 3 {
+                        // Grass patches are flat discs a few metres across: follow the slope.
+                        let e = 1.0;
+                        let nrm = Vec3::new(
+                            world.height_at(x - e, z) - world.height_at(x + e, z),
+                            2.0 * e,
+                            world.height_at(x, z - e) - world.height_at(x, z + e),
+                        )
+                        .normalize();
+                        rot = Quat::from_rotation_arc(Vec3::Y, nrm) * rot;
+                    }
+                    let xform = Affine3A::from_scale_rotation_translation(Vec3::splat(scale), rot, Vec3::new(x, y, z));
                     let t = &trees[variant];
                     let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
                     let seed = 1 + (hs(gx, gz, 8) * 8190.0) as u16;
@@ -236,7 +287,7 @@ impl World {
                 }
             }
         }
-        println!("Scattered {} trees, {} shrubs, {} ferns/plants", counts[0], counts[1], counts[2]);
+        println!("Scattered {} trees, {} shrubs, {} ferns/plants, {} grass patches", counts[0], counts[1], counts[2], counts[3]);
         let mut per = vec![0usize; trees.len()];
         for t in &world.trees {
             per[t.variant as usize] += 1;

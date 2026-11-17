@@ -39,5 +39,9 @@ void main() {
     }
     imageStore(dstA, p, aS / cS);
     imageStore(dstB, p, vec4(octEncode(normalize(nS)), hS / cS, cS * 0.25));
-    imageStore(dstC, p, cS4 / cS);
+    // Visibility y = length of the averaged normal: averaging the children's normals shortens it
+    // further by their coherence |sum w n| / sum w.
+    vec4 vis = cS4 / cS;
+    vis.y *= clamp(length(nS) / cS, 0.0, 1.0);
+    imageStore(dstC, p, vis);
 }
