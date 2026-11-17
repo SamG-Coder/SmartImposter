@@ -69,6 +69,8 @@ pub struct Gpu {
     pub cmd_pool: vk::CommandPool,
     pub device_name: String,
     pub timestamp_period: f32,
+    /// VK_NV_ray_tracing_invocation_reorder enabled (Shader Execution Reordering).
+    pub ser: bool,
 }
 
 unsafe extern "system" fn debug_cb(
@@ -189,6 +191,10 @@ impl Gpu {
                 scratch_alignment: as_props.min_acceleration_structure_scratch_offset_alignment as u64,
             };
 
+            // Shader Execution Reordering (RTX 40+), unless SI_NO_SER is set.
+            let avail_dev = instance.enumerate_device_extension_properties(pdev)?;
+            let ser = std::env::var("SI_NO_SER").is_err()
+                && avail_dev.iter().any(|a| a.extension_name_as_c_str().map(|n| n == c"VK_NV_ray_tracing_invocation_reorder").unwrap_or(false));
             let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
                 .buffer_device_address(true)
                 .descriptor_indexing(true)
@@ -198,16 +204,19 @@ impl Gpu {
             let mut f13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true).maintenance4(true);
             let mut as_f = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default().acceleration_structure(true);
             let mut rt_f = vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
+            let mut ser_f = vk::PhysicalDeviceRayTracingInvocationReorderFeaturesNV::default().ray_tracing_invocation_reorder(true);
             let mut f2 = vk::PhysicalDeviceFeatures2::default()
                 .features(vk::PhysicalDeviceFeatures::default().shader_int64(true))
                 .push_next(&mut f12)
                 .push_next(&mut f13)
                 .push_next(&mut as_f)
                 .push_next(&mut rt_f);
+            if ser {
+                f2 = f2.push_next(&mut ser_f);
+            }
             let prio = [1.0f32];
             let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&prio)];
             let mut ext_ptrs: Vec<*const c_char> = dev_exts.iter().map(|e| e.as_ptr()).collect();
-            let avail_dev = instance.enumerate_device_extension_properties(pdev)?;
             for e in &ngx_dev {
                 // Core 1.2 bufferDeviceAddress is enabled; the EXT version must not be enabled with it.
                 if e.as_c_str() == c"VK_EXT_buffer_device_address" {
@@ -217,6 +226,9 @@ impl Gpu {
                 if have && !ext_ptrs.iter().any(|x| CStr::from_ptr(*x) == e.as_c_str()) {
                     ext_ptrs.push(e.as_ptr());
                 }
+            }
+            if ser {
+                ext_ptrs.push(c"VK_NV_ray_tracing_invocation_reorder".as_ptr());
             }
             if !ngx_dev.is_empty() {
                 println!("NGX extensions: {}", ngx_dev.iter().map(|e| e.to_string_lossy()).collect::<Vec<_>>().join(" "));
@@ -261,6 +273,7 @@ impl Gpu {
                 cmd_pool,
                 device_name,
                 timestamp_period: props.limits.timestamp_period,
+                ser,
             })
         }
     }

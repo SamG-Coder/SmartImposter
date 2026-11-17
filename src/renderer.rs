@@ -195,6 +195,43 @@ struct RtPipeline {
     hit: vk::StridedDeviceAddressRegionKHR,
 }
 
+/// Per-pass GPU times and CPU times (ms), summed over the frames since the last reset.
+#[derive(Default, Clone, Copy)]
+pub struct Profile {
+    /// TLAS build, ray tracing (main.rgen + hit shaders), denoise/TAA + resolve, sharpen + blit
+    pub gpu: [f64; 4],
+    /// update_instances (LOD + instance list), command recording + submit, waiting for the GPU
+    pub cpu_lod: f64,
+    /// parts of cpu_lod: LOD state loop, instance list build, upload to the mapped buffers
+    pub cpu_lod_parts: [f64; 3],
+    pub rebuilds: u32,
+    pub cpu_record: f64,
+    pub cpu_wait: f64,
+    pub frames: u32,
+}
+
+impl Profile {
+    pub fn line(&self) -> String {
+        let n = self.frames.max(1) as f64;
+        format!(
+            "gpu: tlas {:.2} | trace {:.2} | denoise+resolve {:.2} | sharpen+blit {:.2} = {:.2} ms; cpu: lod {:.2} (states {:.2}, list {:.2}, upload {:.2}, {} rebuilds) | record {:.2} | wait {:.2} ms ({} frames)",
+            self.gpu[0] / n,
+            self.gpu[1] / n,
+            self.gpu[2] / n,
+            self.gpu[3] / n,
+            self.gpu.iter().sum::<f64>() / n,
+            self.cpu_lod / n,
+            self.cpu_lod_parts[0] / n,
+            self.cpu_lod_parts[1] / n,
+            self.cpu_lod_parts[2] / n,
+            self.rebuilds,
+            self.cpu_record / n,
+            self.cpu_wait / n,
+            self.frames
+        )
+    }
+}
+
 #[derive(Default, Clone, Copy)]
 pub struct FrameStats {
     pub near_trees: usize,
@@ -263,6 +300,9 @@ pub struct Renderer {
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     acquire_sem: vk::Semaphore,
+    query_pool: vk::QueryPool,
+    queries_pending: bool,
+    pub profile: Profile,
     pub world: World,
     pub pack: TreePack,
     /// Impostor atlas settings (one compressed atlas per variant; slot = variant index).
@@ -274,6 +314,8 @@ pub struct Renderer {
     inst_data: Vec<InstInfo>,
     inst_info: Buffer,
     tlas_dirty: bool,
+    /// insts / inst_data changed and must be copied to the GPU buffers (upload_instances).
+    upload_pending: bool,
     first_update: bool,
     near_count: usize,
     pub need_resize: bool,
@@ -731,7 +773,12 @@ impl Renderer {
                 .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(desc_pool).set_layouts(&[set_layout, set_layout]))?
         };
 
-        let main_pipe = create_rt_pipeline(&gpu, pipe_layout, spv!("main.rgen"))?;
+        let main_pipe = if gpu.ser {
+            println!("Shader Execution Reordering on");
+            create_rt_pipeline(&gpu, pipe_layout, spv!("main_ser.rgen"))?
+        } else {
+            create_rt_pipeline(&gpu, pipe_layout, spv!("main.rgen"))?
+        };
         let bake_pipe = create_rt_pipeline(&gpu, pipe_layout, spv!("bake.rgen"))?;
 
         // ---- supersampling resolve (render resolution HDR -> display resolution)
@@ -816,6 +863,9 @@ impl Renderer {
         };
         let fence = unsafe { gpu.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)? };
         let acquire_sem = unsafe { gpu.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
+        let query_pool = unsafe {
+            gpu.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(5), None)?
+        };
         let lod_state = vec![Lod::Culled; world.trees.len()];
 
         let mut r = Renderer {
@@ -880,6 +930,9 @@ impl Renderer {
             cb,
             fence,
             acquire_sem,
+            query_pool,
+            queries_pending: false,
+            profile: Profile::default(),
             world,
             pack,
             imp,
@@ -889,6 +942,7 @@ impl Renderer {
             inst_data: Vec::new(),
             inst_info,
             tlas_dirty: true,
+            upload_pending: false,
             first_update: true,
             near_count: 0,
             need_resize: false,
@@ -1349,6 +1403,7 @@ impl Renderer {
     /// variant's size (`lod_scale`); small plants also have a draw distance. Rebuilds the TLAS
     /// only when a plant changes state.
     fn update_instances(&mut self, cam: Vec3, lod: f32, band: f32) -> Result<FrameStats> {
+        let t_begin = Instant::now();
         let mut changed = self.first_update;
         self.first_update = false;
         let mut near = 0;
@@ -1382,6 +1437,8 @@ impl Renderer {
             near += matches!(next, Lod::Mesh | Lod::Both) as usize;
         }
         self.near_count = near;
+        let t_states = Instant::now();
+        self.profile.cpu_lod_parts[0] += (t_states - t_begin).as_secs_f64() * 1000.0;
         if changed {
             let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
             // Band plants: not opaque, so the dissolve any-hit runs (hit record 2).
@@ -1419,13 +1476,17 @@ impl Renderer {
                 };
                 let center = t.center.to_array();
                 let tree = (i as u32 & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
+                // Instance masks: bit 0 meshes + terrain, bits 1..6 impostors (lattice colour), bit 7
+                // grass (mesh and impostor), so rays can include or skip grass separately.
+                let grass = self.catalog.variants[t.variant as usize].kind == crate::catalog::Kind::Grass;
+                let (mesh_mask, imp_mask) = if grass { (0x80u8, 0x80u8) } else { (1u8, 2u8 << (t.color % 6)) };
                 if state != Lod::Impostor {
                     let band = if state == Lod::Both { INST_HAS_MESH } else { 0 }; // tri.rahit: dissolve
                     for p in &variant.parts {
                         let alpha = self.catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                         let m = t.xform * p.xform;
-                        self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
+                        self.insts.push(accel::make_instance(&m, p.mesh | seed, mesh_mask, sbt, flags, self.blas[p.mesh as usize].addr));
                         self.inst_data.push(InstInfo { center, data: tree | band });
                     }
                 }
@@ -1433,7 +1494,7 @@ impl Renderer {
                     self.insts.push(accel::make_instance(
                         &t.xform,
                         t.variant as u32 | ((t.color as u32) << 8) | seed,
-                        2u8 << t.color,
+                        imp_mask,
                         1,
                         imp_flags,
                         self.imp_blas[t.variant as usize].addr,
@@ -1452,12 +1513,27 @@ impl Renderer {
                 self.gpu.destroy_buffer(&mut old_info);
                 self.write_set(self.main_set, self.tlas.accel.raw, None);
             }
-            self.tlas.write(&self.insts);
-            let bytes: &[u8] = bytemuck::cast_slice(&self.inst_data);
-            self.inst_info.mapped()[..bytes.len()].copy_from_slice(bytes);
-            self.tlas_dirty = true;
+            self.profile.cpu_lod_parts[1] += t_states.elapsed().as_secs_f64() * 1000.0;
+            self.profile.rebuilds += 1;
+            // The instance buffers are still read by the frame in flight: upload after its fence.
+            self.upload_pending = true;
         }
         Ok(FrameStats { near_trees: self.near_count, instances: self.insts.len(), rebuilt: changed })
+    }
+
+    /// Copy the instance list built by update_instances into the TLAS instance buffer and the
+    /// per-instance info buffer (call after the previous frame's fence).
+    fn upload_instances(&mut self) {
+        if !self.upload_pending {
+            return;
+        }
+        let t = Instant::now();
+        self.tlas.write(&self.insts);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.inst_data);
+        self.inst_info.mapped()[..bytes.len()].copy_from_slice(bytes);
+        self.tlas_dirty = true;
+        self.upload_pending = false;
+        self.profile.cpu_lod_parts[2] += t.elapsed().as_secs_f64() * 1000.0;
     }
 
     pub fn extent(&self) -> (u32, u32) {
@@ -1663,18 +1739,8 @@ impl Renderer {
 
     /// Render one frame. With `capture`, the tonemapped output is returned as RGBA8.
     pub fn render(&mut self, globals: &Globals, cam: Vec3, lod: f32, capture: bool) -> Result<(FrameStats, Option<Vec<u8>>)> {
-        let d = self.gpu.device.clone();
-        unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
-        let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {
-            Ok((i, _)) => i,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.need_resize = true;
-                return Ok((FrameStats::default(), None));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        unsafe { d.reset_fences(&[self.fence])? };
-
+        // CPU work that does not touch GPU-read memory runs while the previous frame is still on
+        // the GPU (LOD states, instance list); the uploads wait for its fence.
         let mut g = *globals;
         if lod <= 0.0 {
             g.lod_params[0] = 0.0; // all impostors: no dissolve band
@@ -1682,6 +1748,8 @@ impl Renderer {
         g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
         g.lod_params[3] = self.ground_layers as f32; // scanned ground layers loaded (4 = full set)
         g.params[1] = self.has_tex as u32 as f32; // material textures available
+        // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
+        g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
         let dlss = self.dlss_mode.is_some();
         if dlss {
             g.iparams[0] = 0; // no still-camera accumulation: DLSS keeps its own history (and needs the Halton jitter)
@@ -1692,7 +1760,37 @@ impl Renderer {
             g.lod_params[2] = 0.0;
         }
         let globals = &g;
+        let t_lod = Instant::now();
         let stats = self.update_instances(cam, lod, g.lod_params[0])?;
+        self.profile.cpu_lod += t_lod.elapsed().as_secs_f64() * 1000.0;
+        let d = self.gpu.device.clone();
+        let t_wait = Instant::now();
+        unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
+        self.profile.cpu_wait += t_wait.elapsed().as_secs_f64() * 1000.0;
+        if self.queries_pending {
+            // Previous frame's GPU timestamps (its fence has signalled).
+            let mut ts = [0u64; 5];
+            if unsafe { d.get_query_pool_results(self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+                let ms = self.gpu.timestamp_period as f64 * 1e-6;
+                for k in 0..4 {
+                    self.profile.gpu[k] += ts[k + 1].saturating_sub(ts[k]) as f64 * ms;
+                }
+                self.profile.frames += 1;
+            }
+            self.queries_pending = false;
+        }
+        let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {
+            Ok((i, _)) => i,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.need_resize = true;
+                return Ok((FrameStats::default(), None));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        unsafe { d.reset_fences(&[self.fence])? };
+
+        self.upload_instances();
+        let t_rec = Instant::now();
         self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(globals));
 
         let (w, h) = self.extent();
@@ -1702,10 +1800,14 @@ impl Renderer {
         unsafe {
             d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
             d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            let qp = self.query_pool;
+            d.cmd_reset_query_pool(cb, qp, 0, 5);
+            d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::TOP_OF_PIPE, qp, 0);
             if self.tlas_dirty {
                 self.tlas.cmd_build(&self.gpu, cb, self.insts.len() as u32);
                 self.tlas_dirty = false;
             }
+            d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, qp, 1);
             self.gpu.memory_barrier(
                 cb,
                 vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::TRANSFER,
@@ -1725,6 +1827,7 @@ impl Renderer {
                 rh,
                 1,
             );
+            d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, qp, 2);
             if dlss {
                 // DLSS Ray Reconstruction: denoise + upscale the noisy frame to display resolution.
                 self.gpu.memory_barrier(
@@ -1809,6 +1912,7 @@ impl Renderer {
             d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
             d.cmd_dispatch(cb, w.div_ceil(8), h.div_ceil(8), 1);
             }
+            d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, qp, 3);
             // CAS sharpening on the display image.
             self.gpu.memory_barrier(
                 cb,
@@ -1881,6 +1985,7 @@ impl Renderer {
                 vk::PipelineStageFlags2::NONE,
                 vk::AccessFlags2::NONE,
             );
+            d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::ALL_COMMANDS, qp, 4);
             d.end_command_buffer(cb)?;
 
             let waits = [self.acquire_sem];
@@ -1896,6 +2001,8 @@ impl Renderer {
                     .signal_semaphores(&signals)],
                 self.fence,
             )?;
+            self.queries_pending = true;
+            self.profile.cpu_record += t_rec.elapsed().as_secs_f64() * 1000.0;
             let swaps = [self.swap.raw];
             let idxs = [idx];
             match self.gpu.swapchain_fn.queue_present(

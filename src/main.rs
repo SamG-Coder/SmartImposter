@@ -419,6 +419,7 @@ impl App {
             s.prev_cam = None;
             s.r.reset_taa();
             s.frame_times.clear();
+            s.r.profile = Default::default();
         }
         if s.r.need_resize {
             let sz = s.window.inner_size();
@@ -433,6 +434,9 @@ impl App {
         s.last = now;
         if s.rendered >= 5 {
             s.frame_times.push(raw_dt * 1000.0);
+        }
+        if s.rendered == 5 && views.is_empty() {
+            s.r.profile = Default::default(); // exclude warm-up frames
         }
 
         // ---- manual fly-cam input (any input takes over from the automatic path)
@@ -577,6 +581,7 @@ impl App {
                         t[(t.len() * 95 / 100).min(t.len() - 1)]
                     );
                 }
+                println!("{}", s.r.profile.line());
                 println!(
                     "stats: near trees {}, TLAS instances {}, camera --cam {:.2},{:.2},{:.2},{:.1},{:.1}",
                     stats.near_trees,

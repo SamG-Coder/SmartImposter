@@ -21,21 +21,30 @@ fn main() {
             continue;
         }
         let name = path.file_name().unwrap().to_str().unwrap();
-        let dst = out.join(format!("{name}.spv"));
-        let result = Command::new(&glslang)
-            .args(["--target-env", "vulkan1.3", "-V", "-Ishaders"])
-            .arg(&path)
-            .arg("-o")
-            .arg(&dst)
-            .output()
-            .expect("failed to run glslangValidator (is the Vulkan SDK installed?)");
-        if !result.status.success() {
-            panic!(
-                "shader {name} failed to compile:\n{}{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
+        compile(&glslang, &path, &out.join(format!("{name}.spv")), &[]);
+        if name == "main.rgen" {
+            // Shader Execution Reordering variant (used when the device supports it).
+            compile(&glslang, &path, &out.join("main_ser.rgen.spv"), &["-DSER"]);
         }
+    }
+}
+
+fn compile(glslang: &PathBuf, src: &PathBuf, dst: &PathBuf, defines: &[&str]) {
+    let result = Command::new(glslang)
+        .args(["--target-env", "vulkan1.3", "-V", "-Ishaders"])
+        .args(defines)
+        .arg(src)
+        .arg("-o")
+        .arg(dst)
+        .output()
+        .expect("failed to run glslangValidator (is the Vulkan SDK installed?)");
+    if !result.status.success() {
+        panic!(
+            "shader {} failed to compile:\n{}{}",
+            src.display(),
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 }
 

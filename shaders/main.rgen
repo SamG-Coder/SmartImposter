@@ -1,5 +1,8 @@
 ﻿#version 460
 #extension GL_GOOGLE_include_directive : require
+#ifdef SER
+#extension GL_NV_shader_invocation_reorder : require
+#endif
 #include "rt.glsl"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
@@ -92,7 +95,17 @@ void main() {
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
+#ifdef SER
+    // Shader Execution Reordering (RTX 40/50): traverse, then regroup the threads by what they
+    // hit (ground, textured leaves, impostors, sky) before running the closest-hit / miss shader,
+    // so neighbouring threads shade the same material. Same result as traceRayEXT.
+    hitObjectNV hitObj;
+    hitObjectTraceRayNV(hitObj, tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org, 0.02, dir, 1.0e5, 0);
+    reorderThreadNV(hitObj);
+    hitObjectExecuteShaderNV(hitObj, 0);
+#else
     traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org, 0.02, dir, 1.0e5, 0);
+#endif
 
     vec3 L = g.sunDir.xyz;
     vec3 col;
@@ -125,7 +138,8 @@ void main() {
         // instance mask; their self-shadowing comes from the baked directional visibility.
         float side = dot(ng, L) >= 0.0 ? 1.0 : -1.0;
         vec3 so = imp ? p + L * (0.05 + pl.t * 2e-4) : p + ng * side * (0.003 + pl.t * 1.5e-4);
-        float sh = (ndl > 0.0 || leaf) ? traceShadow(so, L, 1.0e4, pl.shadowMask) * pl.sunVis : 0.0;
+        uint profSkip = uint(g.params.x); // profiling only (SI_PROF_SKIP): 1 = no sun shadow rays, 2 = no AO rays
+        float sh = (ndl > 0.0 || leaf) ? ((profSkip & 1u) != 0u ? 1.0 : traceShadow(so, L, 1.0e4, pl.shadowMask)) * pl.sunVis : 0.0;
 
         vec3 E = sunColor();
         vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
@@ -174,7 +188,7 @@ void main() {
         // trunks. Range scaled with distance keeps far terrain cheap.
         bool terrain = mat == MAT_TERRAIN;
         float aoRange = terrain ? 30.0 : g.params.w;
-        if (!imp && g.iparams.w > 0u && pl.t < (terrain ? 600.0 : 150.0)) {
+        if (!imp && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
             float occ = 0.0;
             for (uint i = 0u; i < g.iparams.w; ++i) {
                 vec3 d2 = cosineSample(n, rng);
