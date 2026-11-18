@@ -8,7 +8,7 @@ struct Globals {
     vec4 camUp;     // xyz, w = tan(fov/2)
     vec4 camFwd;    // xyz, w = pixel spread angle (rad)
     vec4 sunDir;    // xyz, w = sun intensity
-    vec4 params;    // x time, y unused, z exposure, w ao ray range
+    vec4 params;    // x time, y globe tree thinning (1 smooth, 0 stepped), z exposure, w ao ray range
     uvec4 iparams;  // x frames the camera has been still, y debug mode, z frame counter, w ao rays
     vec4 lodParams; // x mesh<->impostor band width, y hi->lo impostor distance, z its band width, w variant count
     vec4 prevPos;   // previous frame camera (TAA reprojection), same layout as camPos..camFwd

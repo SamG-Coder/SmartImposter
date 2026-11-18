@@ -407,8 +407,18 @@ so far:
   - Trees to the horizon: tree tiles out to the visible horizon (`sqrt(2Rh)` from the camera
     height, plus a ridge allowance). Every tree is placed within 6 km; coarser tiles further out
     keep 1/4^k of the trees at their true size, and the terrain shader adds the canopy colour of
-    the ones left out. Near the camera the trees switch to meshes through the usual LOD band, and
-    grass, ferns and shrubs grow from the 20 m land cover within 700 m.
+    the ones left out. Near the camera the trees switch to meshes through the usual LOD band,
+    and grass, ferns and shrubs grow from the 20 m land cover within 700 m.
+    - Tree thinning, smooth or stepped (`--tree-thinning smooth|stepped`, key N; smooth by
+      default). Smooth: trees also thin out continuously with distance inside each tile
+      (impostor.rint rejects a tree once its distance asks for less than its tile's density;
+      `thinLevels` in rt.glsl), so the density meets the next tile level's at every tile edge and
+      the canopy colour follows the same curve: no density squares from the air. Rays pass
+      through the trees that are thinned out, so it can cost a little in dense forest.
+      Stepped: one density per tile, the canopy colour by whole levels; tiles of
+      different levels meet with a visible density step from high up. (Measured at Lake Como,
+      2560x1392 DLSS Quality: smooth 11.28 ms, stepped 11.32 ms average, within run-to-run
+      noise.)
   - Streaming without hitches: one pool of worker threads builds terrain tiles (first) and grows
     tree tiles. Their vertex copies and BLAS builds are recorded into the frame's own command
     buffer, with no GPU waits. Storage is pooled and device-local: fixed slots for terrain
@@ -589,6 +599,7 @@ cargo run --release
 | `--imp-texel 0.055 --imp-res 448 --imp-grid 12` | impostor texel size (m), maximum frame resolution, views per side |
 | `--spacing 7 --radius 1400` | canopy tree spacing and forest radius |
 | `--sharpen 0.5`, `--no-taa` | post-processing |
+| `--tree-thinning smooth\|stepped` | globe: how distant trees thin out (see [Trees to the horizon](#the-earth-a-11-globe-and-real-places)); key N toggles it |
 | `--shot out.png --frames N --cam x,y,z,yaw,pitch` | render N frames, save, print timings and the GPU profile, exit |
 | `--views "x,h,z,yaw,pitch[,lod,debug];..."` | several cameras in one run (h above ground), one screenshot each |
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
@@ -625,6 +636,7 @@ cargo run --release
 | 0–5 | debug views |
 | K | supersampling 1x / 1.5x / 2x (TAA path) |
 | T | TAA on/off |
+| N (globe) | distant tree thinning: smooth (default) / stepped per tile |
 | H | sharpening strength |
 | Arrow keys | sun azimuth / elevation |
 | `-` `=` | exposure |

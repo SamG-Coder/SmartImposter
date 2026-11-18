@@ -2183,7 +2183,8 @@ impl Renderer {
                 self.profile.globe_max[i] = self.profile.globe_max[i].max(v);
             }
             let a = scene.index_addr();
-            gg.addr = [a as u32, (a >> 32) as u32, 0, 0];
+            // z: smooth tree thinning on (Globals.params.y; globe.rchit's canopy colour follows it)
+            gg.addr = [a as u32, (a >> 32) as u32, (g.params[1] > 0.5) as u32, 0];
             gg.params[1] = self.lod_frame as f32;
             gg.params[2] = g.iparams[1] as f32;
             gg.params[3] = f32::from_bits(self.ground_layers);

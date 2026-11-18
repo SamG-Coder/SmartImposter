@@ -74,6 +74,9 @@ struct Args {
     ss: f32,
     fullscreen: bool,
     no_taa: bool,
+    /// globe: thin distant trees smoothly with distance (no density step at tree tile edges,
+    /// ~0.3-0.5 ms) instead of one density per tile (`--tree-thinning smooth|stepped`, key N)
+    smooth_thin: bool,
     /// DLSS Ray Reconstruction mode (index into dlss::MODES), None = TAA + supersampling.
     dlss: Option<usize>,
     sharpen: f32,
@@ -116,6 +119,7 @@ fn parse_args() -> Args {
         ss: 1.5,
         fullscreen: false,
         no_taa: false,
+        smooth_thin: true,
         dlss: Some(1),
         sharpen: 0.5,
     };
@@ -210,6 +214,7 @@ fn parse_args() -> Args {
                 a.no_taa = true;
                 i -= 1;
             }
+            "--tree-thinning" => a.smooth_thin = next != "stepped",
             "--fullscreen" => {
                 a.fullscreen = true;
                 i -= 1;
@@ -266,6 +271,7 @@ struct State {
     sun_az: f32,
     sun_el: f32,
     exposure: f32,
+    smooth_thin: bool,
     fps_time: Instant,
     fps_frames: u32,
     shot_counter: u32,
@@ -433,6 +439,7 @@ impl App {
             sun_az: a.sun[0],
             sun_el: a.sun[1],
             exposure: 2.2,
+            smooth_thin: a.smooth_thin,
             fps_time: Instant::now(),
             fps_frames: 0,
             shot_counter: 0,
@@ -718,7 +725,8 @@ impl App {
             cam_up: cam_now[2],
             cam_fwd: cam_now[3],
             sun_dir: [sun.x, sun.y, sun.z, sun_w],
-            params: [now.elapsed().as_secs_f32(), 0.0, s.exposure, 4.0],
+            // y: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
+            params: [now.elapsed().as_secs_f32(), if s.smooth_thin { 1.0 } else { 0.0 }, s.exposure, 4.0],
             iparams: [s.accum, s.debug, s.frame, s.ao_rays],
             lod_params: [self.args.lod_band, s.lod2, self.args.lod2_band, 0.0],
             prev_pos: prev[0],
@@ -877,6 +885,10 @@ impl App {
             }
             KeyCode::KeyC => s.cinematic = !s.cinematic,
             KeyCode::KeyT => s.r.taa_enabled = !s.r.taa_enabled,
+            KeyCode::KeyN => {
+                s.smooth_thin = !s.smooth_thin;
+                println!("tree thinning: {}", if s.smooth_thin { "smooth" } else { "stepped (per tile)" });
+            }
             KeyCode::KeyH => s.r.sharpness = if s.r.sharpness >= 0.99 { 0.0 } else { (s.r.sharpness + 0.25).min(1.0) },
             KeyCode::KeyG => s.haze = if s.haze > 0.0 { 0.0 } else { 1.0 },
             KeyCode::KeyL => {

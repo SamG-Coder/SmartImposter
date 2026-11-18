@@ -459,7 +459,13 @@ void main() {
     // (closed stands cover ~85% of the ground), darker for the shade between the crowns.
     if (!water && cover) {
         float kept = 1.0;
-        kept = exp2(-2.0 * thinLevels(t)); // as impostor.rint thins the trees
+        if (gg.addr.z != 0u) {
+            kept = exp2(-2.0 * thinLevels(t)); // as impostor.rint thins the trees
+        } else if (t > gg.misc.y) {
+            // stepped: each tree tile keeps 1 / 4^k of its trees (levels coarser than the finest)
+            float k = max(floor(log2(t / gg.misc.z)), 1.0);
+            kept = exp2(-2.0 * k);
+        }
         if (t > gg.misc.w) kept = 0.0;
         float canopy = A.x * 0.85 * (1.0 - kept);
         alb = mix(alb, vec3(0.040, 0.062, 0.024), canopy);

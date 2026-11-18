@@ -13,7 +13,7 @@ struct GlobeGlobals {
     vec4 planet;  // xyz planet centre relative to the camera, w = radius
     vec4 params;  // x exposure, y frame, z debug view, w ground scans present (bit mask)
     vec4 misc;    // x pixel angle (rad); trees (forest.rs): y every tree within, z SPLIT x finest tile edge, w range (horizon)
-    uvec4 addr;   // xy shared index buffer address
+    uvec4 addr;   // xy shared index buffer address, z smooth tree thinning (1) or stepped (0)
 };
 
 
