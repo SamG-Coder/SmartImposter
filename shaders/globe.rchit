@@ -251,8 +251,10 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // (tundra: sedge, moss and dwarf shrubs over most of the ground, lichen and stones in patches)
     w[16] = bareFlat * arctic * 0.55 + moss * 0.08;
     w[17] = bareFlat * arctic * 0.35 + moss * 0.18;                               // lichen
-    w[18] += moss * 0.5;                                                          // moss mat
-    w[1] += moss * 0.4;                                                           // sedge, mossy grass
+    // (the "mossy forest floor" scan is grey-brown needles: the moss and sedge are the olive
+    // mossy and uncut grass scans)
+    w[1] += moss * 0.5;                                                           // moss, sedge
+    w[2] += moss * 0.25;                                                          // sedge
     w[3] += moss * 0.1;
     w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
     w[8] *= 1.0 - 0.6 * arctic;
