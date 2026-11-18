@@ -8,11 +8,16 @@
 #define MAT_TERRAIN 2u
 #define FLAG_IMPOSTOR 256u
 #define FLAG_IMPOSTOR_HI 512u
+#define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
-#define MAX_VARIANTS 128 // atlas slots (one per plant variant)
-#define MAX_SPECIES 16
-#define MAX_GROUND_TEX 16 // 3 per ground layer; the last slot is the biome mask
-#define TERRAIN_SIZE 3072.0
+#define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
+#define MAX_VARIANTS 256 // atlas slots (one per plant variant)
+#define MAX_SPECIES 64
+#define MAX_GROUND_TEX 80 // 3 per ground layer (26 layers); the last two slots are the far / near masks
+// world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
+#define NEAR_HALF 2048.0
+#define TERRAIN_HALF 60000.0
+#define TILE_FAR 18000.0
 
 // ---------------------------------------------------------------- hashing / random
 uint pcg(uint v) {
@@ -40,6 +45,17 @@ float vnoise(vec2 p) {
     vec2 u = f * f * (3.0 - 2.0 * f);
     float a = hashf(i), b = hashf(i + vec2(1, 0)), c = hashf(i + vec2(0, 1)), d = hashf(i + vec2(1, 1));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+// Value noise with its derivatives: (value, d/dx, d/dy), quintic so the slopes are smooth too.
+vec3 vnoiseD(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    float a = hashf(i), b = hashf(i + vec2(1, 0)), c = hashf(i + vec2(0, 1)), d = hashf(i + vec2(1, 1));
+    float k = a - b - c + d;
+    return vec3(a + (b - a) * u.x + (c - a) * u.y + k * u.x * u.y,
+                du.x * ((b - a) + k * u.y),
+                du.y * ((c - a) + k * u.x));
 }
 
 // ---------------------------------------------------------------- octahedral mappings
@@ -86,6 +102,14 @@ void frameBasis(vec3 f, out vec3 r, out vec3 u) {
 vec3 frameDir(vec2 cell, float N) { return hemiOctDecode(cell / (N - 1.0)); }
 
 // ---------------------------------------------------------------- materials
+// Foliage in dry biomes (dry 0..1): towards a dusty grey-olive of the same brightness, a little
+// paler (waxy, dust-covered leaves of desert and Mediterranean scrub).
+vec3 dryTint(vec3 alb, float dry) {
+    float l = dot(alb, vec3(0.30, 0.59, 0.11));
+    vec3 dusty = l * vec3(1.06, 1.0, 0.80) * 1.12;
+    return mix(alb, dusty, 0.62 * dry);
+}
+
 vec3 treeTint(uint seed, float leafiness) {
     if (seed == 0u) return vec3(1.0);
     uint s = pcg(seed * 7919u);

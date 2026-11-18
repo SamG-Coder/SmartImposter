@@ -17,6 +17,10 @@ struct HitPayload {
     float sunVis; // baked self-shadowing towards the sun (impostors), 1 for meshes
     uint shadowMask; // instance mask for this hit's shadow rays (impostors exclude themselves)
     vec3 trans;   // leaf transmission colour (translucency map x species tint), 0 for opaque
+    float wdepth; // terrain under water: depth of the water over this point (m), else 0
+    vec3 wtan;    // globe water: world direction of the first Earth-fixed coordinate (pl.trans.xy)
+    float wlevel; // globe water: height of the water surface above this point (m)
+    float wfloor; // globe water: depth of the sea floor (m, ETOPO; coastal vs open-ocean water)
 };
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.
@@ -28,6 +32,31 @@ struct ImpHit {
 
 // Custom index layout: low 8 bits mesh/variant id, bits 8..10 impostor mask colour, bits 11..23 seed.
 uint instSeed(uint ci) { return ci >> 11; }
+
+// Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs PlantRec)
+// is at gl_InstanceCustomIndexEXT + gl_PrimitiveID: object->world 3x4 (rows), variant | seed << 8.
+// 52 bytes, packed (the buffers use scalar layout): 13 million trees cost no padding
+struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; };
+mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xyz)); }
+vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
+uint plantVariant(PlantRec p) { return p.data & 0xFFu; }
+uint plantSeed(PlantRec p) { return (p.data >> 8) & 0x1FFFu; }
+// How dry the plant's biome is, 0..1 (forest.rs dryness): dusty, sun-bleached foliage.
+float plantDry(PlantRec p) { return float((p.data >> 21) & 15u) / 15.0; }
+// Globe tree tiles: how many levels coarser than the finest the plant's tile is (forest.rs: such a
+// tile keeps 1 / 4^k of the trees).
+uint plantThin(PlantRec p) { return (p.data >> 25) & 7u; }
+
+// The tree density the globe aims for at distance d, as levels of thinning (continuous): tiles k
+// levels coarser cover [THIN_BASE 2^k, THIN_BASE 2^(k+1)) beyond THIN_NEAR (forest.rs
+// tiles_near: SPLIT x the finest tile edge; NEAR), full density closer in. Trees fade out within
+// their tile towards the next level's density, so neighbouring tiles meet without a step; the
+// terrain's canopy colour (globe.rchit) follows the same curve.
+const float THIN_BASE = 2443.4;  // forest.rs SPLIT x the level-15 tile edge, m
+const float THIN_NEAR = 6000.0;  // forest.rs NEAR
+float thinLevels(float d) {
+    return max(log2(d / THIN_BASE), 0.0) * smoothstep(0.5 * THIN_NEAR, THIN_NEAR, d);
+}
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
 struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)
@@ -52,9 +81,10 @@ struct SpeciesInfo { vec4 leafTint; vec4 barkTint; vec4 transTint; };
 // Per TLAS instance (indexed by gl_InstanceID): the tree it belongs to, for LOD cross-fades.
 struct InstInfo {
     vec3 center;  // tree bounding-sphere centre (world)
-    uint data;    // tree index (24 bits) | has-mesh flag (bit 24) | variant (bits 25..31)
+    uint data;    // tree index (24 bits) | variant (bits 24..31)
+    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness
 };
-uint instVariant(uint data) { return data >> 25; }
+uint instVariant(uint data) { return data >> 24; }
 
 // Cross-fade weights. Inside a band, every ray picks one representation per tree with this
 // probability, using the same random number in the mesh any-hit and the impostor intersection

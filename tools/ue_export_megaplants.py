@@ -1,4 +1,4 @@
-"""Run inside Unreal (UnrealEditor-Cmd -run=pythonscript): export every Megaplant under
+"""Run inside Unreal: export every Megaplant under
 /Game/Megaplant_Library for SmartImposter.
 
 Megaplants are Nanite assemblies: each variant (e.g. Tree_European_Beech_01_A) is a skeletal mesh
@@ -13,6 +13,10 @@ Output (default <repo>/assets/megaplants, override with SI_MEGAPLANT_OUT):
   <Species>/textures/*.png     foliage CA/NT, bark C/NAH
   <Species>/materials.json     material instance parameters
 Env: SI_ONLY=<substring> to export a subset of species, SI_SKIP_TEXTURES=1.
+
+Run (the USD plugins must be on, or every mesh fails with "No usd exporter found"):
+  UnrealEditor-Cmd.exe <Project>.uproject -run=pythonscript -script=<repo>/tools/ue_export_megaplants.py
+      -EnablePlugins=PythonScriptPlugin,EditorScriptingUtilities,USDCore,USDImporter -unattended -NullRHI
 """
 import json
 import os

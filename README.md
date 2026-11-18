@@ -47,6 +47,7 @@ the same ray tracing pipeline, in about 2 seconds at startup.
   8. [Materials](#8-materials)
   9. [Frame: DLSS Ray Reconstruction](#9-frame-dlss-ray-reconstruction-or-taa)
   10. [Performance work](#10-performance-work)
+- [The Earth: a 1:1 globe and real places](#the-earth-a-11-globe-and-real-places)
 - [Getting started](#getting-started)
 - [Tools](#tools) · [Code layout](#code-layout) · [Limitations](#limitations) · [License](#license)
 
@@ -276,15 +277,34 @@ rebuilds the instance list only when a plant changes state; the shaders compute 
 exact distance every frame, so the transition is continuous. An 8M-instance budget keeps very
 long mesh distances from exhausting GPU memory.
 
-### 7. Forest layout and ground
+### 7. Terrain, rivers, forest growth and ground
 
-`world.rs` scatters four jittered-grid layers: canopy trees every 7 m, shrubs every 3.4 m, ferns
-every 2.1 m and grass patches every 2.3 m. Each layer reads biome fields: canopy density, moisture
-(low ground and wet patches), forest edges, dryness, beech stands and aspen groves. Variants are
-picked by weight, and each plant gets its own scale and rotation.
+**Terrain from erosion.** `erosion.rs` lifts a 144 km landscape by a tectonic uplift field and cuts
+it down with rivers, using the stream-power law solved implicitly (Braun & Willett 2013; Cordonnier
+et al. 2016). Every iteration a priority-flood pass (Barnes et al. 2014) routes all water to the sea,
+and the drainage area is accumulated. Branching valleys, ridges and basins come out of the
+simulation; the result is cached in `assets/cache`. Rivers are the cells draining more than 12 km²,
+traced into smoothed, meandering polylines with widths from their catchment and a water level that
+only falls downstream. Floodplains, banks and a riverbed are cut along them. The mesh is 3 m near
+the start, grows to 200 m cells out to ±60 km, and carries the Earth's curvature.
 
-The ground blends four scanned surfaces (forest floor, mossy grass, uncut grass, dried grass) found
-in the Fab library cache:
+**Forest growth as succession.** Trees are grown, not scattered:
+
+- founder pairs on a 60 m lattice where the site allows forest, then 10 generations (~150 years)
+  of seed dispersal;
+- pioneers (aspen in root-sucker groves, poplar and alder in thickets) colonise open ground and
+  gaps; shade-tolerant beech establishes under them and overtops them;
+- every species has a lifespan and an age of first seeding; windthrow gaps of all sizes reset
+  patches early on;
+- a seedling fails under a crown two generations older within 5.5 m (light competition).
+
+The result is a mosaic of stand ages and species, with alder and poplar along the rivers and
+meadows on the valley floors (~6M trees in an 8 km radius). Shrubs, ferns and grass are scattered
+on jittered grids from the simulated canopy cover.
+
+The ground blends twelve scanned surfaces found in the Fab library cache: forest floor, mossy
+grass, uncut grass, dried grass, two rock cliffs, snow, gravel, lichen rock, riverbed, pebbles and
+wet grass:
 
 - **Biome mask:** a 1024² mask is built at startup from the actual tree crowns (canopy cover),
   moisture, dryness and understory density. Leaf litter goes under closed canopy, moss on wet
@@ -296,6 +316,13 @@ in the Fab library cache:
   and 80 m, and open ground varies in brightness and hue over tens of metres.
 - **Height-based blending** (grass blades over litter), and a per-layer gain: the scans' mean
   albedos differ about 10x.
+- **Landform-driven layers:** leaf litter only under the simulated crowns; dry grass on convex,
+  sun-facing ground and lush grass in hollows; rock where it is too steep for soil (triplanar, with
+  strata), scree and snow by altitude zone; pebble bars, mud and wet grass along the water.
+- **Water:** rivers and lakes have a bed below the water surface. The ray-gen shades the surface
+  over the bed: absorption with depth (Beer-Lambert) and in-scattering, sunlight attenuated down to
+  the bed, flowing ripples, foam where it is shallow, a ray-traced reflection by Fresnel, the sun
+  glint, and wet banks.
 
 ![Ground: plain tiling vs hex-tile stochastic texturing](docs/images/ground_tiling.jpg)
 
@@ -366,6 +393,175 @@ Tried and dropped:
 The remaining cost is primary rays through dense grass (any-hit invocations) and the fixed DLSS-RR
 cost at DLAA; DLSS-RR Quality halves the frame time for a slightly softer image.
 
+## The Earth: a 1:1 globe and real places
+
+The plan for the whole planet at true scale is in [docs/EARTH_PLAN.md](docs/EARTH_PLAN.md). Built
+so far:
+
+- **`--globe`: the planet at 1:1, in the same renderer.** A cube-sphere quadtree of terrain tiles
+  from orbit down to ~5 m cells, streamed in as you fly. Positions are float64 on the CPU and
+  camera-relative float32 on the GPU, so it holds still from orbit to standing height. The globe is
+  a mode of the main renderer, so it keeps the same path tracing, DLSS Ray Reconstruction / TAA,
+  AO, mesh LOD band and see-through water. A single-scattering atmosphere (Rayleigh + Mie) gives
+  the sky, sunlight, sky light and aerial perspective from the ground to space.
+  - Trees to the horizon: tree tiles out to the visible horizon (`sqrt(2Rh)` from the camera
+    height, plus a ridge allowance). Every tree is placed within 6 km; coarser tiles further out
+    keep 1/4^k of the trees at their true size, and the terrain shader adds the canopy colour of
+    the ones left out. Near the camera the trees switch to meshes through the usual LOD band,
+    and grass, ferns and shrubs grow from the 20 m land cover within 700 m.
+    - Tree thinning, smooth or stepped (`--tree-thinning smooth|stepped`, key N; smooth by
+      default). Smooth: trees also thin out continuously with distance inside each tile
+      (impostor.rint rejects a tree once its distance asks for less than its tile's density;
+      `thinLevels` in rt.glsl), so the density meets the next tile level's at every tile edge and
+      the canopy colour follows the same curve: no density squares from the air. Rays pass
+      through the trees that are thinned out, so it can cost a little in dense forest.
+      Stepped: one density per tile, the canopy colour by whole levels; tiles of
+      different levels meet with a visible density step from high up. (Measured at Lake Como,
+      2560x1392 DLSS Quality: smooth 11.28 ms, stepped 11.32 ms average, within run-to-run
+      noise.)
+  - Clouds (`shaders/clouds.glsl`, noise from `src/cloudnoise.rs`), after Schneider's Nubis
+    (Horizon), Hillaire's Frostbite sky and Wrenninge's multiple scattering:
+    - Three layers fixed to the Earth: low clouds from 600 m (stratus and stratocumulus ~1 km
+      thick, cumulus to ~3 km, cumulonimbus towers with anvils to 11 km), altocumulus at
+      3.5-5 km, cirrus streaks at 8-9.5 km drawn out along the wind.
+    - Where they form: the equatorial band of towering convection, clear subtropics and
+      deserts, marine stratocumulus decks off subtropical west coasts (ocean with land to the
+      east), the cloudy mid-latitude storm tracks, polar stratus; weather systems of ~800 km and
+      cells of ~12 km that grow and decay over tens of minutes; `--cloud-cover` scales it all.
+    - Shapes from tiling 3D noise textures built once and cached: Perlin-Worley billows eroded by
+      Worley fBm, a height profile per cloud type (flat bases, rounded tops), wispy below.
+    - Light: sunlight marched towards the sun and summed over three scattering octaves
+      (multiple scattering: bright, soft interiors), the droplet phase function of Jendersie &
+      d'Eon 2023 (Henyey-Greenstein + Draine fitted to Mie: silver linings, fogbow and glory
+      lobes), darker thin edges seen away from the sun (powder), light diffused down through the
+      cloud above (1 / (1 + 0.75 tau (1 - g)): thick parts darker on the base), sky light from the
+      atmosphere and the sunlit ground's bounce. Clouds shadow the ground through all three
+      layers, dim the sky light under them and show in water reflections.
+    - About 3.2 ms at 2560x1392 (Lake Como, 15.0 vs 11.8 ms); `--clouds off` or key U.
+  - Atmosphere: ozone absorption, and samples packed towards the eye with each one dimmed only to
+    its own middle, so the horizon is pale and hazy rather than a brown band.
+  - The sea (`src/globe/ocean.rs`, `shaders/main.rgen`), built the way film and game oceans are
+    (Tessendorf, "Simulating Ocean Water"):
+    - Waves from a measured spectrum: JONSWAP wind sea plus a narrower swell, directional
+      spreading, deep-water dispersion. Four FFT cascades (1024, 256, 64, 16 m patches, 128^2)
+      on a background thread (~5 ms a step, overlapped), with choppy displacement (sharp crests,
+      round troughs), slopes and the Jacobian, uploaded each frame as RGBA16F textures with mips.
+    - Wind by region: trade winds, calm doldrums, westerlies (strongest in the Southern Ocean),
+      polar easterlies, varied by weather patterns; the spectrum follows the camera's place.
+    - Real wave geometry within 1.5 km: every view ray is marched through the slab the waves
+      fill and stops on the height field (bisection-refined), so crests hide the troughs behind
+      them and the skyline is made of waves; further out the cascades are normal detail.
+    - Roughness from physics: what the mips average away plus the Cox-Munk slope variance below
+      the finest cascade (0.003 + 0.00512 U) drives the reflection blur and a Beckmann sun
+      glitter, so the glitter path widens with the wind as over the real sea.
+    - Whitecaps where the crests fold (lowest Jacobian), steered so their area matches the
+      measured coverage for the wind (Monahan: 3.84e-6 U^3.41, ~1% at 10 m/s), fading over a few
+      seconds, drawn as dense fresh foam with streaks trailing downwind.
+    - Water colour by floor depth: clear deep blue over the open ocean (pure water absorbs red,
+      barely blue), greener over the shelf; light glows through thin crests when the sun is
+      behind them (after the Atlas GDC 2019 water BSDF); waves die out as the bottom shoals.
+    - No repeating patches (stochastic tiling): each cascade is laid out on hex cells ~1.5
+      patches across, every cell at a random offset and turned up to +-25 degrees about the
+      wind, three cells blended per point (variance-preserving, slopes and displacements turned
+      back); amplitudes rise and fall in wave groups, and the whitecaps cluster with them.
+    - Cost at sea level (2560x1392, DLSS Quality): ~10.4 ms a frame with clouds.
+    Lakes keep their own calmer wind ripples.
+  - Streaming without hitches: one pool of worker threads builds terrain tiles (first) and grows
+    tree tiles. Their vertex copies and BLAS builds are recorded into the frame's own command
+    buffer, with no GPU waits. Storage is pooled and device-local: fixed slots for terrain
+    vertices and BLASes, one plant record / AABB buffer, and size-class slabs for tree BLASes.
+    Tile selection, instance lists and mesh LOD run while the previous frame is still on the GPU.
+    A tree tile that is being replaced by a finer or coarser one stays until its replacement is
+    in, so the forest never shows bare patches. The coarse terrain tiles above the drawn ones
+    (and their siblings) are never evicted, so very fast flight lowers the detail gradually
+    instead of dropping whole regions to a coarse tile. Moving fast, tiles are requested by their
+    distance from where the camera will be ~30 frames later, so the ground ahead fills first.
+  - Elevation: NOAA ETOPO 2022 (60″, global, land and seafloor), Copernicus GLO-30 (30 m) where its
+    tiles are present, blended at the edges. The whole ETOPO grid also lives on the GPU for
+    per-pixel coastlines and relief far away.
+  - Land cover: ESA WorldCover 2021 (10 m) where present, as fractions per terrain vertex. They pick
+    the Quixel ground scans (forest floor, grass, rock on cliffs, glaciers, gravel, wetland) and mark
+    lakes and rivers.
+- **Time, sun and moon.** A UTC clock drives the sun and the moon (Astronomical Almanac /
+  Meeus formulas: sun to ~0.01 degrees, moon to ~0.3), so the Earth turns under them: day and
+  night, the seasons, and from orbit the terminator sweeping across the planet. The moon has its
+  real phase and brightness (~2.4 millionths of sunlight at full); at night it is the light, and the
+  eye adapts (pre-exposure in main.rgen, so moonlit radiance survives the 16-bit targets). `,` `.`
+  step an hour (Shift: a day), `/` cycles the speed (real time, a minute, an hour or a day per
+  second, stopped); `--time 2026-06-21T19:30` starts at a UTC time.
+- **Water and shores.** Every terrain tile carries a 64 x 64 signed distance to the shore (from the
+  10 m land cover, ETOPO where there is none), filtered per pixel: coastlines and lake shores are
+  smooth curves at any distance. The same field gives the depth (lakes shelve to ~18 m, the sea to
+  ~12 m and then ETOPO's seafloor), so the water is see-through over its bed: shallows show the
+  pebbles or sand, foam at the waterline, a wet strip and a pebble or beach-sand strip on the shore,
+  deep blue sea and dark lakes further out.
+- **Biomes.** RESOLVE Ecoregions 2017 (846 ecoregions in 14 biomes, `tools/bake_biomes.py` ->
+  a 3.7 km grid) chooses per place:
+  - which trees grow (globe/forest.rs `BIOME_TREES`: e.g. spruce, pine, birch in the taiga; beech,
+    oak, maple, hornbeam in temperate forest; Aleppo pine and oak in Mediterranean scrub; palms in
+    oases and the tropics), with conifers taking over with altitude in temperate mountains and
+    alders / willows / poplars on wet ground;
+  - which understory plants belong there (bilberry and anemone in temperate and boreal forest,
+    greasewood in deserts and steppe, ...);
+  - which ground scans cover the land (globe.rchit: mossy forest floor in the taiga, red soil in
+    the tropics, dry grass and red soil in savanna, sand and arid soil in deserts, tundra stones
+    and lichen in the Arctic, mud in wetlands and mangroves, glacier ice, ploughed fields, beach
+    sand on sea coasts).
+
+  Species and scans are found by name: a Quixel asset that is not downloaded is skipped (the
+  biome's other species, or a stand-in, take its place) and grows where it belongs once it is.
+- **`--site lat,lon`: a real place in the forest renderer.** The local tangent plane at that point
+  (with the Earth's curvature), heights from GLO-30 / ETOPO, lakes and rivers from WorldCover,
+  streams from a priority-flood drainage of the real 30 m heights, and the forest grown only where
+  WorldCover has tree cover. Altitude zones shift with latitude.
+- **M** in site mode returns to the globe above the same spot.
+
+**Data (free, not included).** `tools/fetch_earth.py` downloads it into `assets/earth/`
+(resumable: stop and restart any time; `--bbox south,west,north,east` limits it to a region):
+
+| Command | Folder | Dataset | Download | On disk |
+|---|---|---|---|---|
+| (by hand) | `etopo/` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model) 60″ ice surface, `ETOPO_2022_v1_60s_N90W180_surface.tif` | 466 MB | 0.9 GB |
+| `fetch_earth.py dem` | `glo30/` | [Copernicus DEM GLO-30](https://registry.opendata.aws/copernicus-dem/), 26,450 1° tiles | ~543 GB | ~120 GB |
+| `fetch_earth.py cover` | `worldcover/` | [ESA WorldCover 2021 v200](https://registry.opendata.aws/esa-worldcover-vito/), 2,651 3° tiles | 124 GB | 124 GB |
+| `fetch_earth.py vectors` | `ecoregions/`, `hydrorivers/`, `hydrolakes/` | [RESOLVE Ecoregions 2017](https://ecoregions.appspot.com/), [HydroRIVERS / HydroLAKES](https://www.hydrosheds.org/) | 1.5 GB | 5.3 GB |
+
+Elevation tiles are converted to a compact `.dem` file as they arrive (half-metre int16,
+gradient-predicted, deflate: ~4.5x smaller than the GeoTIFF; `smart_imposter --convert-dem`).
+Nothing is loaded up front: the workers decode elevation tiles and 1024 x 1024 land-cover blocks
+the first time they need them and keep the recent ones in memory. Far terrain reads the land
+cover's overviews (20 m ... 600 m pixels) instead of single 10 m pixels. The globe runs with
+ETOPO alone; the 30 m elevation and land cover exist wherever their tiles are present.
+
+Streaming on an RTX 5080 at 1920x1080, DLSS-RR Quality, `--bench-move` over 900 frames:
+
+| Run | avg | p99 | max | frames > 33 ms |
+|---|---|---|---|---|
+| Flight at 300 m over Lake Como, 4 m/frame | 7.3 ms | 9.5 ms | 12.3 ms | 0 |
+| Walk on an alpine slope, 0.3 m/frame | 6.3 ms | 10.2 ms | 11.2 ms | 0 |
+| Flight at 1500 m, 15 m/frame | 7.1 ms | 11.0 ms | 15.5 ms | 0 |
+
+Earlier, with synchronous per-tile uploads, the same runs had p99 64–68 ms and maxima of 76–110 ms.
+A cold view streams in fully in ~1.8 s after the first frame (was 4.3 s).
+
+Quixel species in the globe so far (docs/QUIXEL_DOWNLOADS.md): European Beech, Black Alder,
+Black Poplar, European Aspen, Common Hazel, Norway Spruce, Baltic Pine, Silver Birch, English Oak,
+Goat Willow, Norway Maple, Aleppo Pine, Dead Pine, Rowan, Elder, Giant Bamboo, Bilberry, Wood
+Anemone, European Spindle, Greasewood, Bracken, Heather, Huckleberry Oak and 7 grasses; 26 ground
+scans. Megaplants are exported from Unreal with `tools/ue_export_megaplants.py` (the USD plugins
+must be enabled) and converted with `tools/megaplant_to_mtree.py` (needs Pixar's `usd-core`).
+GPU memory is kept in check without losing detail: textures are block-compressed on first use
+and cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
+>= 35 dB for almost all of them, a quarter of RGBA8 or less; static and streamed BLASes are
+compacted (the tree meshes 1.9 -> 0.7 GB); tree AABBs are build input only; plant records carry
+no padding. Impostor atlases share a budget (`SI_IMPOSTOR_MB`, default 30% of VRAM): with many
+species their texels grow uniformly instead of running out of memory. `SI_MEM=1` prints the GPU
+memory by allocation with the benchmark output.
+
+**Still to do** (see the plan): the glTF 3D plants (palms, cacti, Xanadu, marram and ribbon
+grass, poppies, dandelions) need an importer; rivers from HydroRIVERS (the 10 m land cover has the
+wide ones); ocean waves, clouds, stars and seasons.
+
 ## Getting started
 
 ### Requirements
@@ -407,10 +603,11 @@ license doesn't allow redistribution, so this repository contains no assets. Get
    tools/.venv/Scripts/python tools/grass_to_mtree.py <FabLibrary>/Grass_Clumps-<id> assets/species/Grass_Clumps
    ```
    Options: `--patch 2.6` (patch diameter, m), `--patches 3` (variants), `--density 1.0`.
-5. Ground (optional): add the Fab surfaces **Forest Floor**, **Mossy Grass**, **Uncut Grass** and
-   **Grass Dried** (glTF, 2K). The engine finds them in the Fab library cache
-   (`D:/EpicVault/VaultCache/FabLibrary` by default; set `SI_GROUND_DIR`). Without them the
-   terrain is procedural.
+5. Ground (optional): add the Fab surfaces listed in `catalog.rs` `GROUND_LAYERS` (Forest Floor,
+   Mossy Grass, Uncut Grass, Grass Dried, rock cliffs, snow, gravel, riverbed, pebbles, wet grass;
+   glTF, 2K). The engine finds them in your Fab library cache: set `SI_GROUND_DIR` to it, at run
+   time or at build time in `.cargo/config.toml` (`[env]`). Missing surfaces fall back to
+   procedural stand-ins.
 
 The older single-species route (USD download → `tools/usd_to_mtree.py`, textures via
 `tools/ue_export.py`) still works: with no `assets/species` packs the engine loads
@@ -449,12 +646,16 @@ cargo run --release
 | `--imp-texel 0.055 --imp-res 448 --imp-grid 12` | impostor texel size (m), maximum frame resolution, views per side |
 | `--spacing 7 --radius 1400` | canopy tree spacing and forest radius |
 | `--sharpen 0.5`, `--no-taa` | post-processing |
+| `--clouds on\|off`, `--cloud-cover 0.45` | globe: volumetric clouds and how much of the sky they cover (0-1, before the weather systems and latitude belts); key U toggles them |
+| `--tree-thinning smooth\|stepped` | globe: how distant trees thin out (see [Trees to the horizon](#the-earth-a-11-globe-and-real-places)); key N toggles it |
 | `--shot out.png --frames N --cam x,y,z,yaw,pitch` | render N frames, save, print timings and the GPU profile, exit |
 | `--views "x,h,z,yaw,pitch[,lod,debug];..."` | several cameras in one run (h above ground), one screenshot each |
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
 | `--gallery` | every variant on flat ground, one row per species |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
-| `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse |
+| `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
+| `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
+| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--time 2026-06-21T10:30] [--time-rate s]` | the 1:1 globe; `--views` takes the same five numbers per view; `--time` is UTC (default 10:30 local solar time on the June solstice), `--time-rate` simulated seconds per second (default real time, stopped when capturing); `--bench-move m` flies along the heading at constant height |
 
 | Environment | Meaning |
 |---|---|
@@ -483,17 +684,24 @@ cargo run --release
 | 0–5 | debug views |
 | K | supersampling 1x / 1.5x / 2x (TAA path) |
 | T | TAA on/off |
+| N (globe) | distant tree thinning: smooth (default) / stepped per tile |
+| U (globe) | volumetric clouds on/off |
 | H | sharpening strength |
 | Arrow keys | sun azimuth / elevation |
 | `-` `=` | exposure |
 | O | AO rays per pixel |
-| P | print the camera as `--cam` |
+| P | print the camera as `--cam` (globe: as `--at`) |
+| M (site mode) | back to the globe above the same place |
+| `,` `.` / Arrows (globe) | clock back / forward an hour (Shift: a day; up / down: a day) |
+| `/` (globe) | clock speed: real time, 1 min/s, 1 h/s, 1 day/s, stopped |
 | F11 / F12 | fullscreen / screenshot |
 
 ## Tools
 
 | Script | Purpose |
 |---|---|
+| `tools/fetch_earth.py` | download the globe's data (Copernicus GLO-30, ESA WorldCover, ecoregions, rivers, lakes) into `assets/earth/`, converting the elevation tiles as they arrive |
+| `tools/bake_biomes.py` | rasterise the RESOLVE ecoregions into the globe's biome grid (`assets/earth/ecoregions/eco_grid.bin`) |
 | `tools/ue_export_megaplants.py` | run inside Unreal: export every Megaplant's meshes, Nanite assembly hierarchy, textures and material parameters |
 | `tools/megaplant_to_mtree.py` | flatten an exported Megaplant into `.mtree` + species `.json` |
 | `tools/grass_to_mtree.py` | Megascans 3D grass (Fab glTF) → grass-patch species pack |
@@ -516,14 +724,18 @@ src/
   accel.rs     BLAS / TLAS building, instance records
   asset.rs     .mtree loader
   textures.rs  parallel PNG decode, per-species normalisation, GPU mip generation
-  world.rs     procedural terrain, biome scatter, ground mask
+  world.rs     terrain (eroded or a real site), forest succession, biome scatter, ground masks
+  erosion.rs   uplift + stream-power erosion, priority flood, drainage, river polylines
+  globe/       the 1:1 Earth as a mode of the renderer: scene (streaming, pooled GPU storage,
+               BLAS builds in the frame, instances), tiles (cube-sphere quadtree, tile meshes),
+               forest (tree and understory tiles), etopo / dem / landcover (data readers)
   flypath.rs   arc-length parameterised Catmull-Rom showcase path
 native/
   dlss_shim.cpp  thin C ABI over the NGX Vulkan Ray Reconstruction API
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  (+ rt.glsl, globals.glsl, shared.glsl)
+  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl, atmosphere.glsl)
 ```
 
 ## Limitations
@@ -536,6 +748,10 @@ shaders/
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
+- **Globe:** tropical, desert and mangrove trees are stand-ins until their Quixel species are
+  imported (palms and cacti are glTF downloads without an importer yet); the ground colour without
+  land cover data is a latitude stand-in; the ocean has no waves; no stars. Site mode uses the
+  forest scene's lowland species everywhere. Terrain pools take ~1–2 GB of VRAM in a typical view.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 

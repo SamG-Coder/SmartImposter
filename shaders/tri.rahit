@@ -13,7 +13,7 @@ layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
 layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[]; };
 layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
 layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
-layout(set = 0, binding = 13) uniform sampler2D matTex[4 * MAX_SPECIES];
+layout(set = 0, binding = 13) uniform sampler2D matTex[6 * MAX_SPECIES];
 
 void main() {
     MeshInfo m = meshes[gl_InstanceCustomIndexEXT & 0x7FFu];
@@ -25,13 +25,13 @@ void main() {
         float spread = g.camFwd.w;
         float footprint = spread > 0.0 ? gl_HitTEXT * spread : -spread;
         float lod = clamp(log2(max(footprint * 2048.0, 1e-4)), 0.0, 9.0);
-        float a = textureLod(matTex[nonuniformEXT(m.texSet * 4u)], uv, lod).a;
+        float a = textureLod(matTex[nonuniformEXT(m.texSet * 6u)], uv, lod).a;
         // Box-filtered mips thin the blades' coverage: lower the cutoff with distance.
         if (a < mix(0.5, 0.25, clamp(lod / 6.0, 0.0, 1.0))) ignoreIntersectionEXT;
     }
     if (g.lodParams.z < -0.5) return; // impostor bake: no LOD dissolve
     InstInfo ii = insts[gl_InstanceID];
-    if ((ii.data & 0x1000000u) == 0u) return; // plain mesh instance (alpha-tested only)
+    if ((ii.flags & 1u) == 0u) return; // plain mesh instance (alpha-tested only)
     float f = meshFade(g, distance(g.camPos.xyz, ii.center) / imps[instVariant(ii.data)].lodScale);
     if (lodRand(g, ii.data & 0xFFFFFFu, 1u) >= f) ignoreIntersectionEXT;
 }
