@@ -18,6 +18,8 @@ struct HitPayload {
     uint shadowMask; // instance mask for this hit's shadow rays (impostors exclude themselves)
     vec3 trans;   // leaf transmission colour (translucency map x species tint), 0 for opaque
     float wdepth; // terrain under water: depth of the water over this point (m), else 0
+    vec3 wtan;    // globe water: world direction of the first Earth-fixed coordinate (pl.trans.xy)
+    float wlevel; // globe water: height of the water surface above this point (m)
 };
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.

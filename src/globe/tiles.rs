@@ -21,15 +21,23 @@ pub const SPLIT_K: f64 = 5.0;
 /// tree shrub grass crop | built bare snow water | wetland moss has-data -), texture
 /// coordinates in metres (2).
 pub const VSTRIDE: usize = 12;
-/// Shoreline field after each tile's vertices: one float (cell size, m), then FIELD x FIELD bytes
-/// of signed distance to the shore (globe.rchit: water where it is negative; mirrored there).
+/// Shoreline field after each tile's vertices: one float (cell size m), the water level grid
+/// (LEVEL_GRID x LEVEL_GRID floats, m), then FIELD x FIELD bytes of signed distance to the mapped
+/// water (globe.rchit; mirrored there).
 pub const FIELD: usize = 64;
+/// Water level grid nodes per tile side (every 4th vertex): the height of the water surface,
+/// bilinear in globe.rchit, so lakes are flat and rivers step down with the land.
+pub const LEVEL_GRID: usize = 9;
+/// Level grid values with a meaning of their own: no water near this node; the heights are
+/// ETOPO's (lake beds, not surfaces), so the field alone decides where water is.
+pub const LEVEL_NONE: f32 = -1.0e7;
+pub const LEVEL_UNKNOWN: f32 = 1.0e7;
 /// Field cells around the tile that are sampled too, so the distances agree across tile edges.
 const APRON: usize = 12;
 /// Field encoding: byte = 128 + distance in cells x FIELD_SCALE (so +-16 cells).
 const FIELD_SCALE: f64 = 8.0;
 /// Floats per tile in the vertex buffer: vertices, then the field.
-pub const TILE_FLOATS: usize = (GRID * GRID + 4 * GRID) * VSTRIDE + 1 + FIELD * FIELD / 4;
+pub const TILE_FLOATS: usize = (GRID * GRID + 4 * GRID) * VSTRIDE + 1 + LEVEL_GRID * LEVEL_GRID + FIELD * FIELD / 4;
 /// Texture coordinates repeat every TEX_PERIOD metres (a multiple of every texture repeat).
 pub const TEX_PERIOD: f64 = 131_072.0;
 
@@ -316,9 +324,84 @@ pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
     let (cell_m, field) = water_field(id, terrain);
     FIELD_NS.fetch_add(tf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     verts.push(cell_m);
+    verts.extend(water_levels(&field, &elev, cell > 400.0));
     verts.extend(field.chunks_exact(4).map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
     debug_assert_eq!(verts.len(), TILE_FLOATS);
     TileMesh { id, center, verts }
+}
+
+/// The water surface height on the LEVEL_GRID nodes: a low percentile of the ground height (the
+/// 30 m DSM gives water bodies their surface height) over the mapped water within one node
+/// spacing, the sea at 0; nodes without water nearby take their neighbours' level. globe.rchit
+/// draws water as this level wherever the ground lies below it, so shores follow the contours.
+/// `elev`: the tile's heights with a one-sample apron; `coarse`: they are ETOPO's.
+fn water_levels(field: &[u8], elev: &[f32], coarse: bool) -> Vec<f32> {
+    let lg = LEVEL_GRID;
+    if coarse || field.iter().all(|&f| f >= 128) {
+        return vec![if coarse { LEVEL_UNKNOWN } else { LEVEL_NONE }; lg * lg];
+    }
+    let (n, m) = (GRID, GRID + 2);
+    // ground height at a field cell centre: bilinear in the vertex grid (as the mesh has it)
+    let height = |x: usize, y: usize| -> f32 {
+        let g = |c: usize| ((c as f64 + 0.5) / FIELD as f64 * (n - 1) as f64).min((n - 1) as f64 - 1e-6);
+        let (gx, gy) = (g(x), g(y));
+        let (i, j) = (gx.floor() as usize, gy.floor() as usize);
+        let (tx, ty) = ((gx - i as f64) as f32, (gy - j as f64) as f32);
+        let e = |i: usize, j: usize| elev[(j + 1) * m + i + 1];
+        let a = e(i, j) + (e(i + 1, j) - e(i, j)) * tx;
+        let b = e(i, j + 1) + (e(i + 1, j + 1) - e(i, j + 1)) * tx;
+        a + (b - a) * ty
+    };
+    let span = FIELD / (lg - 1); // field cells between nodes
+    let mut lv = vec![f32::NAN; lg * lg];
+    let mut s = Vec::with_capacity((2 * span + 1) * (2 * span + 1));
+    for ny in 0..lg {
+        for nx in 0..lg {
+            s.clear();
+            let (cx, cy) = (nx * span, ny * span);
+            for y in cy.saturating_sub(span)..(cy + span).min(FIELD) {
+                for x in cx.saturating_sub(span)..(cx + span).min(FIELD) {
+                    if field[y * FIELD + x] < 128 {
+                        s.push(height(x, y));
+                    }
+                }
+            }
+            if !s.is_empty() {
+                s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let l = s[s.len() / 4];
+                lv[ny * lg + nx] = if l < 1.0 { 0.0 } else { l };
+            }
+        }
+    }
+    // fill the nodes without water from their neighbours
+    for _ in 0..2 * lg {
+        if !lv.iter().any(|v| v.is_nan()) {
+            break;
+        }
+        let prev = lv.clone();
+        for ny in 0..lg {
+            for nx in 0..lg {
+                if !prev[ny * lg + nx].is_nan() {
+                    continue;
+                }
+                let (mut sum, mut k) = (0.0, 0.0);
+                for (dx, dy) in [(-1i32, 0i32), (1, 0), (0, -1), (0, 1)] {
+                    let (x, y) = (nx as i32 + dx, ny as i32 + dy);
+                    if x >= 0 && y >= 0 && (x as usize) < lg && (y as usize) < lg {
+                        let v = prev[y as usize * lg + x as usize];
+                        if !v.is_nan() {
+                            sum += v;
+                            k += 1.0;
+                        }
+                    }
+                }
+                if k > 0.0 {
+                    lv[ny * lg + nx] = sum / k;
+                }
+            }
+        }
+    }
+    lv
 }
 
 /// Shared index buffer for every tile (same topology): the grid, then the four skirts.

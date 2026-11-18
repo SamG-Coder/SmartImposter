@@ -258,11 +258,48 @@ impl LandCover {
     /// Is it water (permanent water bodies) at lat / lon, read at a resolution for samples
     /// `spacing` metres apart? None where there is no land cover data.
     pub fn water_at(&self, lat: f64, lon: f64, spacing: f64) -> Option<bool> {
-        let level = ((spacing / (3.0 * 111_320.0 / N as f64)).log2().floor().max(0.0)) as usize;
-        match self.class_at(lat, lon, level) {
-            0 => None,
-            c => Some(c == 80),
+        self.water_frac(lat, lon, spacing).map(|f| f > 0.5)
+    }
+
+    /// Water coverage (0..1) at lat / lon, bilinear between the pixel centres of the level for
+    /// samples `spacing` metres apart: its 0.5 contour is a smooth line, not the pixel staircase.
+    /// None where there is no land cover data.
+    pub fn water_frac(&self, lat: f64, lon: f64, spacing: f64) -> Option<f32> {
+        let mut f = [0f32; GROUPS];
+        let n = self.bilinear(lat, lon, Self::level_for(spacing), 1.0, &mut f);
+        (n > 0.0).then(|| f[WATER] / n)
+    }
+
+    /// The coarsest level whose pixels are no larger than `spacing` metres.
+    fn level_for(spacing: f64) -> usize {
+        ((spacing / (3.0 * 111_320.0 / N as f64)).log2().floor().max(0.0)) as usize
+    }
+
+    /// Add the class groups of the four pixel centres around lat / lon at `level` with their
+    /// bilinear weights (times `weight`) to `f`; returns the weight that had data.
+    fn bilinear(&self, lat: f64, lon: f64, level: usize, weight: f32, f: &mut [f32; GROUPS]) -> f32 {
+        let level = level.min(LEVELS - 1);
+        let px = 3.0 / (N >> level) as f64; // pixel size in degrees
+        // pixel centres sit at (k + 0.5) * px from the tile corner
+        let fy = (90.0 - lat) / px - 0.5;
+        let fx = (lon + 180.0) / px - 0.5;
+        let (y0, x0) = (fy.floor(), fx.floor());
+        let (ty, tx) = ((fy - y0) as f32, (fx - x0) as f32);
+        let mut got = 0.0;
+        for (dy, wy) in [(0.0, 1.0 - ty), (1.0, ty)] {
+            for (dx, wx) in [(0.0, 1.0 - tx), (1.0, tx)] {
+                let w = wy * wx * weight;
+                if w <= 0.0 {
+                    continue;
+                }
+                let (clat, clon) = (90.0 - (y0 + dy + 0.5) * px, (x0 + dx + 0.5) * px - 180.0);
+                if let Some(g) = group(self.class_at(clat, clon, level)) {
+                    f[g] += w;
+                    got += w;
+                }
+            }
         }
+        got
     }
 
     /// Class group at lat / lon (None = no data).
@@ -276,9 +313,9 @@ impl LandCover {
             return None;
         }
         let k = ((size / 20.0).ceil() as usize).clamp(1, 6);
-        // the coarsest level whose pixels are no larger than the sample spacing
-        let spacing = size / k as f64;
-        let level = ((spacing / (3.0 * 111_320.0 / N as f64)).log2().floor().max(0.0)) as usize;
+        // the coarsest level whose pixels are no larger than the sample spacing; each sample is
+        // bilinear between pixel centres (fractions change smoothly, no pixel staircase)
+        let level = Self::level_for(size / k as f64);
         let dlat = size / 111_320.0;
         let dlon = dlat / lat.to_radians().cos().max(0.05);
         let mut f = [0f32; GROUPS];
@@ -286,10 +323,7 @@ impl LandCover {
         for j in 0..k {
             for i in 0..k {
                 let (a, b) = ((i as f64 + 0.5) / k as f64 - 0.5, (j as f64 + 0.5) / k as f64 - 0.5);
-                if let Some(g) = group(self.class_at(lat + b * dlat, lon + a * dlon, level)) {
-                    f[g] += 1.0;
-                    n += 1.0;
-                }
+                n += self.bilinear(lat + b * dlat, lon + a * dlon, level, 1.0, &mut f);
             }
         }
         if n == 0.0 {

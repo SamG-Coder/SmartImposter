@@ -136,6 +136,7 @@ void main() {
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
     pl.wdepth = 0.0;
+    pl.wlevel = 0.0;
 #ifdef SER
     // Shader Execution Reordering (RTX 40/50): traverse, then regroup the threads by what they
     // hit (ground, textured leaves, impostors, sky) before running the closest-hit / miss shader,
@@ -256,10 +257,14 @@ void main() {
         // depth from the shoreline field and the sea floor)
         float under = -1.0;
         bool sea = (pl.flags & FLAG_SEA) != 0u;
-        if (globe() && (pl.flags & FLAG_WATER) != 0u) {
-            tSurf = pl.t;
+        bool globeWater = globe() && (pl.flags & FLAG_WATER) != 0u;
+        vec3 wq = pl.trans, wtan = pl.wtan; // globe water: Earth-fixed coordinates, shore distance
+        if (globeWater) {
+            // the hit is the ground under the flat water surface, wlevel below it
+            float cosV = max(dot(-dir, normalize(gq)), 0.02);
+            tSurf = max(pl.t - pl.wlevel / cosV, pl.t * 0.5);
             wd = max(wd, 0.02);
-            under = wd / max(dot(-dir, normalize(gq)), 0.05);
+            under = wd / max(cosV, 0.05);
         } else if ((pl.flags & FLAG_WATER) != 0u && wd <= 0.0) {
             tSurf = pl.t;
             wd = 6.0; // open water: no shallows, no foam
@@ -298,29 +303,55 @@ void main() {
             vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? vec3(0.0015, 0.006, 0.016) : vec3(0.003, 0.010, 0.010);
             vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
-            // flowing ripples: two octaves drifting at different speeds and directions
+            // flowing ripples: two octaves drifting at different speeds and directions, fixed to
+            // the ground (globe: the Earth-fixed water coordinates, not the camera frame)
             float tm = g.extra.w;
-            vec2 q = ps.xz;
+            // globe: the coordinates at the surface point (the hit is the ground under it)
+            float vSign = length(wtan) > 1.5 ? -1.0 : 1.0;
+            wtan = globeWater ? normalize(wtan) : vec3(1.0, 0.0, 0.0);
+            vec3 wvd = cross(normalize(gq), wtan) * vSign;
+            vec2 q = globeWater ? wq.xy + vec2(dot(ps - p, wtan), dot(ps - p, wvd)) : ps.xz;
             float e = 0.08;
             #define RIPPLE(Q) (0.022 * vnoise((Q) * 1.1 + vec2(0.55, 0.2) * tm) + 0.009 * vnoise((Q) * 3.3 - vec2(0.3, 0.75) * tm) + 0.004 * vnoise((Q) * 8.0 + vec2(0.9, 0.4) * tm))
             float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
-            n = normalize(vec3(-(hx - h0) / e, 1.0, -(hz - h0) / e));
+            // fade the ripples out where a pixel covers many of them (no shimmer far away)
+            float rip = globeWater ? smoothstep(250.0, 40.0, tSurf) * 0.85 + 0.15 : 1.0;
+            vec2 gr = vec2(hx - h0, hz - h0) / e * rip;
+            float foam;
+            if (globeWater) {
+                vec3 wup = normalize(gq);
+                n = normalize(wup - wtan * gr.x - wvd * gr.y);
+                // lapping foam: a thin, broken line that runs up and back at the waterline
+                float sdW = wq.z;
+                float swash = 0.5 + 0.35 * sin(tm * 0.9 + vnoise(q * 0.12) * 6.2831853);
+                float band = smoothstep(-swash - 0.8, -swash * 0.4, sdW) * (1.0 - smoothstep(-0.1, 0.15, sdW));
+                float brk = smoothstep(0.42, 0.78, vnoise(q * 1.6 + vec2(0.3, 0.5) * tm) * 0.6 + vnoise(q * 5.5 - vec2(0.2, 0.4) * tm) * 0.4);
+                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf);
+            } else {
+                n = normalize(vec3(-gr.x, 1.0, -gr.y));
+                // foam and white water where it is shallow at the shore
+                foam = smoothstep(0.14, 0.02, wd) * smoothstep(0.35, 0.75, vnoise(q * 2.2 + vec2(0.4, 0.3) * tm) * 0.6 + vnoise(q * 7.0) * 0.4);
+            }
             nDir = n;
-            // foam and white water where it is shallow at the shore
-            float foam = smoothstep(0.14, 0.02, wd) * smoothstep(0.35, 0.75, vnoise(q * 2.2 + vec2(0.4, 0.3) * tm) * 0.6 + vnoise(q * 7.0) * 0.4);
             p = ps;
             pl.t = tSurf;
             col = refr;
             float tHit = pl.t;
             vec3 R = reflect(dir, n);
-            R = normalize(vec3(R.x, max(R.y, 0.01), R.z));
+            if (globeWater) {
+                vec3 wup = normalize(gq);
+                float ru = dot(R, wup);
+                if (ru < 0.01) R = normalize(R + wup * (0.01 - ru));
+            } else {
+                R = normalize(vec3(R.x, max(R.y, 0.01), R.z));
+            }
             float cosT = max(dot(-dir, n), 0.0);
             float F = 0.02 + 0.98 * pow(1.0 - cosT, 5.0);
             pl.t = -1.0;
             pl.sunVis = 1.0;
             pl.shadowMask = 0xFFu;
             pl.trans = vec3(0.0);
-            traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, p + vec3(0.0, 0.05, 0.0), 0.02, R, farRay(), 0);
+            traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, p + (globeWater ? normalize(gq) : vec3(0.0, 1.0, 0.0)) * 0.05, 0.02, R, farRay(), 0);
             vec3 refl;
             if (pl.t < 0.0) {
                 refl = skyColor(R);
@@ -345,7 +376,7 @@ void main() {
             float glint = pow(max(dot(n, H), 0.0), 900.0) * 120.0;
             col = mix(col, refl, F) + E * glint * F * sh;
             vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
-            col = mix(col, foamCol, foam * 0.7);
+            col = mix(col, foamCol, foam * 0.6);
             gbN = n;
             gbAlb = mix(vec3(0.02, 0.04, 0.04), vec3(0.75), foam);
             gbRough = 0.05;

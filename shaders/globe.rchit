@@ -67,10 +67,14 @@ float fbmN(vec2 p, int octaves) {
     return s / norm;
 }
 
-// ---- shoreline field (tiles.rs water_field), stored after each tile's vertices
+// ---- shoreline field (tiles.rs water_field) and water level grid (water_levels), stored after
+// each tile's vertices: cell size, LG x LG levels, FIELD x FIELD bytes
 const uint GRID = 33u;                          // tiles.rs GRID
 const uint NVERT = GRID * GRID + 4u * GRID;     // surface grid + skirts
 const uint FIELD = 64u;                         // tiles.rs FIELD
+const uint LG = 9u;                             // tiles.rs LEVEL_GRID
+const uint LEVELS_AT = NVERT * 12u + 1u;
+const uint FIELD_AT = LEVELS_AT + LG * LG;
 
 // Tile coordinates (0..1) of vertex v: the surface grid, or for a skirt vertex its edge vertex
 // (tiles.rs index_buffer / build_tile order).
@@ -92,7 +96,7 @@ vec2 vertUV(uint v) {
 float fieldAt(Verts V, ivec2 c) {
     c = clamp(c, ivec2(0), ivec2(int(FIELD) - 1));
     uint idx = uint(c.y) * FIELD + uint(c.x);
-    uint word = floatBitsToUint(V.v[NVERT * 12u + 1u + idx / 4u]);
+    uint word = floatBitsToUint(V.v[FIELD_AT + idx / 4u]);
     return float((word >> (8u * (idx % 4u))) & 255u);
 }
 
@@ -108,14 +112,54 @@ float shoreDist(Verts V, vec2 uv) {
     return (mix(a, b, t.y) - 128.0) / 8.0 * cellM;
 }
 
+// The water surface height (m) at tile coordinates uv: bilinear between the level grid nodes.
+// < -1e6: no water near; > 1e6: unknown (ETOPO heights), the field alone decides.
+float waterLevel(Verts V, vec2 uv) {
+    vec2 f = clamp(uv, 0.0, 1.0) * float(LG - 1u);
+    ivec2 c0 = min(ivec2(floor(f)), ivec2(int(LG) - 2));
+    vec2 t = f - vec2(c0);
+    uint i = uint(c0.y) * LG + uint(c0.x);
+    float a = V.v[LEVELS_AT + i], b = V.v[LEVELS_AT + i + 1u];
+    float c = V.v[LEVELS_AT + i + LG], d = V.v[LEVELS_AT + i + LG + 1u];
+    float lo = min(min(a, b), min(c, d)), hi = max(max(a, b), max(c, d));
+    if (hi > 1e6) return 2e7;
+    if (lo < -1e6) return hi < -1e6 ? -2e7 : hi; // at the edge of the water: the known level
+    return mix(mix(a, b, t.x), mix(c, d, t.x), t.y);
+}
+
+// A smooth step whose edge is broken by Earth-fixed noise: land cover boundaries become organic
+// lines (field and forest edges, clumps) instead of the vertex grid's diamonds.
+float organic(float a, float n, float sharp) {
+    float e = a + (n - 0.5) * 0.7;
+    return mix(a, smoothstep(0.5 - sharp, 0.5 + sharp, e), 0.75);
+}
+
 // Ground albedo, ambient occlusion and normal from the land cover fractions.
 // `bed` (0..1): the bottom of a lake, river or the sea; `shore`: the strip of land at the water.
 // `biome`: RESOLVE biome number (biomes.rs); `sea`: the water at the shore / over the bed is sea.
 vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, int biome, bool sea, out float ao) {
+    float ptint = 1.0, pw = 0.0; // crop parcels: brightness of this parcel, its weight
     float slope = 1.0 - max(dot(n, up), 0.0);
-    float tree = A.x, shrub = A.y, grass = A.z, crop = A.w, built = B.x, bare = B.y, snow = B.z, wet = C.x, moss = C.y;
     vec2 q = uvm;
     float nA = fbmN(q * 0.05, 3), nB = fbmN(q * 0.008 + 11.0, 3);
+    // organic class edges: each class's fraction gets its own Earth-fixed noise (clumps of ~20 m
+    // on outlines of ~150 m), sharpened, then renormalised
+    float sharp = clamp(footprint * 0.02, 0.12, 0.5);
+    float tree = A.x, shrub = A.y, grass = A.z, crop = A.w, built = B.x, bare = B.y, snow = B.z, wet = C.x, moss = C.y;
+    {
+        float total = tree + shrub + grass + crop + bare + wet + moss;
+        float nT = fbmN(q * 0.0065 + 3.1, 3) * 0.6 + fbmN(q * 0.045 + 8.3, 2) * 0.4;
+        float nS = fbmN(q * 0.008 + 17.0, 3) * 0.6 + fbmN(q * 0.06 + 2.0, 2) * 0.4;
+        float nG = fbmN(q * 0.007 + 23.0, 3) * 0.6 + fbmN(q * 0.05 + 6.0, 2) * 0.4;
+        float nW = fbmN(q * 0.01 + 31.0, 3) * 0.6 + fbmN(q * 0.08 + 4.0, 2) * 0.4;
+        tree = organic(tree, nT, sharp);
+        shrub = organic(shrub, nS, sharp);
+        grass = organic(grass, nG, sharp);
+        bare = organic(bare, 1.0 - nG, sharp);
+        wet = organic(wet, nW, sharp);
+        float k = total / max(tree + shrub + grass + crop + bare + wet + moss, 1e-3);
+        tree *= k; shrub *= k; grass *= k; bare *= k; wet *= k;
+    }
     // cliffs: rock wherever it is too steep for soil, whatever the land cover says
     float cliff = smoothstep(0.38, 0.55, slope + (nA - 0.5) * 0.15);
     float rockBare = bare * smoothstep(0.1, 0.3, slope + (nA - 0.5) * 0.2);
@@ -132,18 +176,53 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // flat bare ground in the mountains is scree: rock debris and grey gravel
     w[4] += (bare - rockBare) * 0.5 * nB;
     w[5] += (bare - rockBare) * 0.5 * (1.0 - nB);
-    w[7] = (bare - rockBare) * 0.5 + built * 0.8;                                 // gravel
+    // built-up land: a mosaic of paved (dark), gravel and gardens rather than one grey
+    float nb = fbmN(q * 0.035 + 61.0, 3);
+    w[7] = (bare - rockBare) * 0.5;                                               // gravel
+    w[5] += built * 0.35 * smoothstep(0.45, 0.7, nb);
+    w[2] += built * 0.35 * smoothstep(0.5, 0.3, nb);
     w[8] = moss;                                                                  // lichen rock
     w[9] = 0.0;
     w[10] = 0.0;
     w[11] = wet * 0.8;                                                            // wet grass
+    // meadows are not one grass: patches of mossy, green and dry grass on their own noise fields
+    {
+        float m1 = fbmN(q * 0.03 + 41.0, 3), m2 = fbmN(q * 0.012 + 47.0, 3), m3 = fbmN(q * 0.022 + 53.0, 3);
+        w[1] *= 0.35 + 1.3 * smoothstep(0.3, 0.7, m1);
+        w[2] *= 0.45 + 1.1 * smoothstep(0.25, 0.75, m2);
+        w[3] *= 0.25 + 1.5 * smoothstep(0.4, 0.75, m3) * (1.0 - wet);
+    }
     for (int l = 0; l < 12; ++l) if (l != 4 && l != 5 && l != 6) w[l] *= 1.0 - cliff;
     // ---- the biome's own surfaces (biomes.rs numbers; layers 12-25, catalog.rs GROUND_LAYERS)
     float soil = 1.0 - cliff;
-    // cropland: ploughed fields between the crops
-    w[22] = crop * 0.35 * soil;
-    w[2] = max(w[2] - crop * 0.2, 0.0);
-    w[3] = max(w[3] - crop * 0.15, 0.0);
+    // cropland: parcels on a rotated, jittered grid (one orientation and size per ~2 km region),
+    // each ploughed, green, ripe or stubble, with grass margins along the edges
+    if (crop > 0.01) {
+        vec2 rg = floor(q / 1900.0);
+        uint hr = hash2(uvec2(ivec2(rg) + 40000));
+        float ang = float(hr & 0xFFFFu) * (6.2831853 / 65536.0);
+        vec2 size = vec2(110.0 + float((hr >> 16) & 0xFFu) * 0.6, 40.0 + float(hr >> 24) * 0.2);
+        vec2 r = mat2(cos(ang), sin(ang), -sin(ang), cos(ang)) * q;
+        // gently bent furrow lines: the parcel edges follow the land a little
+        r += vec2(fbmN(q * 0.004 + 5.0, 2) - 0.5, fbmN(q * 0.004 + 9.0, 2) - 0.5) * 40.0;
+        float row = floor(r.y / size.y);
+        r.x += float(hash2(uvec2(int(row) + 70000, hr)) & 0xFFFFu) / 65536.0 * size.x;
+        vec2 cellId = vec2(floor(r.x / size.x), row);
+        vec2 f = fract(r / size) * size;
+        float edge = min(min(f.x, size.x - f.x), min(f.y, size.y - f.y));
+        float margin = smoothstep(2.5, 0.8, edge + (nA - 0.5) * 1.5);
+        uint hc = hash2(uvec2(ivec2(cellId) + 50000) ^ uvec2(hr));
+        float st = float(hc & 0xFFu) / 255.0;
+        int layer = st < 0.25 ? 22 : st < 0.62 ? 2 : st < 0.82 ? (biome == 8 || biome == 13 ? 25 : 3) : 24;
+        float cw = crop * soil;
+        w[2] = max(w[2] - crop * 0.45, 0.0);
+        w[3] = max(w[3] - crop * 0.55, 0.0);
+        w[layer] += cw * (1.0 - margin);
+        ptint = 0.78 + 0.36 * float((hc >> 8) & 0xFFu) / 255.0;
+        pw = cw * (1.0 - margin);
+        w[1] += cw * margin * 0.6;
+        w[2] += cw * margin * 0.4;
+    }
     // forest floor: moss under boreal and mountain conifers, red soil in the tropics
     float conifer = biome == 6 ? 0.7 : biome == 5 ? 0.4 : 0.0;
     w[18] = w[0] * conifer;
@@ -154,14 +233,16 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     float savanna = biome == 7 ? 0.7 : biome == 12 ? 0.5 : biome == 13 ? 0.6 : 0.0;
     float steppe = biome == 8 ? 0.45 : biome == 13 ? 0.3 : 0.0;
     float g = w[1] + w[2] + w[3];
-    w[25] = g * savanna;
-    w[24] = g * steppe;
+    w[25] += g * savanna;
+    w[24] += g * steppe;
     w[15] += biome == 7 ? g * 0.15 : 0.0;
     float keep = max(1.0 - savanna - steppe - (biome == 7 ? 0.15 : 0.0), 0.0);
     w[1] *= keep; w[2] *= keep; w[3] *= keep;
     // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
     // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
     float bareFlat = w[7];
+    // bare ground at sea level is a beach: sand, whatever the biome
+    if (sea && bed == 0.0) { w[12] += bareFlat * 0.85; w[7] = bareFlat * 0.15; bareFlat = 0.0; }
     float desert = biome == 13 ? 1.0 : 0.0;
     float hot = (biome == 1 || biome == 2 || biome == 7) ? 1.0 : 0.0;
     float med = biome == 12 ? 1.0 : 0.0;
@@ -173,6 +254,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[17] = bareFlat * arctic * 0.35 + moss * (0.4 + 0.3 * arctic);
     w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
     w[8] *= 1.0 - 0.6 * arctic;
+    w[7] += built * 0.45 * soil; // built-up land keeps its gravel in every biome
     // wetlands and mangroves: mud
     float marsh = (biome == 9 || biome == 14) ? 0.6 : 0.25;
     w[20] = w[11] * marsh;
@@ -199,6 +281,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
         else if (v > W[1]) { W[2] = W[1]; L[2] = L[1]; W[1] = v; L[1] = l; }
         else if (v > W[2]) { W[2] = v; L[2] = l; }
     }
+    if (W[0] <= 0.0) { W[0] = 1.0; L[0] = 2; } // nothing left: grass, never black
     float sum = max(W[0], 0.0) + max(W[1], 0.0) + max(W[2], 0.0);
     vec3 alb = vec3(0.0);
     vec2 nxy = vec2(0.0);
@@ -237,6 +320,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     }
     // large-scale variation so meadows and forests are not one flat colour from a distance
     alb *= mix(0.8, 1.15, nB) * mix(0.9, 1.1, nA);
+    alb *= mix(1.0, ptint, clamp(pw, 0.0, 1.0));
     ao = mix(1.0, ao, 0.8);
     // east in Earth axes, into the camera frame the instance is placed in
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
@@ -288,7 +372,12 @@ void main() {
         uvm += vec2(V.v[b + 10u], V.v[b + 11u]) * w[c];
     }
     vec2 tuv = vertUV(tri.x) * w.x + vertUV(tri.y) * w.y + vertUV(tri.z) * w.z;
+    float cellM = V.v[NVERT * 12u];
     float sd = shoreDist(V, tuv);
+    // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
+    sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));
+    float level = waterLevel(V, tuv);
+    bool hasLevel = abs(level) < 1e6;
     // tile-local (Earth axes) -> world (the camera frame: the instance rotates)
     n = normalize(mat3(gl_ObjectToWorldEXT) * n);
     float t = gl_HitTEXT;
@@ -301,8 +390,17 @@ void main() {
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
     float lat = degrees(asin(clamp(upE.z, -1.0, 1.0)));
     bool cover = C.z > 0.5;
-    bool water = sd < 0.0;
-    bool lake = water && elev > 0.5; // a water surface above sea level
+    // Water: a flat surface at the level wherever the ground lies below it on the mapped water, and
+    // a little beyond (the maps disagree by a pixel); where the mapped water climbs a bank the bank
+    // stays land. Shores follow the terrain's contours, lakes are flat.
+    float tol = 0.4 + cellM * 0.05;
+    // the mesh is linear between vertices, so its contours are straight: bend them with
+    // Earth-fixed noise (on the fine tiles, where a vertex spacing is visible)
+    float wig = ((fbmN(uvm * 0.22 + 17.0, 3) - 0.5) * 0.7 + (fbmN(uvm * 0.045 + 3.0, 2) - 0.5) * 0.9) * min(1.0, 6.0 / max(cellM, 1.0));
+    float above = hasLevel ? elev + wig - level : 1e3; // height of the ground over the water level
+    bool water = hasLevel ? (sd < 0.0 && above < tol) || (above < -0.05 && sd < min(12.0, 3.0 * cellM))
+                          : sd < 0.0;
+    bool lake = water && (hasLevel ? level > 0.5 : elev > 0.5); // a water surface above sea level
     // Where the tile mesh is coarser than the data (far away), coastline and relief come from the
     // elevation grid per pixel instead (geometry cells ~ t / 160 m, see tiles.rs SPLIT_K).
     float footprint = t * gg.misc.x;
@@ -334,12 +432,13 @@ void main() {
     if (water) {
         float d = -sd;
         float floorE = max(-elevAt(elevUV(upE), 0.0), 0.0);
-        depth = lake ? min(d * 0.45, 18.0) : max(min(d * 0.3, 12.0), floorE * smoothstep(20.0, 36.0, d));
-        depth = max(depth, 0.02);
+        depth = lake ? min(max(d, 0.0) * 0.45, 18.0) : max(min(max(d, 0.0) * 0.3, 12.0), floorE * smoothstep(20.0, 36.0, d));
+        depth = max(max(depth, -above), 0.02);
     }
     // the strip along the water: pebbles, and wet (darker) right at the waterline
     float band = max(2.5, footprint * 1.5);
-    float shore = water ? 0.0 : smoothstep(band, 0.0, sd);
+    // (inside the mapped water but above the level: by the height over the water)
+    float shore = water ? 0.0 : sd >= 0.0 || !hasLevel ? smoothstep(band, 0.0, sd) : smoothstep(1.2, 0.0, above - tol);
     int biome = int(biomeF + 0.5);
     bool seaSide = elev < 4.0; // the water at this shore / over this bed is the sea
     if (water) {
@@ -347,7 +446,9 @@ void main() {
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
     } else if (cover) {
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
-        alb *= mix(1.0, 0.55, smoothstep(1.2, 0.0, sd)); // wet
+        // wet: right at the mapped water, and just above the water level along the contour
+        float damp = max(smoothstep(1.2, 0.0, sd), smoothstep(0.6, 0.0, above - tol) * step(sd, max(25.0, 2.0 * cellM)));
+        alb *= mix(1.0, 0.55, damp);
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
     }
@@ -370,6 +471,7 @@ void main() {
     if (dbg == 2u) alb = vec3(fract(elev / 500.0), clamp(elev / 5000.0, 0.0, 1.0), float(water));
     if (dbg == 3u) alb = A.x * vec3(0.0, 0.4, 0.0) + A.z * vec3(0.5, 1.0, 0.2) + A.w * vec3(1.0, 0.9, 0.3) + B.x * vec3(1.0, 0.0, 0.0)
                          + B.y * vec3(0.6) + B.z * vec3(1.0) + B.w * vec3(0.0, 0.3, 1.0) + A.y * vec3(0.6, 0.5, 0.0) + C.x * vec3(0.0, 0.8, 0.8);
+    if (dbg == 3u && water) alb = sd < 0.0 ? (hasLevel ? vec3(1.0, 0.0, 1.0) : vec3(0.5, 0.0, 1.0)) : vec3(0.0, 0.0, 0.0);
     pl.albedo = alb;
     pl.t = t;
     pl.n = n;
@@ -380,4 +482,28 @@ void main() {
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
     pl.wdepth = depth;
+    if (water) {
+        // Earth-fixed water coordinates for main.rgen's ripples and foam: the texture coordinates
+        // (m), the shore distance, the direction of the first coordinate, the surface height
+        vec3 P[3];
+        vec2 U[3];
+        for (int c = 0; c < 3; ++c) {
+            uint b = tri[c] * 12u;
+            P[c] = vec3(V.v[b], V.v[b + 1u], V.v[b + 2u]);
+            U[c] = vec2(V.v[b + 10u], V.v[b + 11u]);
+        }
+        vec3 e1 = P[1] - P[0], e2 = P[2] - P[0];
+        vec2 d1 = U[1] - U[0], d2 = U[2] - U[0];
+        vec3 Tu = mat3(gl_ObjectToWorldEXT) * (e1 * d2.y - e2 * d1.y);
+        Tu -= up * dot(Tu, up);
+        float tl = length(Tu);
+        pl.wtan = tl > 1e-12 ? Tu / tl : normalize(cross(up, vec3(0.0, 0.0, 1.0)) + vec3(1e-4, 0.0, 0.0));
+        float det = d1.x * d2.y - d2.x * d1.y;
+        if (det < 0.0) pl.wtan = -pl.wtan;
+        // the second coordinate runs along +-cross(up, wtan): length 2 marks the minus
+        vec3 Tv = mat3(gl_ObjectToWorldEXT) * (e2 * d1.x - e1 * d2.x) * sign(det);
+        if (dot(cross(up, pl.wtan), Tv) < 0.0) pl.wtan *= 2.0;
+        pl.trans = vec3(uvm, sd);
+        pl.wlevel = max(-above, 0.0);
+    }
 }
