@@ -64,6 +64,9 @@ pub struct Globals {
     /// height m, w chop; then wind direction (patch coordinates), whitecap coverage, ocean on;
     /// then the slope variance of each cascade.
     pub ocean: [[f32; 4]; 3],
+    /// Forest scene: the biome's ground map (biome.rs Preset::ground_packed), one scan index per
+    /// ground slot, 4 per word.
+    pub biome: [u32; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -1279,7 +1282,7 @@ impl Renderer {
                     c.x_axis.y, c.y_axis.y, c.z_axis.y, o.y, //
                     c.x_axis.z, c.y_axis.z, c.z_axis.z, o.z,
                 ],
-                data: t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8),
+                data: t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21),
             });
             let asset = &pack.trees[t.variant as usize];
             let (lo, hi) = (asset.bmin - Vec3::splat(0.05), asset.bmax + Vec3::splat(0.05));
@@ -1745,7 +1748,14 @@ impl Renderer {
             self.atlases.len()
         );
         if self.globe.is_none() {
-            for v in 0..self.atlases.len() {
+            // the forest scene: full atlases for the variants that grow in it (every one is in view)
+            let mut used = vec![false; self.atlases.len()];
+            for t in &self.world.trees {
+                if let Some(u) = used.get_mut(t.variant as usize) {
+                    *u = true;
+                }
+            }
+            for v in (0..self.atlases.len()).filter(|&v| used[v]) {
                 let a = &self.atlases[v];
                 let stream = crate::atlas::read_regions(&a.path, &crate::atlas::layout(a.grid, a.res, a.mips))?;
                 self.install_full(v, &stream)?;
@@ -2027,7 +2037,8 @@ impl Renderer {
                 let center = t.center.to_array();
                 let rec = self.rec_of[i];
                 let tree = (rec & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
-                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 }; // tri.rahit: dissolve
+                // tri.rahit: dissolve; bits 1..4 the biome's dryness tint (tri.rchit)
+                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1);
                 for p in &variant.parts {
                     let alpha = self.catalog.mesh_alpha[p.mesh as usize];
                     let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };

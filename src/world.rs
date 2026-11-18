@@ -33,6 +33,8 @@ pub struct TreeInstance {
     pub variant: u8,
     pub seed: u16, // 13 bits, never 0 (0 = untinted, used by the baker)
     pub color: u8, // impostor instance-mask colour
+    /// dryness tint 0..15 (rt.glsl plantDry; biome.rs Preset::dry_tint)
+    pub dry: u8,
 }
 
 pub struct World {
@@ -351,13 +353,15 @@ impl World {
         let h = self.height_at(x, z);
         let ring = 0.25 * (self.height_at(x + e, z) + self.height_at(x - e, z) + self.height_at(x, z + e) + self.height_at(x, z - e));
         let convex = ((h - ring) / (0.06 * e)).clamp(-1.0, 1.0);
-        smoothstep(-0.25, 0.55, 0.6 * (0.5 - wet) + 0.4 * convex + 0.12 * fbm(x / 140.0, z / 140.0, 3, 83))
+        let bias = if site().is_some() { 0.0 } else { crate::biome::current().dry_bias };
+        smoothstep(-0.25, 0.55, 0.6 * (0.5 - wet) + 0.4 * convex + 0.12 * fbm(x / 140.0, z / 140.0, 3, 83) + bias)
     }
 
     /// Soil moisture in [0, 1]: valleys and wet patches, river banks; uplands are drier.
     pub fn wetness(&self, x: f32, z: f32) -> f32 {
         let (_, bank) = self.river_at(x, z);
-        (0.15 + 0.6 * twi(x, z) + 0.4 * fbm(x / 380.0, z / 380.0, 4, 31) - 0.25 * mountain_n(x, z) + 0.8 * bank).clamp(0.0, 1.0)
+        let k = if site().is_some() { 1.0 } else { crate::biome::current().wet_scale };
+        ((0.15 + 0.6 * twi(x, z) + 0.4 * fbm(x / 380.0, z / 380.0, 4, 31) - 0.25 * mountain_n(x, z)) * k + 0.8 * bank).clamp(0.0, 1.0)
     }
 
     /// Where forest can establish (0 = open country, 1 = forest site). Follows the land like a real
@@ -384,9 +388,20 @@ impl World {
         // meadows on flat, wet valley floors (farmed / grazed), woods on the slopes
         let floodplain = twi(x, z) * (1.0 - smoothstep(0.03, 0.15, slope));
         // a strip of alder / poplar lines the rivers (not on the gravel bars)
-        let riparian = smoothstep(0.25, 0.6, bank);
-        let v = 0.85 * large - 0.45 * floodplain + 1.6 * slope.min(0.35) + 0.22 * ragged + 0.2 + 0.7 * riparian;
-        let treeline = 1.0 - smoothstep(1250.0, 1450.0, alt);
+        // the biome: how much of the land is forest, how much of the river banks (biome.rs)
+        let bp = crate::biome::current();
+        // (the biome's riparian strip: a broad belt, or a ribbon right at the water)
+        let riparian = smoothstep(bp.riparian_from, (bp.riparian_from + 0.35).min(0.97), bank);
+        let land = 0.85 * large - 0.45 * floodplain + 1.6 * slope.min(0.35) + 0.22 * ragged + 0.2;
+        let v_land = if bp.forest >= 1.0 {
+            land + 0.3 * (bp.forest - 1.0)
+        } else if bp.forest > 0.0 {
+            land - 0.62 * (1.0 - bp.forest)
+        } else {
+            -0.45 // no forest on the dry land (desert: only the ribbon right at the water passes)
+        };
+        let v = v_land + 0.7 * riparian * bp.riparian;
+        let treeline = 1.0 - smoothstep(1250.0 + bp.alt_shift, 1450.0 + bp.alt_shift, alt);
         let river = (1.0 - water) * (1.0 - smoothstep(0.8, 0.95, bank));
         clearing * treeline * river * smoothstep(-0.12, 0.28, v)
     }
@@ -519,7 +534,7 @@ impl BiomeGrid {
 
 /// Grow the canopy inside a disc of `radius`: founder pairs, then GENERATIONS of seed dispersal
 /// with site, crowding and shade filters. `avail[k]`: species k has variants.
-fn grow_forest(world: &World, radius: f32, avail: [bool; 6]) -> Vec<Seedling> {
+fn grow_forest(world: &World, radius: f32, avail: [bool; 6], spacing: f32) -> Vec<Seedling> {
     let bg = BiomeGrid::new(world, radius, if radius > 3000.0 { 16.0 } else { 8.0 });
     let cell = 10.0f32;
     let n = (2.0 * radius / cell).ceil() as usize + 1;
@@ -562,7 +577,7 @@ fn grow_forest(world: &World, radius: f32, avail: [bool; 6]) -> Vec<Seedling> {
                         continue;
                     }
                     let d2 = (o.x - t.x).powi(2) + (o.z - t.z).powi(2);
-                    let sp = h.space.max(HABITS[o.sp as usize].space) * 0.8;
+                    let sp = h.space.max(HABITS[o.sp as usize].space) * 0.8 * spacing;
                     if d2 < sp * sp {
                         return false;
                     }
@@ -771,7 +786,7 @@ impl World {
                 let pos = Vec3::new(x + tw * 0.5 - (t.bmin.x + t.bmax.x) * 0.5, 0.0, z - depth * 0.5 - (t.bmin.z + t.bmax.z) * 0.5);
                 let xform = Affine3A::from_translation(pos);
                 let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
-                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, color: (v % 7) as u8 });
+                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, color: (v % 7) as u8, dry: 0 });
                 x += tw;
             }
             z -= depth + 2.0;
@@ -786,28 +801,20 @@ impl World {
         println!("Terrain: {}x{} graded grid to +-{:.0} km, {:.1}M triangles ({:.2}s)", world.xs.len(), world.xs.len(), TERRAIN_HALF / 1000.0, world.terrain.tri_count() as f64 / 1e6, t0.elapsed().as_secs_f32());
         world.forest_radius = radius;
 
-        let beech = cat.variants_of("Beech");
-        let alder = cat.variants_of("Alder");
-        let poplar = cat.variants_of("Poplar");
-        let aspen = cat.variants_of("Aspen");
-        let hazel = cat.variants_of("Hazel");
-        let heather = cat.variants_of("Heather");
-        let huck = cat.variants_of("Huckleberry");
-        let fern = cat.variants_of("Fern");
-        let g_clumps = cat.variants_of("Grass_Clumps");
-        let g_wild = cat.variants_of("Wild_Grass");
-        let g_tall = cat.variants_of("Tall_Grass");
-        let g_tufted = cat.variants_of("Tufted_Grass");
-        let g_dry = cat.variants_of("Dry_Grass");
-        let g_cotton = cat.variants_of("Cotton_Grass");
-        let known: Vec<usize> =
-            [&beech, &alder, &poplar, &aspen, &hazel, &heather, &huck, &fern, &g_clumps, &g_wild, &g_tall, &g_tufted, &g_dry, &g_cotton]
-                .iter()
-                .flat_map(|v| v.iter().copied())
-                .collect();
-        // The catalog also holds the globe's species for other biomes (globe/forest.rs picks them by
-        // biome); this Alpine scene grows only its own. A single-species run (--species) is the
-        // exception: whatever was asked for grows.
+        // what grows: the biome preset (biome.rs; the temperate default is the original forest)
+        let bp = crate::biome::current();
+        println!("Biome: {} (--biome {})", bp.title, bp.name);
+        let names = |list: &[&str]| -> Vec<usize> {
+            let mut v: Vec<usize> = list.iter().flat_map(|n| cat.variants_of(n)).collect();
+            v.sort();
+            v.dedup();
+            v
+        };
+        let mut known: Vec<usize> = bp.roles.iter().flat_map(|r| names(r)).collect();
+        known.extend(bp.shrubs.iter().chain(bp.plants).flat_map(|e| names(&[e.0])));
+        known.extend(bp.grass.iter().flat_map(|e| names(&[e.0])));
+        // The catalog holds every biome's species; this scene grows the preset's own. A
+        // single-species run (--species) is the exception: whatever was asked for grows.
         let single = std::env::args().any(|a| a == "--species");
         let other = |want: &dyn Fn(Kind) -> bool| -> Vec<usize> {
             if !single {
@@ -818,17 +825,32 @@ impl World {
         let other_trees = other(&|k| k == Kind::Tree);
         let other_small = other(&|k| matches!(k, Kind::Shrub | Kind::Plant));
         let other_grass = other(&|k| k == Kind::Grass);
+        let mut shrubs: Vec<(Vec<usize>, f32, crate::biome::Habitat)> = bp.shrubs.iter().map(|e| (names(&[e.0]), e.1, e.2)).filter(|e| !e.0.is_empty()).collect();
+        let plants: Vec<(Vec<usize>, f32, crate::biome::Habitat)> = bp.plants.iter().map(|e| (names(&[e.0]), e.1, e.2)).filter(|e| !e.0.is_empty()).collect();
+        let mut grasses: Vec<(Vec<usize>, f32, crate::biome::Grass)> = bp.grass.iter().map(|e| (names(&[e.0]), e.1, e.2)).filter(|e| !e.0.is_empty()).collect();
+        if !other_small.is_empty() {
+            shrubs.push((other_small, 0.2, crate::biome::Habitat::Edge));
+        }
+        if !other_grass.is_empty() {
+            grasses.push((other_grass, 0.5, crate::biome::Grass::Moist));
+        }
+        let boulders = cat.variants_of("Boulders");
+        let logs = cat.variants_of("Logs");
+        let snags = cat.variants_of("Snags");
 
         // ---- canopy: seed-dispersal growth
         let t1 = std::time::Instant::now();
-        let mut by_species: Vec<Vec<usize>> = vec![beech.clone(), alder.clone(), poplar.clone(), aspen.clone(), hazel.clone(), other_trees.clone()];
+        let mut by_species: Vec<Vec<usize>> = (0..6).map(|k| names(bp.roles[k])).collect();
+        by_species[5].extend(other_trees.iter().copied());
+        let _ = &other_trees;
+
         for vs in &mut by_species {
             vs.sort_by(|a, b| cat.variants[*b].height.partial_cmp(&cat.variants[*a].height).unwrap()); // tallest first
         }
         let avail = [0, 1, 2, 3, 4, 5].map(|k| !by_species[k].is_empty());
-        let grown = grow_forest(&world, radius, avail);
+        let grown = grow_forest(&world, radius, avail, bp.spacing);
         let mut rng = Rng(0x1234_5678_9abc_def0);
-        let mut counts = [0usize; 5];
+        let mut counts = [0usize; 5]; // trees, shrubs, plants, grass, rocks and deadwood
         let mut canopy: Vec<usize> = Vec::new(); // indices into world.trees of the simulated trees
         for s in &grown {
             let vs = &by_species[s.sp as usize];
@@ -838,7 +860,7 @@ impl World {
             let variant = vs[k];
             let y = world.height_at(s.x, s.z) - 0.15;
             let xform = Affine3A::from_scale_rotation_translation(
-                Vec3::splat(0.85 + 0.3 * rng.f()),
+                Vec3::splat((0.85 + 0.3 * rng.f()) * bp.tree_scale),
                 Quat::from_rotation_y(rng.f() * std::f32::consts::TAU),
                 Vec3::new(s.x, y, s.z),
             );
@@ -846,7 +868,7 @@ impl World {
             let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
             let seed = 1 + (rng.f() * 8190.0) as u16;
             canopy.push(world.trees.len());
-            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color: (rng.next() % 7) as u8 });
+            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color: (rng.next() % 7) as u8, dry: bp.dry_tint });
             counts[0] += 1;
         }
         world.cover = world.splat_cover(trees, cat);
@@ -855,7 +877,10 @@ impl World {
         // ---- understory and grass, driven by the simulated canopy cover
         let under_radius = radius.min(900.0);
         let grass_radius = radius.min(600.0);
-        let layers = [(1u32, 3.4, under_radius), (2, 2.1, under_radius), (3, 2.3, grass_radius)];
+        // layers: 1 shrubs, 2 forest plants, 3 grass, 4 boulders, 5 deadwood
+        let layers = [(1u32, 3.4, under_radius), (2, 2.1, under_radius), (3, 2.3, grass_radius), (4, 5.0, under_radius), (5, 7.0, under_radius)];
+        use crate::biome::{Grass, Habitat};
+        let weighted = |list: &[(f32, &[usize])], r1: f32, r2: f32| pick(list, r1, r2);
         for (layer, step, rad) in layers {
             let count = (rad * 2.0 / step) as i32;
             let hs = |gx: i32, gz: i32, k: u32| hash(gx, gz, k + layer * 100);
@@ -875,57 +900,110 @@ impl World {
                     b.dens = world.cover_at(x, z).min(world.forest_density(x, z).max(0.05) * 1.5).clamp(0.0, 1.0);
                     b.edge = smoothstep(0.05, 0.45, b.dens) * (1.0 - smoothstep(0.55, 0.95, b.dens));
                     let (r_place, r1, r2) = (hs(gx, gz, 3), hs(gx, gz, 4), hs(gx, gz, 5));
+                    let open = 1.0 - b.dens;
                     let choice = match layer {
                         1 => {
-                            let open = 1.0 - b.dens;
                             let clump = smoothstep(-0.15, 0.35, fbm(x / 28.0, z / 28.0, 3, 61));
-                            let w_heather = 1.6 * open * open * (1.0 - b.wet) * clump;
-                            let w_huck = 0.9 * b.edge + 0.25 * b.dens * clump;
-                            let w_other = if other_small.is_empty() { 0.0 } else { 0.2 };
-                            if r_place > (w_heather + w_huck + w_other).min(0.85) {
+                            let w: Vec<f32> = shrubs
+                                .iter()
+                                .map(|(_, wt, h)| {
+                                    wt * match h {
+                                        Habitat::Open => open * open * (1.0 - b.wet) * clump,
+                                        Habitat::Edge => b.edge + 0.28 * b.dens * clump,
+                                        Habitat::Under => b.dens * clump,
+                                    }
+                                })
+                                .collect();
+                            let total: f32 = w.iter().sum();
+                            if r_place > (total * bp.shrub_cover).min(0.85) {
                                 continue;
                             }
-                            pick(&[(w_heather, &heather), (w_huck, &huck), (w_other, &other_small)], r1, r2)
+                            let list: Vec<(f32, &[usize])> = shrubs.iter().zip(&w).map(|(s, w)| (*w, s.0.as_slice())).collect();
+                            weighted(&list, r1, r2)
                         }
                         3 => {
-                            let open = 1.0 - b.dens;
                             let dry = world.dryness(x, z, b.wet, 12.0);
                             let patchy = smoothstep(-0.3, 0.25, fbm(x / 18.0, z / 18.0, 3, 97));
                             let w = (open * 1.15 + 0.35 * b.edge) * (0.85 + 0.15 * patchy) * smoothstep(0.0, 0.25, open + 0.5 * b.edge);
-                            if r_place > w.min(0.97) {
+                            // sparse grass breaks up into tufts and bare ground
+                            let sparse = if bp.grass_cover < 0.6 { smoothstep(0.35, 0.65, fbm(x / 14.0, z / 14.0, 3, 131)) } else { 1.0 };
+                            if r_place > (w * bp.grass_cover * sparse).min(0.97) {
                                 continue;
                             }
                             let tallz = smoothstep(0.1, 0.5, fbm(x / 45.0, z / 45.0, 3, 101));
-                            pick(
-                                &[
-                                    (1.6 * (1.0 - dry) * (1.0 - 0.6 * b.wet), &g_wild),
-                                    (1.6 * (1.0 - dry), &g_clumps),
-                                    (1.4 * dry * (1.0 - b.wet), &g_dry),
-                                    (2.0 * b.wet * b.wet, &g_cotton),
-                                    (0.9 * tallz + 0.8 * b.edge, &g_tall),
-                                    (0.6 * tallz * (1.0 - dry) + 0.3 * b.edge, &g_tufted),
-                                    (0.5, &other_grass),
-                                ],
-                                r1,
-                                r2,
-                            )
+                            let list: Vec<(f32, &[usize])> = grasses
+                                .iter()
+                                .map(|(vs, wt, g)| {
+                                    let k = match g {
+                                        Grass::Moist => 1.6 * (1.0 - dry) * (1.0 - 0.3 * b.wet),
+                                        Grass::Dry => 1.4 * dry * (1.0 - b.wet),
+                                        Grass::Wet => 2.0 * b.wet * b.wet,
+                                        Grass::Tall => 0.9 * tallz + 0.8 * b.edge,
+                                    };
+                                    (wt * k, vs.as_slice())
+                                })
+                                .collect();
+                            weighted(&list, r1, r2)
+                        }
+                        4 => {
+                            // Boulders lie in fields (moraine, scree, rocky knolls) and under steep
+                            // ground, not strewn evenly
+                            if boulders.is_empty() || bp.rocks <= 0.0 {
+                                continue;
+                            }
+                            let e = 4.0;
+                            let h0 = world.height_at(x, z);
+                            let slope = ((world.height_at(x + e, z) - h0).powi(2) + (world.height_at(x, z + e) - h0).powi(2)).sqrt() / e;
+                            let field = smoothstep(0.12, 0.32, fbm(x / 220.0, z / 220.0, 3, 141) * 0.65 + fbm(x / 45.0, z / 45.0, 3, 143) * 0.35);
+                            let p = bp.rocks * (field + 0.7 * smoothstep(0.25, 0.6, slope)).min(1.0) * 0.55;
+                            if r_place > p {
+                                continue;
+                            }
+                            weighted(&[(1.0, &boulders)], r1, r2)
+                        }
+                        5 => {
+                            // deadwood on the forest floor: fallen logs, a few standing snags
+                            let p = bp.deadwood * 0.1 * (b.dens + 0.3 * b.edge);
+                            if r_place > p {
+                                continue;
+                            }
+                            weighted(&[(0.7, &logs), (0.3, &snags)], r1, r2)
                         }
                         _ => {
                             let clump = smoothstep(-0.25, 0.3, fbm(x / 22.0, z / 22.0, 3, 71));
-                            let w = b.dens.powf(1.3) * (0.35 + 0.65 * b.wet) * clump + 0.06 * b.edge;
-                            if r_place > (1.4 * w).min(0.85) {
+                            let w: Vec<f32> = plants
+                                .iter()
+                                .map(|(_, wt, h)| {
+                                    wt * match h {
+                                        Habitat::Under => b.dens.powf(1.3) * (0.35 + 0.65 * b.wet) * clump + 0.06 * b.edge,
+                                        Habitat::Edge => 0.8 * b.edge * clump,
+                                        Habitat::Open => 0.5 * open * (1.0 - 0.5 * b.wet) * clump,
+                                    }
+                                })
+                                .collect();
+                            let total: f32 = w.iter().sum();
+                            if r_place > (1.4 * total * bp.plant_cover).min(0.85) {
                                 continue;
                             }
-                            pick(&[(1.0, &fern)], r1, r2)
+                            let list: Vec<(f32, &[usize])> = plants.iter().zip(&w).map(|(s, w)| (*w, s.0.as_slice())).collect();
+                            weighted(&list, r1, r2)
                         }
                     };
                     let Some(variant) = choice else { continue };
                     let yaw = hs(gx, gz, 6) * std::f32::consts::TAU;
                     let scale = 0.7 + 0.6 * hs(gx, gz, 7);
-                    let y = world.height_at(x, z) - 0.03;
+                    let t = &trees[variant];
+                    // boulders and logs sink into the ground a little (their lowest point is the base)
+                    let sink = match layer {
+                        4 => 0.08 + 0.2 * (t.bmax.y - t.bmin.y) * scale,
+                        5 => 0.03 + 0.1 * (t.bmax.y - t.bmin.y) * scale,
+                        _ => 0.03,
+                    };
+                    let y = world.height_at(x, z) - sink;
                     let mut rot = Quat::from_rotation_y(yaw);
-                    if layer == 3 {
-                        // Grass patches are flat discs a few metres across: follow the slope.
+                    let snag = layer == 5 && snags.contains(&variant);
+                    if layer >= 3 && !snag {
+                        // Grass patches, boulders and logs lie on the slope.
                         let e = 1.0;
                         let nrm = Vec3::new(
                             world.height_at(x - e, z) - world.height_at(x + e, z),
@@ -936,23 +1014,25 @@ impl World {
                         rot = Quat::from_rotation_arc(Vec3::Y, nrm) * rot;
                     }
                     let xform = Affine3A::from_scale_rotation_translation(Vec3::splat(scale), rot, Vec3::new(x, y, z));
-                    let t = &trees[variant];
                     let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
                     let seed = 1 + (hs(gx, gz, 8) * 8190.0) as u16;
                     let color = (gx + 3 * gz + 2 * layer as i32).rem_euclid(7) as u8;
-                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color });
-                    counts[layer as usize] += 1;
+                    // (the boulder scans are mossy: in dry biomes they take the dry tint too)
+                    let dry = bp.dry_tint;
+                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color, dry });
+                    counts[(layer as usize).min(4)] += 1;
                 }
             }
         }
 
         let _ = &canopy;
         println!(
-            "Placed {} trees, {} shrubs, {} ferns/plants, {} grass patches ({:.2}s)",
+            "Placed {} trees, {} shrubs, {} ferns/plants, {} grass patches, {} rocks and deadwood ({:.2}s)",
             counts[0],
             counts[1],
             counts[2],
             counts[3],
+            counts[4],
             t0.elapsed().as_secs_f32()
         );
         let mut per = vec![0usize; trees.len()];

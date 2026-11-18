@@ -26,6 +26,7 @@ struct Globals {
     vec4 ocean0;    // globe sea (ocean.rs): x wind m/s, y residual slope variance, z largest wave height m, w chop
     vec4 ocean1;    //   xy wind direction (patch coordinates), z whitecap coverage, w 1 once a frame is in
     vec4 ocean2;    //   slope variance of each cascade
+    uvec4 biome;    // forest scene: ground slot -> scanned surface, one byte per slot (biome.rs)
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).

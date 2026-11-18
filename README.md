@@ -326,6 +326,34 @@ wet grass:
 
 ![Ground: plain tiling vs hex-tile stochastic texturing](docs/images/ground_tiling.jpg)
 
+**Biomes (`--biome`).** The eroded terrain can carry any of eight biomes (`src/biome.rs`):
+`temperate` (the default), `boreal`, `rainforest`, `savanna`, `desert`, `tundra`, `mediterranean`
+and `alpine`. The terrain stays the erosion simulation's; a preset decides what grows on it and how
+the ground looks:
+
+- **Canopy:** the succession works with six ecological roles (shade-tolerant climax trees, trees
+  of wet ground, edge pioneers, clonal groves, an understory tree, others). A preset fills them with
+  its species: spruce over birch pioneers and aspen groves in the taiga, Aleppo pine and oak in the
+  Mediterranean, broad crowns, bamboo and palms in the rainforest. It also sets how much of the
+  land is forest, how wide the strips along the rivers are (a ribbon of willows and palms at the
+  water in the desert), how far apart the trees stand (open savanna) and how tall they grow (dwarf
+  birch and willow in the tundra).
+- **Understory:** shrubs, forest plants and grasses, each with the habitat it grows in (open
+  ground, forest edges, under the canopy; moist, dry or wet grass), plus boulder fields (clustered,
+  and under steep ground) and deadwood.
+- **Ground:** the 12 ground slots of `tri.rchit` (forest floor, moss, grass, dry grass, rock,
+  snow, scree, mud, pebbles, wet grass) map to any of the 26 scans: sand and arid soil in the
+  desert, red clay in the rainforest, tundra and lichen ground, boreal moss.
+- **Climate:** plants' dryness tint, how dry and wet the ground is, the treeline and snow line
+  (higher in the tropics and deserts, lower in the tundra), and a default sun, haze and exposure.
+
+| | |
+|---|---|
+| ![temperate](docs/images/biomes/temperate.jpg) `temperate` | ![boreal](docs/images/biomes/boreal.jpg) `boreal` |
+| ![rainforest](docs/images/biomes/rainforest.jpg) `rainforest` | ![savanna](docs/images/biomes/savanna.jpg) `savanna` |
+| ![desert](docs/images/biomes/desert.jpg) `desert` | ![tundra](docs/images/biomes/tundra.jpg) `tundra` |
+| ![mediterranean](docs/images/biomes/mediterranean.jpg) `mediterranean` | ![alpine](docs/images/biomes/alpine.jpg) `alpine` |
+
 ### 8. Materials
 
 ![Leaves front-lit and back-lit](docs/images/leaves.jpg)
@@ -664,6 +692,7 @@ cargo run --release
 | `--gallery` | every variant on flat ground, one row per species |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
+| `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |
 | `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
 | `--tour tours/showcase.txt [--tour-pace 40]` | globe: fly a scripted tour (`src/tour.rs`: shots of spline keys, local time, cloud cover, exposure; black while each shot streams in, then a fade in and out) and exit. Each frame steps 1/60 s; with a pace above 16.7 ms it plays slower than real time so a 60 fps recorder captures every frame (`tools/record_tour.ps1` + `tools/tour_post.py` turn that into a 60 fps video). `SI_TOUR_STILLS=1` saves stills per shot |
 | `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--time 2026-06-21T10:30] [--time-rate s]` | the 1:1 globe; `--views` takes the same five numbers per view; `--time` is UTC (default 10:30 local solar time on the June solstice), `--time-rate` simulated seconds per second (default real time, stopped when capturing); `--bench-move m` flies along the heading at constant height |
@@ -738,6 +767,7 @@ src/
   asset.rs     .mtree loader
   textures.rs  parallel PNG decode, per-species normalisation, GPU mip generation
   world.rs     terrain (eroded or a real site), forest succession, biome scatter, ground masks
+  biome.rs     --biome presets for the eroded terrain: species roles, understory, ground scans, climate
   erosion.rs   uplift + stream-power erosion, priority flood, drainage, river polylines
   globe/       the 1:1 Earth as a mode of the renderer: scene (streaming, pooled GPU storage,
                BLAS builds in the frame, instances), tiles (cube-sphere quadtree, tile meshes),

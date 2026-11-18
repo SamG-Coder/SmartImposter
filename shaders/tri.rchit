@@ -30,7 +30,11 @@ layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX];
 const float GROUND_TILE = 2.2; // metres per texture repeat
 // The scans' mean albedos differ ~10x (moss 0.02 .. dried grass 0.19); bring them to 0.05..0.1.
 // Mountain scans: neutral until calibrated.
-const float GROUND_GAIN[12] = float[12](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0);
+// The biome presets (biome.rs) map a slot to any of the 26 scans: their gains as in globe.rchit.
+const float GROUND_GAIN[26] = float[26](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0,
+                                        1.02, 1.99, 4.0, 2.27, 3.3, 0.85, 0.58, 4.09, 3.69, 2.65, 2.62, 3.97, 3.44, 4.02);
+// The scan a ground slot shows in this biome (Globals.biome, one byte per slot).
+int groundSrc(int l) { return int((g.biome[l >> 2] >> (8u * uint(l & 3))) & 0xFFu); }
 
 // Fractal value noise in [0, 1].
 float fbmN(vec2 p, int octaves) {
@@ -166,8 +170,10 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     for (int l = 0; l < GROUND_LAYERS; ++l) {
         alb[l] = vec3(0.0); nrm[l] = vec2(0.0); occ[l] = 1.0; h[l] = 0.0;
         if (w[l] < 0.02) continue;
-        // Missing river scans borrow a lowland scan: mud <- forest floor (darker), wet grass <- mossy grass.
-        int src = l;
+        // The biome's scan for this slot (its own one where that scan is not downloaded). Missing
+        // river scans borrow a lowland scan: mud <- forest floor (darker), wet grass <- mossy grass.
+        int src = groundSrc(l);
+        if (src >= 26 || (layerMask & (1u << uint(src))) == 0u) src = l;
         vec3 tint = vec3(1.0);
         if ((layerMask & (1u << uint(l))) == 0u && (l == 9 || l == 11) && (layerMask & 3u) == 3u) {
             src = l == 9 ? 0 : 1;
@@ -225,6 +231,8 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
         }
         occ[l] = occ[l] / max(hw3.x * float(hw3.x >= 0.01) + hw3.y * float(hw3.y >= 0.01) + hw3.z * float(hw3.z >= 0.01), 1e-4);
         alb[l] *= GROUND_GAIN[src];
+        // the arid soil scan is a saturated brick red: dusty red-brown earth instead (as globe.rchit)
+        if (src == 14) alb[l] = mix(alb[l], vec3(dot(alb[l], vec3(0.3, 0.59, 0.11))) * vec3(1.25, 0.95, 0.7), 0.55) * 0.85;
         h[l] = dot(alb[l], vec3(0.3, 0.5, 0.2)) * 3.0 + occ[l] * 0.5; // brighter / less occluded = higher
     }
     // Height-based blend: the taller layer wins near the transition (grass blades over litter).
