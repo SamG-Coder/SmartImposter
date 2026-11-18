@@ -274,6 +274,8 @@ void main() {
             col = transTerm; // leaf transmission only
         } else if (dbg == 9u) {
             col = specTerm * 16.0; // specular only (x16 for measurement)
+        } else if (dbg == 11u) {
+            col = alb * 4.0 * (0.5 + 0.5 * max(ndl, 0.0)); // ground layer codes (tri.rchit)
         } else if (dbg == 10u) {
             col = alb / PI * E * max(ndl, 0.0) * sh + alb * amb * ao; // diffuse only
         }

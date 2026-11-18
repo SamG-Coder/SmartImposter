@@ -93,7 +93,7 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     // Far mask: forest site density stands in for canopy cover, at partial strength (the tiles' trees
     // have gaps: mossy ground between them, leaf litter only under the densest stands).
     // Far away the dry-grass layer is toned down: at a distance it dominated as a brown wash.
-    vec4 mk = mix(vec4(mkF.r * 0.6, mkF.g, mkF.b * 0.55, 0.0), mkN, nearW);
+    vec4 mk = mix(vec4(mkF.r, mkF.g, mkF.b, 0.0), mkN, nearW);
     float cover = mk.r, wet = mk.g, dry = mk.b, under = mk.a;
     // Noise at three scales: ~3 m (ragged edges, small patches), ~16 m (patches), ~80 m (regions).
     float nA = fbmN(p.xz * 0.35, 3), nB = fbmN(p.xz * 0.06 + 17.0, 3), nC = fbmN(p.xz * 0.012 + 41.0, 3);
@@ -102,12 +102,16 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     // ---- mountains: true altitude (the terrain carries the Earth's curvature)
     float alt = p.y + dot(p.xz, p.xz) / (2.0 * 6371000.0);
     float nR = fbmN(p.xz * 0.004 + 7.0, 3);
-    // Rock on steep ground (steeper needed in the lowlands) and high up.
-    float rockSlope = mix(0.5, 0.32, smoothstep(400.0, 1100.0, alt));
-    float rockAll = clamp(smoothstep(rockSlope, rockSlope + 0.2, slope + (nR - 0.5) * 0.25) + 0.75 * smoothstep(1350.0, 1600.0, alt + (nR - 0.5) * 220.0), 0.0, 1.0);
-    float snow = smoothstep(1580.0, 1700.0, alt + (nR - 0.5) * 200.0) * (1.0 - smoothstep(0.5, 0.75, slope));
-    float scree = smoothstep(0.16, 0.3, slope) * (1.0 - smoothstep(0.4, 0.55, slope)) * smoothstep(800.0, 1200.0, alt + (nA - 0.5) * 80.0) * (1.0 - snow);
-    float lichenF = (1.0 - smoothstep(0.45, 0.7, slope)) * (1.0 - smoothstep(1400.0, 1650.0, alt));
+    // Altitude zones (world.rs treeline ~1250-1450 m): forest and meadows below, alpine meadow,
+    // scree and rock above, snow on the summits. Rock where it is too steep for soil to stay
+    // (~45 degrees in the lowlands, ~37 in the alpine zone), so outcrops follow the landform.
+    float alpine = smoothstep(1250.0, 1450.0, alt + (nR - 0.5) * 160.0);
+    float rockSlope = mix(0.3, 0.2, alpine);
+    float rockAll = clamp(smoothstep(rockSlope, rockSlope + 0.1, slope + (nR - 0.5) * 0.12 + (nB - 0.5) * 0.06) + 0.7 * smoothstep(1600.0, 1800.0, alt + (nR - 0.5) * 220.0), 0.0, 1.0);
+    float snow = smoothstep(1650.0, 1780.0, alt + (nR - 0.5) * 200.0) * (1.0 - smoothstep(0.45, 0.7, slope));
+    // scree: debris fans below the rock in the alpine zone, in tongues down the slope
+    float scree = alpine * smoothstep(0.1, 0.18, slope) * (1.0 - smoothstep(0.28, 0.38, slope)) * smoothstep(0.35, 0.6, nB + (nA - 0.5) * 0.3) * (1.0 - snow);
+    float lichenF = (1.0 - smoothstep(0.45, 0.7, slope)) * (1.0 - smoothstep(1500.0, 1750.0, alt));
     float darkF = smoothstep(0.45, 0.65, fbmN(p.xz * 0.0015 + 3.0, 2));
     float rockW = rockAll * (1.0 - snow);
     float wm[5] = float[5](rockW * (1.0 - lichenF) * (1.0 - darkF), rockW * (1.0 - lichenF) * darkF, snow, scree * (1.0 - rockAll), rockW * lichenF);
@@ -116,14 +120,17 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     // ---- lowland layers (biome masks)
     // Leaf litter under closed canopy and on steep banks, with ragged edges, plus scattered litter
     // and bare patches in the grass near trees.
-    float wFloor = smoothstep(0.3, 0.65, cover + 0.2 * under + (nA - 0.5) * 0.55 + (nB - 0.5) * 0.3 + slope * 0.8 * smoothstep(0.15, 0.5, cover));
-    wFloor = max(wFloor, smoothstep(0.62, 0.8, nA) * smoothstep(0.08, 0.35, cover) * 0.8);
+    float wFloor = smoothstep(0.4, 0.75, cover + 0.2 * under + (nA - 0.5) * 0.45 + (nB - 0.5) * 0.2);
+    wFloor = max(wFloor, smoothstep(0.65, 0.8, nA) * smoothstep(0.2, 0.5, cover) * 0.7);
     float open = 1.0 - wFloor;
     float wetN = wet + (nB - 0.5) * 0.6 + (nA - 0.5) * 0.3;
     // Mossy, darker-green patches also in dry meadows (hollows, old clumps): ~10-30 m scale.
     float nD = fbmN(p.xz * 0.045 + 93.0, 3);
     float wMoss = (smoothstep(0.42, 0.78, wetN) + 0.7 * smoothstep(0.15, 0.6, cover + (nA - 0.5) * 0.3) + 0.8 * smoothstep(0.6, 0.78, nD + (nA - 0.5) * 0.25)) * (open + 0.4 * wFloor);
-    float dryN = dry + (nC - 0.5) * 0.45 + (nB - 0.5) * 0.5 + (nA - 0.5) * 0.3;
+    // Sun-facing slopes dry out (more insolation), shaded ones stay lush.
+    vec2 sunH = g.sunDir.xz / max(length(g.sunDir.xz), 1e-3);
+    float sunny = dot(n.xz, sunH);
+    float dryN = dry + 1.2 * sunny + (nC - 0.5) * 0.2 + (nB - 0.5) * 0.3 + (nA - 0.5) * 0.25;
     float wDry = open * smoothstep(0.45, 0.8, dryN) * (1.0 - 0.7 * wet);
     float wGrass = open * (1.0 - 0.6 * smoothstep(0.4, 0.8, wetN)) * (1.0 - smoothstep(0.35, 0.75, dryN));
     // ---- river banks: pebble bars at the water, muddy riverbed, then wet grass on the floodplain
@@ -143,6 +150,11 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     float texel = GROUND_TILE / float(textureSize(groundTex[0], 0).x);
     float lod = max(log2(footprint / texel) - 0.5 * log2(cosv), 0.0);
     HexTile hx = hexTile(p.xz / GROUND_TILE);
+    // Tangent frame of the ground (u along +X, v along +Z), for the triplanar rock normals.
+    vec3 Tg = normalize(vec3(1.0, 0.0, 0.0) - n * n.x);
+    vec3 Bg = cross(Tg, n);
+    vec3 tw = pow(abs(n), vec3(4.0));
+    tw /= tw.x + tw.y + tw.z;
 
     vec3 alb[GROUND_LAYERS];
     vec2 nrm[GROUND_LAYERS];
@@ -166,6 +178,31 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
                    : l == 10 ? vec3(0.11, 0.10, 0.085) : vec3(0.05, 0.075, 0.028);
             alb[l] = c * (l == 6 ? mix(0.95, 1.05, m - 0.5) : m);
             h[l] = dot(alb[l], vec3(0.3, 0.5, 0.2)) * 3.0 + 0.5;
+            continue;
+        }
+        if (l == 4 || l == 5 || l == 8) {
+            // Rock: triplanar projection (a top-down projection smears down cliff faces), larger
+            // repeat, plus a macro sample at 1/6 scale and horizontal strata so faces read as rock
+            // from a distance.
+            const float RT = 5.0;
+            float lodR = max(log2(footprint / (RT / float(textureSize(groundTex[0], 0).x))) - 0.5 * log2(cosv), 0.0);
+            vec3 ra = vec3(0.0), off = vec3(0.0);
+            float ro = 0.0;
+            for (int ax = 0; ax < 3; ++ax) {
+                if (tw[ax] < 0.02) continue;
+                vec2 uv = (ax == 0 ? p.zy : ax == 1 ? p.xz : p.xy) / RT;
+                vec3 c0 = textureLod(groundTex[src * 3], uv, lodR).rgb;
+                vec3 c1 = textureLod(groundTex[src * 3], uv * 0.17 + 0.37, max(lodR - 2.58, 0.0)).rgb;
+                ra += c0 * mix(vec3(1.0), 2.0 * c1 / max(c0 + c1, vec3(0.02)), 0.5) * tw[ax];
+                vec2 nt = textureLod(groundTex[src * 3 + 1], uv, lodR).rg * 2.0 - 1.0;
+                off += (ax == 0 ? vec3(0.0, nt.y, nt.x) : ax == 1 ? vec3(nt.x, 0.0, nt.y) : vec3(nt.x, nt.y, 0.0)) * tw[ax];
+                ro += textureLod(groundTex[src * 3 + 2], uv, lodR).r * tw[ax];
+            }
+            float strata = 0.82 + 0.3 * vnoise(vec2(p.y * 0.22 + 0.5 * vnoise(p.xz * 0.01), (p.x + p.z) * 0.004));
+            alb[l] = ra * tint * strata * mix(0.8, 1.15, fbmN(p.xz * 0.03 + p.y * 0.02, 2)) * GROUND_GAIN[src];
+            nrm[l] = vec2(dot(off, Tg), dot(off, Bg));
+            occ[l] = ro;
+            h[l] = dot(alb[l], vec3(0.3, 0.5, 0.2)) * 3.0 + occ[l] * 0.5;
             continue;
         }
         vec3 a[3];
@@ -204,6 +241,16 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
         nxy += nrm[l] * k;
         ao += occ[l] * k;
     }
+    if (g.iparams.y == 11u) {
+        // debug: dominant ground layers colour-coded (floor orange, moss dark green, grass lime,
+        // dry yellow, rock grey / dark grey, snow white, scree red, lichen purple, mud brown,
+        // pebbles cyan, wet grass blue)
+        const vec3 PAL[12] = vec3[12](vec3(1.0, 0.45, 0.0), vec3(0.0, 0.35, 0.0), vec3(0.5, 1.0, 0.0), vec3(1.0, 1.0, 0.0),
+            vec3(0.6), vec3(0.25), vec3(1.0), vec3(1.0, 0.0, 0.0), vec3(0.6, 0.0, 1.0), vec3(0.3, 0.15, 0.05), vec3(0.0, 1.0, 1.0), vec3(0.0, 0.2, 1.0));
+        albedo = vec3(0.0);
+        for (int l = 0; l < GROUND_LAYERS; ++l) albedo += PAL[l] * hw[l] / max(hsum, 1e-12);
+        albedo *= 0.25;
+    }
     // Large-scale variation: brightness over ~80 m and a warm/cool shift over ~16 m, so open
     // ground does not read as one flat colour from a distance (lowland layers only).
     float vary = mix(1.0, 0.5, wFloor) * low;
@@ -214,20 +261,16 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     // Sky occlusion under far forest: AO rays stop at 600 m, so beyond that the canopy's shade on
     // the forest floor comes from the forest density.
     float dc = distance(p, g.camPos.xyz);
-    float coverF = smoothstep(0.1, 0.7, mix(mk.r / 0.6, mk.r, nearW));
+    float coverF = smoothstep(0.1, 0.7, mk.r);
     ao *= mix(1.0, 0.3, smoothstep(450.0, 900.0, dc) * coverF * low);
-    // Beyond the grown forest (g.extra.y from the origin) the forest is painted into the ground.
-    // Inside it, far forest floor is partly painted too: at a few km a pixel covers several crowns
-    // and the floor between the impostors would otherwise read as bare (brown / mauve in the haze).
-    float rW = length(p.xz);
-    float paint = g.extra.y > 0.0 ? smoothstep(g.extra.y * 0.98, g.extra.y * 1.04, rW) * smoothstep(0.15, 0.55, mkF.r) * low : 0.0;
-    paint = max(paint, 0.7 * smoothstep(900.0, 3500.0, dc) * coverF * low);
-    if (paint > 0.0) {
-        float mott = fbmN(p.xz * 0.02, 3);
-        vec3 canopy = vec3(0.040, 0.062, 0.022) * mix(0.65, 1.35, mott);
-        albedo = mix(albedo, canopy, paint);
-        ao = mix(ao, 0.7, paint);
-        nxy *= 1.0 - paint;
+    // Small-scale relief the mesh cannot hold (hummocks, bumps, 2-20 m): normal from the gradient
+    // of a height noise, stronger on steep / mountain ground, faded where the mesh is finer.
+    {
+        float e = 0.6;
+        vec2 q = p.xz * 0.11;
+        float h0 = fbmN(q, 3), hx = fbmN(q + vec2(e * 0.11, 0.0), 3), hz = fbmN(q + vec2(0.0, e * 0.11), 3);
+        float amp = 0.35 + 1.2 * smoothstep(0.1, 0.4, slope);
+        nxy += vec2(-(hx - h0), -(hz - h0)) / e * amp * 1.6;
     }
     // Tangent frame: u along +X, v along +Z.
     vec3 T = normalize(vec3(1.0, 0.0, 0.0) - n * n.x);

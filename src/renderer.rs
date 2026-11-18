@@ -522,7 +522,7 @@ impl Renderer {
             }
             ground_tex.truncate(MAX_GROUND_TEX - 2);
             const FAR_RES: u32 = 2048;
-            let far = world.far_mask(FAR_RES as usize);
+            let far = world.far_mask(FAR_RES as usize, &pack.trees, &catalog);
             ground_tex.push(crate::textures::upload_with_mips(&gpu, FAR_RES, FAR_RES, &far, vk::Format::R8G8B8A8_UNORM, "far ground mask")?);
             let m = MASK_RES as u32;
             ground_tex.push(crate::textures::upload_with_mips(&gpu, m, m, &mask, vk::Format::R8G8B8A8_UNORM, "ground mask")?);

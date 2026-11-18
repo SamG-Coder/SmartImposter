@@ -167,6 +167,8 @@ fn raw_sample(l: &Land, x: f32, z: f32) -> (f32, f32, f32) {
     let detail = 12.0 * fbm(sx / 900.0, sz / 900.0, 4, 19)
         + 4.0 * fbm(sx / 260.0, sz / 260.0, 3, 23)
         + 1.2 * fbm(sx / 70.0, sz / 70.0, 3, 29)
+        + (0.8 + 1.6 * mtn) * fbm(sx / 28.0, sz / 28.0, 3, 31)
+        + (0.35 + 0.5 * mtn) * fbm(sx / 11.0, sz / 11.0, 2, 33)
         + mtn * 80.0 * (ridged(sx / 1500.0, sz / 1500.0, 5, 67) - 0.45);
     let mut h = e.height(sx, sz) + detail;
     let (mut water, mut bank) = (0.0, 0.0);
@@ -194,9 +196,6 @@ pub fn terrain_sample(x: f32, z: f32) -> (f32, f32, f32) {
     (l.h0 + (h - l.h0) * f - r2 / (2.0 * EARTH_RADIUS), water, bank)
 }
 
-fn dryness(x: f32, z: f32, wet: f32) -> f32 {
-    smoothstep(-0.1, 0.45, fbm(x / 140.0, z / 140.0, 3, 83) + 0.5 * (0.5 - wet))
-}
 
 /// Biome fields at a point, all in [0, 1].
 #[derive(Clone, Copy, Default)]
@@ -209,6 +208,16 @@ struct Biome {
 }
 
 impl World {
+    /// Dry ground (0..1) from the landform: convex knolls and ridges shed water and dry out,
+    /// hollows collect it; plus the soil moisture. `e`: curvature scale (m). Sun-facing slopes
+    /// are added in the shader (it knows the sun).
+    pub fn dryness(&self, x: f32, z: f32, wet: f32, e: f32) -> f32 {
+        let h = self.height_at(x, z);
+        let ring = 0.25 * (self.height_at(x + e, z) + self.height_at(x - e, z) + self.height_at(x, z + e) + self.height_at(x, z - e));
+        let convex = ((h - ring) / (0.06 * e)).clamp(-1.0, 1.0);
+        smoothstep(-0.25, 0.55, 0.6 * (0.5 - wet) + 0.4 * convex + 0.12 * fbm(x / 140.0, z / 140.0, 3, 83))
+    }
+
     /// Soil moisture in [0, 1]: valleys and wet patches, river banks; uplands are drier.
     pub fn wetness(&self, x: f32, z: f32) -> f32 {
         let (_, bank) = self.river_at(x, z);
@@ -730,7 +739,7 @@ impl World {
                         }
                         3 => {
                             let open = 1.0 - b.dens;
-                            let dry = dryness(x, z, b.wet);
+                            let dry = world.dryness(x, z, b.wet, 12.0);
                             let patchy = smoothstep(-0.3, 0.25, fbm(x / 18.0, z / 18.0, 3, 97));
                             let w = (open * 1.15 + 0.35 * b.edge) * (0.85 + 0.15 * patchy) * smoothstep(0.0, 0.25, open + 0.5 * b.edge);
                             if r_place > w.min(0.97) {
@@ -940,7 +949,7 @@ impl World {
                 let x = (i as f32 + 0.5) * cell - NEAR_HALF;
                 let z = (j as f32 + 0.5) * cell - NEAR_HALF;
                 let wet = self.wetness(x, z);
-                let dry = dryness(x, z, wet);
+                let dry = self.dryness(x, z, wet, 12.0);
                 let k = j * res + i;
                 let c = if self.cover.is_empty() { 0.0 } else { self.cover[k] };
                 let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
@@ -950,10 +959,25 @@ impl World {
         px
     }
 
-    /// Far ground mask (res^2 RGBA8 over +-TERRAIN_HALF): R forest site density (where the tiles
-    /// and the painted canopy are), G moisture, B dryness.
-    pub fn far_mask(&self, res: usize) -> Vec<u8> {
+    /// Far ground mask (res^2 RGBA8 over +-TERRAIN_HALF): R canopy cover of the simulated trees
+    /// (crown area per texel) inside the grown forest, G moisture, B dryness, A forest site
+    /// density beyond the grown forest (painted canopy there).
+    pub fn far_mask(&self, res: usize, trees: &[TreeAsset], cat: &Catalog) -> Vec<u8> {
         let cell = 2.0 * TERRAIN_HALF / res as f32;
+        let mut crown = vec![0.0f32; res * res];
+        for t in &self.trees {
+            let v = t.variant as usize;
+            if v >= cat.variants.len() || cat.variants[v].kind != Kind::Tree || cat.variants[v].height < 4.0 {
+                continue;
+            }
+            let a = &trees[v];
+            let rc = 0.5 * (a.bmax.x - a.bmin.x).max(a.bmax.z - a.bmin.z) * t.xform.matrix3.x_axis.length();
+            let i = (((t.center.x + TERRAIN_HALF) / cell) as isize).clamp(0, res as isize - 1) as usize;
+            let j = (((t.center.z + TERRAIN_HALF) / cell) as isize).clamp(0, res as isize - 1) as usize;
+            crown[j * res + i] += std::f32::consts::PI * rc * rc * 0.8 / (cell * cell);
+        }
+        let crown = blur(&crown, res);
+        let fr = self.forest_radius;
         let mut px = vec![0u8; res * res * 4];
         par_rows(res, res * 4, &mut px, |j, row| {
             for i in 0..res {
@@ -961,7 +985,9 @@ impl World {
                 let z = (j as f32 + 0.5) * cell - TERRAIN_HALF;
                 let wet = self.wetness(x, z);
                 let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
-                row[i * 4..i * 4 + 4].copy_from_slice(&[q(self.forest_density(x, z)), q(wet), q(dryness(x, z, wet)), 0]);
+                let inside = 1.0 - smoothstep(fr * 0.97, fr, (x * x + z * z).sqrt());
+                let site = if inside < 1.0 { self.forest_density(x, z) * (1.0 - inside) } else { 0.0 };
+                row[i * 4..i * 4 + 4].copy_from_slice(&[q(crown[j * res + i].min(1.0) * inside), q(wet), q(self.dryness(x, z, wet, cell)), q(site)]);
             }
         });
         px

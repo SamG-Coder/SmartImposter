@@ -10,6 +10,7 @@ mod catalog;
 mod dlss;
 mod erosion;
 mod flypath;
+mod globe;
 mod textures;
 mod gpu;
 mod renderer;
@@ -257,7 +258,7 @@ struct App {
     state: Option<State>,
 }
 
-fn save_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
+pub fn save_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
     if let Some(dir) = std::path::Path::new(path).parent() {
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(dir)?;
@@ -835,6 +836,10 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<()> {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if raw.iter().any(|a| a == "--globe") {
+        return globe::app::run(globe::app::parse(&raw));
+    }
     let args = parse_args();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

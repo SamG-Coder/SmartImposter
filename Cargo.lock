@@ -1318,6 +1318,7 @@ dependencies = [
  "ash-window",
  "bytemuck",
  "cc",
+ "flate2",
  "glam",
  "gpu-allocator",
  "png",
