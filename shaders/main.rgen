@@ -33,7 +33,24 @@ vec3 globeSky(vec3 d) {
     vec3 T;
     vec3 ro = -g.planet.xyz;
     vec3 c = atmosphere(ro, d, 1e30, g.sunDir.xyz, g.sunDir.w, T);
-    if (dot(d, g.sunDir.xyz) > 0.99996 && raySphere(ro, d, R_GROUND).x < 0.0) c += g.sunDir.w * 2000.0 * T;
+    vec2 hg = raySphere(ro, d, R_GROUND);
+    if (hg.x > 0.0 && hg.y > 0.0) return c; // the planet hides what lies behind it
+    // the sun's disc (the real sun, also when the moon is the light)
+    if (dot(d, g.sunTrue.xyz) > 0.99996) c += 4.6 * 2000.0 * T;
+    // the moon: a sphere lit by the sun (phase), albedo ~0.12, seen through the atmosphere
+    float mr = g.moon.w;
+    float cd = dot(d, g.moon.xyz);
+    if (mr > 0.0 && cd > cos(mr)) {
+        // point on the moon's sphere under this pixel (unit sphere, centre along g.moon)
+        vec3 side = d - g.moon.xyz * cd;
+        float r = clamp(length(side) / sin(mr), 0.0, 1.0);
+        vec3 nrm = normalize(side / sin(mr) - g.moon.xyz * sqrt(1.0 - r * r));
+        float lit = max(dot(nrm, g.sunTrue.xyz), 0.0);
+        // physical brightness by day (a pale day-time moon); at night the eye sees the phase, not
+        // a clipped disc: at most ~2x white after the exposure
+        float L = min(4.6 * 0.12 / PI, 2.0 / max(g.sunTrue.w * g.params.z, 1e-6));
+        c += L * lit * T;
+    }
     return c;
 }
 
@@ -235,8 +252,15 @@ void main() {
         // The hit is the bed under a water surface the ray crossed first (camera above it)?
         float wd = pl.wdepth;
         float tSurf = (wd > 0.0 && dir.y < -1e-4) ? (p.y + wd - org.y) / dir.y : -1.0;
-        // globe terrain flags its lakes / sea itself (the hit is the water surface)
-        if ((pl.flags & FLAG_WATER) != 0u && wd <= 0.0) {
+        // globe terrain: the hit is the water surface itself, the bed lies wd below it (globe.rchit:
+        // depth from the shoreline field and the sea floor)
+        float under = -1.0;
+        bool sea = (pl.flags & FLAG_SEA) != 0u;
+        if (globe() && (pl.flags & FLAG_WATER) != 0u) {
+            tSurf = pl.t;
+            wd = max(wd, 0.02);
+            under = wd / max(dot(-dir, normalize(gq)), 0.05);
+        } else if ((pl.flags & FLAG_WATER) != 0u && wd <= 0.0) {
             tSurf = pl.t;
             wd = 6.0; // open water: no shallows, no foam
         }
@@ -263,12 +287,16 @@ void main() {
             // with depth absorption (Beer-Lambert) and in-scattering, flowing ripples, foam where
             // it is shallow, a ray-traced reflection by Fresnel, and the sun glint.
             vec3 ps = org + dir * tSurf;
-            float under = pl.t - tSurf;                // view path through the water
+            if (under < 0.0) under = pl.t - tSurf;     // view path through the water
             float sunPath = wd / max(L.y, 0.08);       // sunlight down to the bed
-            const vec3 SIGMA = vec3(0.42, 0.10, 0.075); // clear, slightly green water (1/m)
+            // clear, slightly green lake / river water; the sea is bluer and scatters more blue
+            vec3 SIGMA = sea ? vec3(0.45, 0.07, 0.04) : vec3(0.42, 0.10, 0.075); // 1/m
             vec3 Tv = exp(-SIGMA * under);
             vec3 Ts = exp(-SIGMA * sunPath);
-            vec3 inscat = vec3(0.012, 0.035, 0.032) * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
+            // light scattered back out of deep water (globe: dark blue-green lakes, deep blue sea;
+            // the bed shows only where it is shallow)
+            vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? vec3(0.0015, 0.006, 0.016) : vec3(0.003, 0.010, 0.010);
+            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
             // flowing ripples: two octaves drifting at different speeds and directions
             float tm = g.extra.w;
@@ -359,6 +387,8 @@ void main() {
         col = col * T + hazeColor(dir) * (1.0 - T);
     }
     // This frame's sample and hit distance; taa.comp blends it into the history.
+    // eye adaptation before the 16-bit targets (moonlit radiance would flush to zero in them)
+    if (globe() && dbg == 0u) col *= g.sunTrue.w;
     imageStore(curImg, ivec2(px), vec4(col, 1.0));
     imageStore(depthImg, ivec2(px), vec4(pl.t < 0.0 ? 10.0 * farRay() : pl.t));
     if (g.lodParams.z > 0.5) {

@@ -15,7 +15,7 @@ use anyhow::{bail, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 10 m cells per 3 degree tile side.
 const N: usize = 36_000;
@@ -50,6 +50,12 @@ pub fn group(class: u8) -> Option<usize> {
         100 => 9,     // moss and lichen
         _ => return None,
     })
+}
+
+/// Index of a 3 degree tile (south-west corner) in the presence grid.
+fn cell((lat, lon): (i32, i32)) -> Option<usize> {
+    let (y, x) = ((lat + 90) / 3, (lon + 180) / 3);
+    (lat >= -90 && lat < 90 && lon >= -180 && lon < 180).then(|| y as usize * 120 + x as usize)
 }
 
 fn coords(name: &str) -> Option<(i32, i32)> {
@@ -112,12 +118,17 @@ type Lazy<T> = Arc<(OnceLock<Option<Arc<T>>>, AtomicU64)>;
 
 thread_local! {
     /// Each worker's last block (weak: never keeps an evicted block alive).
-    static LAST: std::cell::RefCell<((i32, i32, u32), Weak<Vec<u8>>)> = const { std::cell::RefCell::new(((i32::MIN, 0, 0), Weak::new())) };
+    /// Each worker's recent blocks (weak: never keeps an evicted block alive). Several: a tile's
+    /// vertices read full-resolution blocks and overviews in turn, and samples straddle blocks.
+    static LAST: std::cell::RefCell<([((i32, i32, u32), Option<Arc<Vec<u8>>>); 8], usize)> =
+        std::cell::RefCell::new((std::array::from_fn(|_| ((i32::MIN, 0, 0), None)), 0));
 }
 
 pub struct LandCover {
     /// 3 degree tiles on disk, by south-west corner
     index: HashMap<(i32, i32), PathBuf>,
+    /// the same as a 60 x 120 grid of 3 degree cells (the hot path: no hashing)
+    present: Vec<bool>,
     cogs: Mutex<HashMap<(i32, i32), Lazy<Cog>>>,
     blocks: Mutex<HashMap<(i32, i32, u32), Lazy<Vec<u8>>>>,
     clock: AtomicU64,
@@ -139,7 +150,13 @@ impl LandCover {
         if !index.is_empty() {
             println!("ESA WorldCover: {} tiles indexed (10 m, decoded on demand)", index.len());
         }
-        Ok(LandCover { index, cogs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()), clock: AtomicU64::new(0) })
+        let mut present = vec![false; 60 * 120];
+        for k in index.keys() {
+            if let Some(i) = cell(*k) {
+                present[i] = true;
+            }
+        }
+        Ok(LandCover { index, present, cogs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()), clock: AtomicU64::new(0) })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -163,16 +180,7 @@ impl LandCover {
     /// Decoded block `b` of level `level` of tile `key`.
     fn block(&self, key: (i32, i32), level: usize, b: u32) -> Option<Arc<Vec<u8>>> {
         let bk = (key.0, key.1, (level as u32) << 24 | b);
-        if let Some(v) = LAST.with(|l| {
-            let l = l.borrow();
-            if l.0 == bk {
-                l.1.upgrade()
-            } else {
-                None
-            }
-        }) {
-            return Some(v);
-        }
+
         if !self.index.contains_key(&key) {
             return None;
         }
@@ -209,7 +217,7 @@ impl LandCover {
                 }
             })
             .clone()?;
-        LAST.with(|l| *l.borrow_mut() = (bk, Arc::downgrade(&v)));
+
         Some(v)
     }
 
@@ -222,16 +230,39 @@ impl LandCover {
     /// the coarsest overview the coarsest is used).
     fn class_at(&self, lat: f64, lon: f64, level: usize) -> u8 {
         let key = ((lat / 3.0).floor() as i32 * 3, (lon / 3.0).floor() as i32 * 3);
-        if !self.index.contains_key(&key) {
+        if !cell(key).is_some_and(|i| self.present[i]) {
             return 0;
         }
         let level = level.min(LEVELS - 1);
         let w = N >> level;
         let y = (((key.0 as f64 + 3.0 - lat) * w as f64 / 3.0) as usize).min(w - 1);
         let x = (((lon - key.1 as f64) * w as f64 / 3.0) as usize).min(w - 1);
-        let b = (y / BLOCK) * w.div_ceil(BLOCK) + x / BLOCK;
-        let Some(blk) = self.block(key, level, b as u32) else { return 0 };
-        blk[(y % BLOCK) * BLOCK + x % BLOCK]
+        let b = ((y / BLOCK) * w.div_ceil(BLOCK) + x / BLOCK) as u32;
+        let bk = (key.0, key.1, (level as u32) << 24 | b);
+        let off = (y % BLOCK) * BLOCK + x % BLOCK;
+        // each worker's recent blocks, read in place: no shared counters or locks per sample
+        if let Some(v) = LAST.with(|l| l.borrow().0.iter().find(|e| e.0 == bk).and_then(|e| e.1.as_ref().map(|b| b[off]))) {
+            return v;
+        }
+        let Some(blk) = self.block(key, level, b) else { return 0 };
+        let v = blk[off];
+        LAST.with(|l| {
+            let mut l = l.borrow_mut();
+            let i = l.1;
+            l.0[i] = (bk, Some(blk));
+            l.1 = (i + 1) % 8;
+        });
+        v
+    }
+
+    /// Is it water (permanent water bodies) at lat / lon, read at a resolution for samples
+    /// `spacing` metres apart? None where there is no land cover data.
+    pub fn water_at(&self, lat: f64, lon: f64, spacing: f64) -> Option<bool> {
+        let level = ((spacing / (3.0 * 111_320.0 / N as f64)).log2().floor().max(0.0)) as usize;
+        match self.class_at(lat, lon, level) {
+            0 => None,
+            c => Some(c == 80),
+        }
     }
 
     /// Class group at lat / lon (None = no data).

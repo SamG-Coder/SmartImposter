@@ -126,14 +126,21 @@ def dem_tiles(res):
     return out
 
 
-CONVERTER = os.path.join(ROOT, "target", "fetch_earth", os.path.basename(EXE))
+# its own name: stopping the engine (taskkill /IM smart_imposter.exe) must not stop conversions
+CONVERTER = os.path.join(ROOT, "target", "fetch_earth", "si_convert" + (".exe" if os.name == "nt" else ""))
 
 
 def convert(paths):
     """Published GeoTIFFs -> .dem (the engine converts and deletes them). Runs a copy of the
     engine, so rebuilding it while a download runs does not collide with a conversion."""
     if paths:
-        subprocess.run([CONVERTER, "--convert-dem", *paths], check=True, stdout=subprocess.DEVNULL)
+        # below normal priority: the conversion yields the CPU to the renderer while you fly
+        flags = 0x00004000 if os.name == "nt" else 0  # BELOW_NORMAL_PRIORITY_CLASS
+        r = subprocess.run([CONVERTER, "--convert-dem", *paths], stdout=subprocess.DEVNULL, creationflags=flags,
+                           preexec_fn=(lambda: os.nice(10)) if os.name != "nt" else None)
+        if r.returncode != 0:
+            # leave the GeoTIFFs: the next run converts them (and the engine converts any it finds)
+            print(f"\n  conversion of {len(paths)} tiles failed (exit {r.returncode}); they stay as .tif", file=sys.stderr)
 
 
 def dem(args):
@@ -144,6 +151,11 @@ def dem(args):
         shutil.copy2(EXE, CONVERTER)
     tiles = [t for t in dem_tiles(args.res) if in_bbox(t[1], t[2], 1, args.bbox)]
     d = os.path.join(EARTH, "glo30" if args.res == 30 else "glo90")
+    if not args.keep_tif and os.path.isdir(d):
+        left = [os.path.join(d, f) for f in os.listdir(d) if f.endswith("_DEM.tif")]
+        if left:
+            print(f"converting {len(left)} GeoTIFFs left by an earlier run")
+            convert(left)
     todo = [t for t in tiles if not os.path.exists(os.path.join(d, t[0] + ".dem"))]
     print(f"GLO-{args.res}: {len(tiles)} tiles in range, {len(tiles) - len(todo)} already here -> {d}")
     batch = []

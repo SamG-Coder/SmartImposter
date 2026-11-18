@@ -17,7 +17,7 @@ mod renderer;
 mod world;
 
 use anyhow::Result;
-use glam::{DVec3, Vec3};
+use glam::{DMat3, DVec3, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use renderer::{Globals, ImpostorSettings, Renderer};
 use std::collections::HashSet;
@@ -40,6 +40,11 @@ struct Args {
     globe: bool,
     /// Globe start: lat, lon (deg), height above the ground (m), heading (deg from north), pitch (deg).
     at: [f64; 5],
+    /// Globe clock: start time (UTC "YYYY-MM-DDTHH:MM"; default 10:30 local solar time on the June
+    /// solstice at the start) and speed (simulated seconds per second; default real time, or
+    /// stopped when capturing).
+    time: Option<String>,
+    time_rate: Option<f64>,
     /// Several cameras in one run (`--views`): x, height above ground, z, yaw, pitch.
     views: Vec<[f32; 7]>, // + optional mesh LOD distance and debug mode (-1 = unchanged)
     frames: u32,
@@ -89,6 +94,8 @@ fn parse_args() -> Args {
         debug: 0,
         ao_rays: 1,
         sun: [35.0, 38.0],
+        time: None,
+        time_rate: None,
         imp: ImpostorSettings { grid: 12, texel: 0.055, max_res: 448, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12 },
         species: None,
         lod2: 100.0,
@@ -160,6 +167,8 @@ fn parse_args() -> Args {
             "--lod" => a.lod = next.parse().unwrap_or(50.0),
             "--debug" => a.debug = next.parse().unwrap_or(0),
             "--ao" => a.ao_rays = next.parse().unwrap_or(1),
+            "--time" => a.time = Some(next),
+            "--time-rate" => a.time_rate = next.parse().ok(),
             "--sun" => {
                 let v = floats(&next);
                 if v.len() == 2 {
@@ -286,10 +295,21 @@ struct State {
 /// east / up / south frame at the camera, origin at the camera (Camera.pos stays 0).
 struct Geo {
     ecef: DVec3,
-    /// direction to the sun, Earth-fixed (set from sun azimuth / elevation at the start)
-    sun: DVec3,
+    /// simulated UTC time (seconds since 1970) and clock speed (simulated seconds per second)
+    time: f64,
+    rate: f64,
+    /// eye adaptation: exposure factor (1 in daylight, up by ~10^4 under a full moon)
+    adapt: f32,
     /// last frame's camera position and right / up / forward vectors, Earth-fixed (motion vectors)
     prev: Option<[DVec3; 4]>,
+    /// the renderer's frame at the camera (rows east, up, south): set from north at a jump, then
+    /// carried along with the camera (scene::transport), so flights over the poles stay straight
+    frame: DMat3,
+}
+
+fn smoothstep(a: f64, b: f64, x: f64) -> f64 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn geo_place(terrain: &globe::dem::Terrain, lat: f64, lon: f64, height: f64) -> DVec3 {
@@ -384,11 +404,13 @@ impl App {
             Some(t) => {
                 let ecef = geo_place(t, a.at[0], a.at[1], a.at[2]);
                 let c = Camera { pos: Vec3::ZERO, yaw: a.at[3].to_radians() as f32, pitch: a.at[4].to_radians() as f32, fov_y: 60f32.to_radians() };
-                // sun: azimuth / elevation at the start, then fixed to the Earth
-                let (az, el_) = (a.sun[0].to_radians() as f64, a.sun[1].to_radians() as f64);
-                let local = DVec3::new(el_.cos() * az.sin(), el_.sin(), -el_.cos() * az.cos());
-                let sun = globe::scene::frame_at(ecef).transpose() * local;
-                (c, Some(Geo { ecef, sun, prev: None }))
+                // the clock: given, or 10:30 local solar time on the June solstice here
+                let time = a.time.as_deref().and_then(globe::sky::parse_utc).unwrap_or_else(|| {
+                    globe::sky::parse_utc("2026-06-21").unwrap() + (10.5 - a.at[1] / 15.0).rem_euclid(24.0) * 3600.0
+                });
+                let capture = a.shot.is_some() || a.bench_move != 0.0;
+                let rate = a.time_rate.unwrap_or(if capture { 0.0 } else { 1.0 });
+                (c, Some(Geo { ecef, time, rate, adapt: 0.0, prev: None, frame: globe::scene::frame_at(ecef) }))
             }
             None => (cam, None),
         };
@@ -485,6 +507,7 @@ impl App {
                 // globe: lat, lon, height above the ground, heading, pitch
                 (Some(geo), Some(scene)) => {
                     geo.ecef = geo_place(&scene.terrain, v[0] as f64, v[1] as f64, v[2] as f64);
+                    geo.frame = globe::scene::frame_at(geo.ecef);
                     geo.prev = None;
                     s.cam.pos = Vec3::ZERO;
                 }
@@ -582,14 +605,15 @@ impl App {
             s.cam.pos += s.vel * dt;
             if let (Some(geo), Some(scene)) = (s.geo.as_mut(), &s.r.globe) {
                 // globe: the move goes onto the Earth position; the frame follows the camera
-                let rot = globe::scene::frame_at(geo.ecef);
-                geo.ecef += rot.transpose() * s.cam.pos.as_dvec3();
+                geo.ecef += geo.frame.transpose() * s.cam.pos.as_dvec3();
                 s.cam.pos = Vec3::ZERO;
                 let ground = globe::tiles::ground_radius(&scene.terrain, geo.ecef) + 0.6;
                 if geo.ecef.length() < ground {
                     geo.ecef = geo.ecef.normalize() * ground;
                     s.vel.y = s.vel.y.max(0.0);
                 }
+                // the frame follows; the velocity is in the frame, so it carries over unchanged
+                geo.frame = globe::scene::transport(geo.frame, geo.ecef);
             } else {
                 let ground = s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z) + 0.6;
                 if s.cam.pos.y < ground {
@@ -601,12 +625,12 @@ impl App {
         let (fwd, right, up) = s.cam.basis();
         if let (true, Some(geo), Some(scene)) = (self.args.bench_move != 0.0, s.geo.as_mut(), &s.r.globe) {
             // Globe fly-through benchmark: along the heading at a constant height above the ground.
-            let rot = globe::scene::frame_at(geo.ecef);
             let ground = globe::tiles::ground_radius(&scene.terrain, geo.ecef);
             let above = geo.ecef.length() - ground;
-            let dir = rot.transpose() * Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero().as_dvec3();
+            let dir = geo.frame.transpose() * Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero().as_dvec3();
             let p = geo.ecef + dir * self.args.bench_move as f64;
             geo.ecef = p.normalize() * (globe::tiles::ground_radius(&scene.terrain, p) + above);
+            geo.frame = globe::scene::transport(geo.frame, geo.ecef);
         } else if self.args.bench_move != 0.0 {
             // Keep the initial height above the terrain while moving (walk / fly benchmarks).
             let above = s.cam.pos.y - s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z);
@@ -645,9 +669,10 @@ impl App {
         s.prev_cam = Some(cam_now);
         let mut sun = sun;
         let mut planet = [0.0f32; 4];
+        let (mut sun_w, mut moon, mut sun_true) = (4.6f32, [0.0f32; 4], [0.0f32, 0.0, 0.0, 1.0]);
         if let Some(geo) = s.geo.as_mut() {
             // globe: previous camera and the sun in this frame's coordinates, planet centre
-            let rot = globe::scene::frame_at(geo.ecef);
+            let rot = geo.frame;
             let rt = rot.transpose();
             let now_e = [geo.ecef, rt * right.as_dvec3(), rt * up.as_dvec3(), rt * fwd.as_dvec3()];
             let p = geo.prev.unwrap_or(now_e);
@@ -656,7 +681,31 @@ impl App {
             let (pr, pu, pf) = (v(p[1]), v(p[2]), v(p[3]));
             prev = [[pp.x, pp.y, pp.z, s.lod], [pr.x, pr.y, pr.z, prev[1][3]], [pu.x, pu.y, pu.z, prev[2][3]], [pf.x, pf.y, pf.z, prev[3][3]]];
             geo.prev = Some(now_e);
-            sun = v(geo.sun).normalize();
+            // the clock, the sun and the moon (Earth-fixed), the light: the sun by day, the moon
+            // by night (once the sun is 8 degrees down and the sky has gone dark)
+            geo.time += dt as f64 * geo.rate;
+            let sun_e = globe::sky::sun(geo.time);
+            let moon_v = globe::sky::moon(geo.time) - geo.ecef / 1000.0; // km, from the camera
+            let (moon_e, moon_km) = (moon_v.normalize(), moon_v.length());
+            let up_e = geo.ecef.normalize();
+            let alpha = sun_e.dot(-moon_e).clamp(-1.0, 1.0).acos(); // phase angle (0 = full)
+            let moon_i = 4.6 * globe::sky::moonlight(alpha, moon_km);
+            let night = sun_e.dot(up_e) < (-8f64).to_radians().sin();
+            let (light, light_i) = if night { (moon_e, moon_i) } else { (sun_e, 4.6) };
+            sun = v(light).normalize();
+            sun_w = light_i as f32;
+            let ms = v(moon_e).normalize();
+            moon = [ms.x, ms.y, ms.z, (globe::sky::MOON_RADIUS_KM / moon_km).atan() as f32];
+            let ss = v(sun_e).normalize();
+            // eye adaptation from the light on the ground (daylight fading through twilight)
+            let day = 4.6 * smoothstep(-0.14, 0.2, sun_e.dot(up_e));
+            let moon_up = moon_i * smoothstep(-0.05, 0.1, moon_e.dot(up_e));
+            // (a half moon gives ~2.4e-6 of daylight; ^0.85 leaves a moonlit night ~3 stops darker
+            // than day, as a dark-adapted eye sees it; airglow and starlight keep a floor)
+            let target = ((4.6 / (day + moon_up + 2e-8)).powf(0.85)).clamp(1.0, 1e6) as f32;
+            geo.adapt = if geo.adapt == 0.0 || geo.rate == 0.0 { target } else { (geo.adapt.ln() + (target.ln() - geo.adapt.ln()) * (1.0 - (-3.0 * dt).exp())).exp() };
+            // applied in main.rgen before the 16-bit targets (night radiance would flush to zero)
+            sun_true = [ss.x, ss.y, ss.z, geo.adapt];
             let pc = v(-geo.ecef);
             planet = [pc.x, pc.y, pc.z, 1.0];
             let gg = globe::scene::GlobeGlobals { planet: [pc.x, pc.y, pc.z, globe::scene::RADIUS], ..Default::default() };
@@ -667,7 +716,7 @@ impl App {
             cam_right: cam_now[1],
             cam_up: cam_now[2],
             cam_fwd: cam_now[3],
-            sun_dir: [sun.x, sun.y, sun.z, 4.6],
+            sun_dir: [sun.x, sun.y, sun.z, sun_w],
             params: [now.elapsed().as_secs_f32(), 0.0, s.exposure, 4.0],
             iparams: [s.accum, s.debug, s.frame, s.ao_rays],
             lod_params: [self.args.lod_band, s.lod2, self.args.lod2_band, 0.0],
@@ -677,6 +726,8 @@ impl App {
             prev_fwd: prev[3],
             extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() % 3600.0).unwrap_or(0.0)) as f32],
             planet,
+            moon,
+            sun_true,
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -726,6 +777,12 @@ impl App {
                 println!("{}", s.r.profile.line());
                 if let Some(scene) = &s.r.globe {
                     println!("{}", scene.stats_line());
+                    if let Some(geo) = &s.geo {
+                        let (lat, lon) = globe::tiles::lat_lon(geo.ecef);
+                        let h = geo.ecef.length() - globe::tiles::ground_radius(&scene.terrain, geo.ecef);
+                        let hd = globe::scene::heading(geo.frame, s.cam.basis().0.as_dvec3());
+                        println!("camera --at {lat:.5},{lon:.5},{h:.1},{hd:.1},{:.1}", s.cam.pitch.to_degrees());
+                    }
                 }
                 println!(
                     "stats: near trees {}, TLAS instances {}, camera --cam {:.2},{:.2},{:.2},{:.1},{:.1}",
@@ -748,7 +805,16 @@ impl App {
         if el_t > 0.5 {
             let fps = s.fps_frames as f32 / el_t;
             let mode = ["lit", "LOD view", "normals", "albedo", "AO", "sun visibility"][s.debug.min(5) as usize];
-            let cam_mode = if s.fly_on {
+            let cam_mode = if let Some(geo) = &s.geo {
+                let rate = match geo.rate {
+                    r if r == 0.0 => "stopped".to_string(),
+                    r if r == 1.0 => "real time".to_string(),
+                    r if r < 3600.0 => format!("{:.0} min/s", r / 60.0),
+                    r if r < 86_400.0 => format!("{:.0} h/s", r / 3600.0),
+                    r => format!("{:.0} day/s", r / 86_400.0),
+                };
+                format!("{} ({rate}; , . time, / speed) | {:.0} m/s", globe::sky::format_utc(geo.time), s.base_speed)
+            } else if s.fly_on {
                 "AUTO fly (F to stop)".to_string()
             } else {
                 format!("manual {:.0} m/s{}{}", s.base_speed, if s.cinematic { ", cinematic" } else { "" }, if s.captured { "" } else { ", click to look" })
@@ -769,7 +835,7 @@ impl App {
                 s.r.sharpness,
                 cam_mode,
                 stats.near_trees,
-                s.r.world.trees.len(),
+                if s.geo.is_some() { s.r.globe_trees } else { s.r.world.trees.len() },
                 stats.instances,
                 s.lod,
                 mode,
@@ -841,6 +907,25 @@ impl App {
             KeyCode::Semicolon => s.lod2 = (s.lod2 - 10.0).max(0.0),
             KeyCode::Quote => s.lod2 = (s.lod2 + 10.0).min(600.0),
             KeyCode::KeyO => s.ao_rays = (s.ao_rays + 1) % 3,
+            // globe: the clock (, . or left / right: an hour, Shift: a day; up / down: a day; / its speed)
+            KeyCode::Comma | KeyCode::Period | KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Slash
+                if s.geo.is_some() =>
+            {
+                let shift = s.keys.contains(&KeyCode::ShiftLeft) || s.keys.contains(&KeyCode::ShiftRight);
+                let geo = s.geo.as_mut().unwrap();
+                let step = if shift { 86_400.0 } else { 3600.0 };
+                match code {
+                    KeyCode::Comma | KeyCode::ArrowLeft => geo.time -= step,
+                    KeyCode::Period | KeyCode::ArrowRight => geo.time += step,
+                    KeyCode::ArrowUp => geo.time += 86_400.0,
+                    KeyCode::ArrowDown => geo.time -= 86_400.0,
+                    _ => {
+                        const RATES: [f64; 5] = [1.0, 60.0, 3600.0, 86_400.0, 0.0];
+                        let i = RATES.iter().position(|r| *r == geo.rate).map(|i| (i + 1) % RATES.len()).unwrap_or(0);
+                        geo.rate = RATES[i];
+                    }
+                }
+            }
             KeyCode::ArrowLeft => s.sun_az -= 10.0,
             KeyCode::ArrowRight => s.sun_az += 10.0,
             KeyCode::ArrowUp => s.sun_el = (s.sun_el + 5.0).min(89.0),
@@ -871,14 +956,23 @@ impl App {
                 let fs = s.window.fullscreen().is_some();
                 s.window.set_fullscreen(if fs { None } else { Some(winit::window::Fullscreen::Borderless(None)) });
             }
-            KeyCode::KeyP => println!(
-                "--cam {:.2},{:.2},{:.2},{:.1},{:.1}",
-                s.cam.pos.x,
-                s.cam.pos.y,
-                s.cam.pos.z,
-                s.cam.yaw.to_degrees(),
-                s.cam.pitch.to_degrees()
-            ),
+            KeyCode::KeyP => match (&s.geo, &s.r.globe) {
+                (Some(geo), Some(scene)) => {
+                    let (lat, lon) = globe::tiles::lat_lon(geo.ecef);
+                    let h = geo.ecef.length() - globe::tiles::ground_radius(&scene.terrain, geo.ecef);
+                    let (fwd, _, _) = s.cam.basis();
+                    let hd = globe::scene::heading(geo.frame, fwd.as_dvec3());
+                    println!("--at {lat:.5},{lon:.5},{h:.1},{hd:.1},{:.1}", s.cam.pitch.to_degrees());
+                }
+                _ => println!(
+                    "--cam {:.2},{:.2},{:.2},{:.1},{:.1}",
+                    s.cam.pos.x,
+                    s.cam.pos.y,
+                    s.cam.pos.z,
+                    s.cam.yaw.to_degrees(),
+                    s.cam.pitch.to_degrees()
+                ),
+            },
             _ => {}
         }
     }

@@ -22,11 +22,11 @@ macro_rules! spv {
 /// Atlas slots (one per plant variant) bound as sampler arrays. Must match shared.glsl.
 pub const MAX_VARIANTS: usize = 128;
 /// Texture sets (4 textures each) bound as a sampler array. Must match shared.glsl.
-pub const MAX_SPECIES: usize = 16;
+pub const MAX_SPECIES: usize = 32;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
-pub const MAX_GROUND_TEX: usize = 40;
+pub const MAX_GROUND_TEX: usize = 80;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -49,6 +49,11 @@ pub struct Globals {
     pub extra: [f32; 4],
     /// Globe mode: xyz planet centre relative to the camera (camera frame), w = 1. 0 otherwise.
     pub planet: [f32; 4],
+    /// Globe mode: direction to the moon (camera frame), w = its angular radius (rad).
+    pub moon: [f32; 4],
+    /// Globe mode: direction to the sun (camera frame); w = pre-exposure (eye adaptation: 1 by
+    /// day, up to ~1e5 by moonlight), applied before the 16-bit targets. 1 outside globe mode.
+    pub sun_true: [f32; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -367,6 +372,8 @@ pub struct Renderer {
     globe_view: Option<(glam::DVec3, glam::DMat3, crate::globe::scene::GlobeGlobals)>,
     /// Globe mode: plant records currently drawn as meshes (1 both / 2 mesh only).
     globe_states: std::collections::HashMap<u32, u32>,
+    /// Globe mode: trees in the TLAS last frame (window title).
+    pub globe_trees: usize,
 }
 
 /// World -> view for NGX: row-major, row vectors (v_view = v_world * M), x right, y up, z forward.
@@ -619,6 +626,50 @@ impl Renderer {
         let mut atlas_bytes = 0u64;
         let mut raw_bytes = 0u64;
         let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 20% of the GPU's largest
+        // device-local heap): with many species (the globe's biomes), every variant's texels grow
+        // by the same factor until they fit, instead of running out of memory.
+        let imp_in = imp;
+        let mut imp = imp;
+        {
+            let heap = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.pdev) };
+            let vram = heap.memory_heaps[..heap.memory_heap_count as usize]
+                .iter()
+                .filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+                .map(|h| h.size)
+                .max()
+                .unwrap_or(8 << 30);
+            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 5);
+            let planned = |imp: &ImpostorSettings| -> u64 {
+                pack.trees
+                    .iter()
+                    .enumerate()
+                    .map(|(v, t)| {
+                        let vi = &catalog.variants[v];
+                        let r = (t.bmax - t.bmin).length() * 0.5;
+                        let s = (imp.grid * imp.res_for(r / vi.texel_scale, vi.lod_scale)) as u64;
+                        (s * s * 3 + s * s / 4) * 4 / 3
+                    })
+                    .sum()
+            };
+            let full = planned(&imp);
+            for _ in 0..6 {
+                let p = planned(&imp);
+                if p <= budget {
+                    break;
+                }
+                imp.texel *= ((p as f64 / budget as f64).sqrt() as f32).max(1.05);
+            }
+            if imp.texel != imp_in.texel {
+                println!(
+                    "Impostor atlases: {:.2} GB at full resolution > budget {:.2} GB: texels x{:.2}",
+                    full as f64 / 1e9,
+                    budget as f64 / 1e9,
+                    imp.texel / imp_in.texel
+                );
+            }
+        }
+        let imp = imp;
         for (v, t) in pack.trees.iter().enumerate() {
             let vi = &catalog.variants[v];
             let sp = &species[vi.species.min(species.len() - 1)];
@@ -1031,6 +1082,7 @@ impl Renderer {
             globe_dummy: None,
             globe_view: None,
             globe_states: std::collections::HashMap::new(),
+            globe_trees: 0,
         };
         let _ = r.set_layout;
         // Globe mode: terrain and trees stream in around the camera (globe/scene.rs); the static
@@ -1068,6 +1120,15 @@ impl Renderer {
                 }
                 if sp.heath.is_empty() {
                     sp.heath = sp.shrubs.clone();
+                }
+                sp.biomes = vec![u16::MAX; r.imp_infos.len()];
+                for s in &r.catalog.species {
+                    let m = crate::globe::forest::understory_biomes(&s.name);
+                    for v in s.variants.clone() {
+                        if let Some(b) = sp.biomes.get_mut(v) {
+                            *b = m;
+                        }
+                    }
                 }
                 r.globe = Some(crate::globe::scene::GlobeScene::new(&r.gpu, terrain, sp)?);
             }
@@ -1974,7 +2035,7 @@ impl Renderer {
             g.lod_params[0] = 0.0; // all impostors: no dissolve band
         }
         g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
-        g.lod_params[3] = self.ground_layers as f32; // bit mask of the scanned ground layers loaded
+        g.lod_params[3] = f32::from_bits(self.ground_layers); // bit mask of the scanned ground layers loaded (bits, not a value: 26 layers)
         g.params[1] = self.has_tex as u32 as f32; // material textures available
         // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
@@ -1990,7 +2051,7 @@ impl Renderer {
         let globals = &g;
         let t_lod = Instant::now();
         // Globe mode: the instances come from the streamed scene (below).
-        let stats = if self.globe.is_some() { FrameStats::default() } else { self.update_instances(cam, lod, g.lod_params[0])? };
+        let mut stats = if self.globe.is_some() { FrameStats::default() } else { self.update_instances(cam, lod, g.lod_params[0])? };
         self.profile.cpu_lod += t_lod.elapsed().as_secs_f64() * 1000.0;
         // Globe mode: the CPU half of streaming (tile choice, worker requests, TLAS instances, mesh
         // LOD) overlaps the previous frame's GPU work; uploads follow the fence.
@@ -2093,7 +2154,7 @@ impl Renderer {
             gg.addr = [a as u32, (a >> 32) as u32, 0, 0];
             gg.params[1] = self.lod_frame as f32;
             gg.params[2] = g.iparams[1] as f32;
-            gg.params[3] = self.ground_layers as f32;
+            gg.params[3] = f32::from_bits(self.ground_layers);
             gg.misc = [
                 g.cam_fwd[3],
                 crate::globe::forest::NEAR as f32,
@@ -2349,6 +2410,12 @@ impl Renderer {
         } else {
             None
         };
+        if let Some(scene) = &self.globe {
+            // globe: trees drawn as meshes, all trees in the TLAS (window title)
+            stats.near_trees = self.near_count;
+            stats.instances = self.insts.len();
+            self.globe_trees = scene.trees_drawn;
+        }
         Ok((stats, image))
     }
 }

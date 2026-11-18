@@ -25,7 +25,7 @@ vec2 raySphere(vec3 ro, vec3 rd, float r) {
 // planet blocks the sun.
 vec2 lightDepth(vec3 x, vec3 L) {
     vec2 g = raySphere(x, L, R_GROUND);
-    if (g.x > 0.0) return vec2(1e9);
+    if (g.x > 0.0 && g.y > 0.0) return vec2(1e9); // (a miss is (1e30, -1): not blocked)
     float t1 = raySphere(x, L, R_TOP).y;
     const int N = 6;
     float ds = t1 / float(N);

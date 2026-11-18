@@ -26,7 +26,12 @@ float elevAt(vec2 uv, float lod) { return textureLod(elevTex, uv, lod).r * 32767
 layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX]; // the renderer's ground scans (3 per layer)
 const float GT = 2.048; // metres per texture repeat (divides tiles.rs TEX_PERIOD)
 // The scans' mean albedos differ ~10x: bring them to plausible ground albedos (as tri.rchit).
-const float GAIN[12] = float[12](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0);
+// (layers 12-25: measured mean linear albedo -> beach sand 0.36, sand 0.34, arid soil 0.24, red
+// clay 0.2, tundra 0.18, lichen 0.2, boreal floor 0.1, glacier 0.55, mud 0.11, salt 0.45,
+// ploughed 0.15, lava sand 0.07, steppe soil 0.17, dry grass 0.24; very dark scans capped)
+const int LAYERS = 26;
+const float GAIN[LAYERS] = float[LAYERS](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0,
+                                         1.02, 1.99, 4.0, 2.27, 6.0, 1.41, 0.58, 4.09, 3.69, 2.65, 2.62, 3.97, 3.44, 4.02);
 
 struct Hex { vec2 uv[3]; mat2 rot[3]; vec3 w; };
 Hex hexTile(vec2 uv) {
@@ -62,8 +67,51 @@ float fbmN(vec2 p, int octaves) {
     return s / norm;
 }
 
+// ---- shoreline field (tiles.rs water_field), stored after each tile's vertices
+const uint GRID = 33u;                          // tiles.rs GRID
+const uint NVERT = GRID * GRID + 4u * GRID;     // surface grid + skirts
+const uint FIELD = 64u;                         // tiles.rs FIELD
+
+// Tile coordinates (0..1) of vertex v: the surface grid, or for a skirt vertex its edge vertex
+// (tiles.rs index_buffer / build_tile order).
+vec2 vertUV(uint v) {
+    uint i, j;
+    if (v < GRID * GRID) {
+        i = v % GRID;
+        j = v / GRID;
+    } else {
+        uint s = v - GRID * GRID, side = s / GRID, k = s % GRID;
+        if (side == 0u) { i = k; j = 0u; }
+        else if (side == 1u) { i = GRID - 1u; j = k; }
+        else if (side == 2u) { i = GRID - 1u - k; j = GRID - 1u; }
+        else { i = 0u; j = GRID - 1u - k; }
+    }
+    return vec2(i, j) / float(GRID - 1u);
+}
+
+float fieldAt(Verts V, ivec2 c) {
+    c = clamp(c, ivec2(0), ivec2(int(FIELD) - 1));
+    uint idx = uint(c.y) * FIELD + uint(c.x);
+    uint word = floatBitsToUint(V.v[NVERT * 12u + 1u + idx / 4u]);
+    return float((word >> (8u * (idx % 4u))) & 255u);
+}
+
+// Signed distance to the shore (m; positive on land, negative in water), bilinear between the
+// field's cells so the shoreline is a smooth curve at any distance.
+float shoreDist(Verts V, vec2 uv) {
+    float cellM = V.v[NVERT * 12u];
+    vec2 f = uv * float(FIELD) - 0.5;
+    ivec2 c0 = ivec2(floor(f));
+    vec2 t = f - vec2(c0);
+    float a = mix(fieldAt(V, c0), fieldAt(V, c0 + ivec2(1, 0)), t.x);
+    float b = mix(fieldAt(V, c0 + ivec2(0, 1)), fieldAt(V, c0 + ivec2(1, 1)), t.x);
+    return (mix(a, b, t.y) - 128.0) / 8.0 * cellM;
+}
+
 // Ground albedo, ambient occlusion and normal from the land cover fractions.
-vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, out float ao) {
+// `bed` (0..1): the bottom of a lake, river or the sea; `shore`: the strip of land at the water.
+// `biome`: RESOLVE biome number (biomes.rs); `sea`: the water at the shore / over the bed is sea.
+vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, int biome, bool sea, out float ao) {
     float slope = 1.0 - max(dot(n, up), 0.0);
     float tree = A.x, shrub = A.y, grass = A.z, crop = A.w, built = B.x, bare = B.y, snow = B.z, wet = C.x, moss = C.y;
     vec2 q = uvm;
@@ -72,7 +120,8 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     float cliff = smoothstep(0.38, 0.55, slope + (nA - 0.5) * 0.15);
     float rockBare = bare * smoothstep(0.1, 0.3, slope + (nA - 0.5) * 0.2);
     float high = smoothstep(1900.0, 2600.0, elev);
-    float w[12];
+    float w[LAYERS];
+    for (int l = 12; l < LAYERS; ++l) w[l] = 0.0;
     w[0] = tree * 0.75 + shrub * 0.3;                                             // forest floor
     w[1] = tree * 0.25 + grass * (0.35 - 0.2 * high) + shrub * 0.3 + wet * 0.2;   // mossy grass
     w[2] = grass * (0.65 - 0.3 * high) + crop * 0.45;                             // grass
@@ -89,10 +138,62 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[10] = 0.0;
     w[11] = wet * 0.8;                                                            // wet grass
     for (int l = 0; l < 12; ++l) if (l != 4 && l != 5 && l != 6) w[l] *= 1.0 - cliff;
+    // ---- the biome's own surfaces (biomes.rs numbers; layers 12-25, catalog.rs GROUND_LAYERS)
+    float soil = 1.0 - cliff;
+    // cropland: ploughed fields between the crops
+    w[22] = crop * 0.35 * soil;
+    w[2] = max(w[2] - crop * 0.2, 0.0);
+    w[3] = max(w[3] - crop * 0.15, 0.0);
+    // forest floor: moss under boreal and mountain conifers, red soil in the tropics
+    float conifer = biome == 6 ? 0.7 : biome == 5 ? 0.4 : 0.0;
+    w[18] = w[0] * conifer;
+    float tropic = (biome == 1 || biome == 2 || biome == 3 || biome == 14) ? 0.5 : 0.0;
+    w[15] = w[0] * tropic;
+    w[0] *= 1.0 - conifer - tropic;
+    // grass: dry savanna grass and red soil, steppe soil, dry Mediterranean and desert grass
+    float savanna = biome == 7 ? 0.7 : biome == 12 ? 0.5 : biome == 13 ? 0.6 : 0.0;
+    float steppe = biome == 8 ? 0.45 : biome == 13 ? 0.3 : 0.0;
+    float g = w[1] + w[2] + w[3];
+    w[25] = g * savanna;
+    w[24] = g * steppe;
+    w[15] += biome == 7 ? g * 0.15 : 0.0;
+    float keep = max(1.0 - savanna - steppe - (biome == 7 ? 0.15 : 0.0), 0.0);
+    w[1] *= keep; w[2] *= keep; w[3] *= keep;
+    // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
+    // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
+    float bareFlat = w[7];
+    float desert = biome == 13 ? 1.0 : 0.0;
+    float hot = (biome == 1 || biome == 2 || biome == 7) ? 1.0 : 0.0;
+    float med = biome == 12 ? 1.0 : 0.0;
+    float arctic = biome == 11 ? 1.0 : 0.0;
+    w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
+    w[14] = bareFlat * (desert * (0.45 - 0.3 * nB) + hot * 0.4 + med * 0.8);
+    w[15] += bareFlat * hot * 0.5;
+    w[16] = bareFlat * arctic * 0.55 + moss * arctic * 0.3;
+    w[17] = bareFlat * arctic * 0.35 + moss * (0.4 + 0.3 * arctic);
+    w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
+    w[8] *= 1.0 - 0.6 * arctic;
+    // wetlands and mangroves: mud
+    float marsh = (biome == 9 || biome == 14) ? 0.6 : 0.25;
+    w[20] = w[11] * marsh;
+    w[11] *= 1.0 - marsh;
+    // ice sheets and glaciers on gentle slopes; snow on steep ones
+    float sheet = snow * smoothstep(0.25, 0.1, slope);
+    w[19] = sheet * 0.8;
+    w[6] -= sheet * 0.8;
+    // under water: silt and moss on lake and river beds, sand under the sea, pebbles in the
+    // shallows; along the shore pebbles (lakes) or beach sand (sea)
+    for (int l = 0; l < LAYERS; ++l) w[l] *= (1.0 - bed) * (1.0 - shore);
+    if (sea) {
+        w[12] += bed + shore;                                                     // sand
+    } else {
+        w[9] += bed * (0.45 + 0.4 * nA);                                          // riverbed
+        w[10] += bed * (0.55 - 0.4 * nA) + shore;                                 // pebbles
+    }
     // the three strongest layers
     int L[3] = int[3](0, 0, 0);
     float W[3] = float[3](-1.0, -1.0, -1.0);
-    for (int l = 0; l < 12; ++l) {
+    for (int l = 0; l < LAYERS; ++l) {
         float v = w[l];
         if (v > W[0]) { W[2] = W[1]; L[2] = L[1]; W[1] = W[0]; L[1] = L[0]; W[0] = v; L[0] = l; }
         else if (v > W[1]) { W[2] = W[1]; L[2] = L[1]; W[1] = v; L[1] = l; }
@@ -174,8 +275,11 @@ void main() {
     float elev = 0.0;
     vec4 A = vec4(0.0), B = vec4(0.0), C = vec4(0.0);
     vec2 uvm = vec2(0.0);
+    float bw = -1.0, biomeF = 0.0;
     for (int c = 0; c < 3; ++c) {
         uint b = tri[c] * 12u;
+        // the biome is a category: the nearest vertex's, not a blend
+        if (w[c] > bw) { bw = w[c]; biomeF = unpackUnorm4x8(floatBitsToUint(V.v[b + 9u])).w * 255.0; }
         n += vec3(V.v[b + 3u], V.v[b + 4u], V.v[b + 5u]) * w[c];
         elev += V.v[b + 6u] * w[c];
         A += unpackUnorm4x8(floatBitsToUint(V.v[b + 7u])) * w[c];
@@ -183,6 +287,8 @@ void main() {
         C += unpackUnorm4x8(floatBitsToUint(V.v[b + 9u])) * w[c];
         uvm += vec2(V.v[b + 10u], V.v[b + 11u]) * w[c];
     }
+    vec2 tuv = vertUV(tri.x) * w.x + vertUV(tri.y) * w.y + vertUV(tri.z) * w.z;
+    float sd = shoreDist(V, tuv);
     // tile-local (Earth axes) -> world (the camera frame: the instance rotates)
     n = normalize(mat3(gl_ObjectToWorldEXT) * n);
     float t = gl_HitTEXT;
@@ -195,8 +301,8 @@ void main() {
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
     float lat = degrees(asin(clamp(upE.z, -1.0, 1.0)));
     bool cover = C.z > 0.5;
-    bool water = cover ? B.w > 0.5 : elev < 0.0;
-    bool lake = cover && water && elev > 0.5;
+    bool water = sd < 0.0;
+    bool lake = water && elev > 0.5; // a water surface above sea level
     // Where the tile mesh is coarser than the data (far away), coastline and relief come from the
     // elevation grid per pixel instead (geometry cells ~ t / 160 m, see tiles.rs SPLIT_K).
     float footprint = t * gg.misc.x;
@@ -221,11 +327,27 @@ void main() {
     }
     float ao = 1.0;
     vec3 alb;
+    // Water depth: the bed shelves off the shore, then (sea) the sea floor from ETOPO. The field
+    // only reaches +-16 cells (38 m on the finest tiles), so the shelf reaches full visual depth
+    // within that: tiles of every size agree, no seams. main.rgen shades the water over this bed.
+    float depth = 0.0;
+    if (water) {
+        float d = -sd;
+        float floorE = max(-elevAt(elevUV(upE), 0.0), 0.0);
+        depth = lake ? min(d * 0.45, 18.0) : max(min(d * 0.3, 12.0), floorE * smoothstep(20.0, 36.0, d));
+        depth = max(depth, 0.02);
+    }
+    // the strip along the water: pebbles, and wet (darker) right at the waterline
+    float band = max(2.5, footprint * 1.5);
+    float shore = water ? 0.0 : smoothstep(band, 0.0, sd);
+    int biome = int(biomeF + 0.5);
+    bool seaSide = elev < 4.0; // the water at this shore / over this bed is the sea
     if (water) {
         n = up;
-        alb = lake ? vec3(0.012, 0.03, 0.032) : mix(vec3(0.02, 0.06, 0.07), vec3(0.004, 0.014, 0.03), smoothstep(10.0, 300.0, -elev));
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
     } else if (cover) {
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, ao);
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
+        alb *= mix(1.0, 0.55, smoothstep(1.2, 0.0, sd)); // wet
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
     }
@@ -252,10 +374,10 @@ void main() {
     pl.t = t;
     pl.n = n;
     pl.ng = ng;
-    pl.flags = MAT_TERRAIN | (water ? FLAG_WATER : 0u);
+    pl.flags = MAT_TERRAIN | (water ? FLAG_WATER : 0u) | (water && !lake ? FLAG_SEA : 0u);
     pl.ao = ao;
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
-    pl.wdepth = 0.0;
+    pl.wdepth = depth;
 }

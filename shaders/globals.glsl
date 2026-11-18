@@ -17,6 +17,8 @@ struct Globals {
     vec4 prevFwd;
     vec4 extra;     // x aerial perspective strength (1 = clear day, 0 = off), y grown forest radius (m)
     vec4 planet;    // globe mode: xyz planet centre relative to the camera (camera frame), w = 1; else 0
+    vec4 moon;      // globe mode: xyz direction to the moon (camera frame), w = angular radius (rad)
+    vec4 sunTrue;   // globe mode: xyz direction to the sun; w = pre-exposure (eye adaptation, 1 by day; 1 outside globe mode)
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).

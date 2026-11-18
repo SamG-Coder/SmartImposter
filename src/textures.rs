@@ -277,5 +277,8 @@ pub fn load_ground(gpu: &Gpu, ground: &[Option<crate::catalog::GroundMaterial>])
                 .join(", ")
         );
     }
-    Ok(load_jobs(gpu, &jobs, tex_max())?.0)
+    // Ground scans repeat every ~2 m: 1024 texels is ~2 mm each, plenty from standing height, and
+    // 26 layers x 3 maps stay ~0.45 GB instead of ~1.7 GB (SI_GROUND_TEX_MAX to change it).
+    let max = std::env::var("SI_GROUND_TEX_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024).min(tex_max());
+    Ok(load_jobs(gpu, &jobs, max)?.0)
 }

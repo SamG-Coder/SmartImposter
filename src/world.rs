@@ -805,10 +805,19 @@ impl World {
                 .iter()
                 .flat_map(|v| v.iter().copied())
                 .collect();
-        let other_trees: Vec<usize> = (0..trees.len()).filter(|v| !known.contains(v) && cat.variants[*v].kind == Kind::Tree).collect();
-        let other_small: Vec<usize> =
-            (0..trees.len()).filter(|v| !known.contains(v) && matches!(cat.variants[*v].kind, Kind::Shrub | Kind::Plant)).collect();
-        let other_grass: Vec<usize> = (0..trees.len()).filter(|v| !known.contains(v) && cat.variants[*v].kind == Kind::Grass).collect();
+        // The catalog also holds the globe's species for other biomes (globe/forest.rs picks them by
+        // biome); this Alpine scene grows only its own. A single-species run (--species) is the
+        // exception: whatever was asked for grows.
+        let single = std::env::args().any(|a| a == "--species");
+        let other = |want: &dyn Fn(Kind) -> bool| -> Vec<usize> {
+            if !single {
+                return Vec::new();
+            }
+            (0..trees.len()).filter(|v| !known.contains(v) && want(cat.variants[*v].kind)).collect()
+        };
+        let other_trees = other(&|k| k == Kind::Tree);
+        let other_small = other(&|k| matches!(k, Kind::Shrub | Kind::Plant));
+        let other_grass = other(&|k| k == Kind::Grass);
 
         // ---- canopy: seed-dispersal growth
         let t1 = std::time::Instant::now();

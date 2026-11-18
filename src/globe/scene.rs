@@ -39,10 +39,10 @@ pub struct GlobeGlobals {
 }
 
 const CACHE_TILES: usize = 14_000;
-const UPLOADS_PER_FRAME: usize = 160;
-const TREE_UPLOADS_PER_FRAME: usize = 192;
+const UPLOADS_PER_FRAME: usize = 64;
+const TREE_UPLOADS_PER_FRAME: usize = 96;
 /// Trees uploaded per frame at most (BLAS builds on the GPU, recorded in the frame).
-const TREES_PER_FRAME: usize = 200_000;
+const TREES_PER_FRAME: usize = 80_000;
 /// Per-frame staging (host -> device copies) and BLAS build scratch.
 const STAGING: u64 = 48 << 20;
 /// Prefetch along the motion: look this many frames ahead (at most MAX_LEAD m; below MIN_LEAD m
@@ -168,6 +168,10 @@ enum Op {
 /// Work queues (0 terrain tiles, 1 tree tiles), served by one pool of workers.
 type Queue = Arc<(Mutex<[VecDeque<TileId>; 2]>, Condvar)>;
 
+/// Tree workers split: [trees, understory] x (ns, tiles).
+static UNDER: [[std::sync::atomic::AtomicU64; 2]; 2] =
+    [[std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)], [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]];
+
 /// Worker time (ns) and tiles made: terrain, trees.
 static WORK: [[std::sync::atomic::AtomicU64; 2]; 2] =
     [[std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)], [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]];
@@ -273,6 +277,32 @@ pub fn frame_at(pos: DVec3) -> DMat3 {
     DMat3::from_cols(east, up, -north).transpose()
 }
 
+/// Carry a camera frame (rows east, up, south as frame_at) from wherever it was to `to` (ECEF)
+/// without turning it: the horizontal axes are projected onto the new tangent plane (parallel
+/// transport). Unlike frame_at, which is tied to north, this keeps a straight flight straight
+/// over the poles and never spins near them.
+pub fn transport(frame: DMat3, to: DVec3) -> DMat3 {
+    let up = to.normalize();
+    let east0 = frame.row(0);
+    let mut east = east0 - up * east0.dot(up);
+    if east.length_squared() < 1e-12 {
+        // the old east points straight up (a 90 degree jump): fall back to the old south
+        let s0 = frame.row(2);
+        east = up.cross(s0 - up * s0.dot(up));
+    }
+    let east = east.normalize();
+    let south = east.cross(up);
+    DMat3::from_cols(east, up, south).transpose()
+}
+
+/// Heading of a camera-frame direction in degrees from north (clockwise), as `--at` takes it.
+pub fn heading(frame: DMat3, dir: DVec3) -> f64 {
+    let d = frame.transpose() * dir; // Earth axes
+    let n = frame_at(frame.row(1)); // north-tied frame at the same place
+    let l = n * d;
+    l.x.atan2(-l.z).to_degrees().rem_euclid(360.0)
+}
+
 pub struct GlobeScene {
     pub terrain: Arc<Terrain>,
     tiles: HashMap<TileId, TileGpu>,
@@ -353,10 +383,11 @@ impl GlobeScene {
         let nverts = (tiles::GRID * tiles::GRID + 4 * tiles::GRID) as u32;
         let sample = terrain_geometry(0, idx.addr, nverts);
         let (blas_size, terrain_scratch) = accel::blas_sizes(gpu, &sample, tri_count);
-        let mut pool = TilePool::new((nverts as usize * VSTRIDE * 4) as u64, blas_size, (CACHE_TILES + 512) as u32);
+        // a slot: the tile's vertices, then its shoreline field (tiles.rs TILE_FLOATS)
+        let mut pool = TilePool::new((tiles::TILE_FLOATS * 4) as u64, blas_size, (CACHE_TILES + 512) as u32);
         // a typical view keeps 5-9k tiles: allocate the first chunks now, not mid-flight
         let mut first = Vec::new();
-        for _ in 0..8 * POOL_CHUNK {
+        for _ in 0..12 * POOL_CHUNK {
             first.extend(pool.alloc(gpu)?);
         }
         pool.free.extend(first.into_iter().rev());
@@ -388,11 +419,12 @@ impl GlobeScene {
             (done_tx, tree_tx),
             move |id| tiles::build_tile(id, &et),
             move |id| {
-                if id.level == forest::UNDER_LEVEL {
-                    forest::grow_understory(id, &et2, &sp)
-                } else {
-                    forest::grow_tile(id, &et2, &sp, &roles)
-                }
+                let t = std::time::Instant::now();
+                let under = id.level == forest::UNDER_LEVEL;
+                let out = if under { forest::grow_understory(id, &et2, &sp) } else { forest::grow_tile(id, &et2, &sp, &roles) };
+                UNDER[under as usize][0].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                UNDER[under as usize][1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                out
             },
         );
 
@@ -865,12 +897,22 @@ impl GlobeScene {
             let w = |k: usize, i: usize| WORK[k][i].load(std::sync::atomic::Ordering::Relaxed) as f64;
             format!(
                 "
-globe workers: {} terrain tiles at {:.2} ms, {} tree tiles at {:.2} ms (thread time each)",
+globe workers: {} terrain tiles at {:.2} ms ({:.2} ms shoreline field), {} tree tiles at {:.2} ms (thread time each)",
                 w(0, 1),
                 w(0, 0) / w(0, 1).max(1.0) / 1e6,
+                tiles::FIELD_NS.load(std::sync::atomic::Ordering::Relaxed) as f64 / w(0, 1).max(1.0) / 1e6,
                 w(1, 1),
                 w(1, 0) / w(1, 1).max(1.0) / 1e6
-            )
+            ) + &{
+                let u = |k: usize, i: usize| UNDER[k][i].load(std::sync::atomic::Ordering::Relaxed) as f64;
+                format!(
+                    " [{} tree tiles at {:.2} ms, {} understory tiles at {:.2} ms]",
+                    u(0, 1),
+                    u(0, 0) / u(0, 1).max(1.0) / 1e6,
+                    u(1, 1),
+                    u(1, 0) / u(1, 1).max(1.0) / 1e6
+                )
+            }
         }
     }
 }

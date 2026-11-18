@@ -21,6 +21,15 @@ pub const SPLIT_K: f64 = 5.0;
 /// tree shrub grass crop | built bare snow water | wetland moss has-data -), texture
 /// coordinates in metres (2).
 pub const VSTRIDE: usize = 12;
+/// Shoreline field after each tile's vertices: one float (cell size, m), then FIELD x FIELD bytes
+/// of signed distance to the shore (globe.rchit: water where it is negative; mirrored there).
+pub const FIELD: usize = 64;
+/// Field cells around the tile that are sampled too, so the distances agree across tile edges.
+const APRON: usize = 12;
+/// Field encoding: byte = 128 + distance in cells x FIELD_SCALE (so +-16 cells).
+const FIELD_SCALE: f64 = 8.0;
+/// Floats per tile in the vertex buffer: vertices, then the field.
+pub const TILE_FLOATS: usize = (GRID * GRID + 4 * GRID) * VSTRIDE + 1 + FIELD * FIELD / 4;
 /// Texture coordinates repeat every TEX_PERIOD metres (a multiple of every texture repeat).
 pub const TEX_PERIOD: f64 = 131_072.0;
 
@@ -112,6 +121,99 @@ pub fn max_level(id: TileId, terrain: &Terrain) -> u8 {
     }
 }
 
+/// Squared distance transform of one row (Felzenszwalb & Huttenlocher): d[q] = min_p (q - p)^2 + f[p].
+fn edt(f: &mut [f64], tmp: &mut [f64]) {
+    let n = f.len();
+    let (mut v, mut z) = (vec![0usize; n], vec![0f64; n + 1]);
+    let mut k = 0usize;
+    z[0] = f64::NEG_INFINITY;
+    z[1] = f64::INFINITY;
+    let sect = |q: usize, p: usize, f: &[f64]| ((f[q] + (q * q) as f64) - (f[p] + (p * p) as f64)) / (2.0 * (q as f64 - p as f64));
+    for q in 1..n {
+        let mut s = sect(q, v[k], f);
+        while s <= z[k] {
+            k -= 1;
+            s = sect(q, v[k], f);
+        }
+        k += 1;
+        v[k] = q;
+        z[k] = s;
+        z[k + 1] = f64::INFINITY;
+    }
+    k = 0;
+    for q in 0..n {
+        while z[k + 1] < q as f64 {
+            k += 1;
+        }
+        tmp[q] = (q as f64 - v[k] as f64).powi(2) + f[v[k]];
+    }
+    f.copy_from_slice(&tmp[..n]);
+}
+
+/// The shoreline field of a tile: signed distance (cells; + land, - water) from the land cover
+/// (ESA WorldCover permanent water), or where there is none, from ETOPO (below sea level =
+/// sea). Exact Euclidean distance between the cell centres of the other kind, minus half a cell,
+/// so the zero line runs between land and water cells and bilinear filtering draws it smooth.
+fn water_field(id: TileId, terrain: &Terrain) -> (f32, Vec<u8>) {
+    let (u0, v0, s) = id.uv();
+    let m = FIELD + 2 * APRON;
+    let step = s / FIELD as f64;
+    let cell_m = id.edge() / FIELD as f64;
+    let mut wet = vec![false; m * m];
+    for b in 0..m {
+        for a in 0..m {
+            let d = face_dir(id.face, u0 + (a as f64 - APRON as f64 + 0.5) * step, v0 + (b as f64 - APRON as f64 + 0.5) * step);
+            let (lat, lon) = lat_lon(d);
+            wet[b * m + a] = match terrain.cover.water_at(lat, lon, cell_m) {
+                Some(w) => w,
+                None => terrain.etopo.height(lat, lon) < 0.0,
+            };
+        }
+    }
+    let any_wet = wet.iter().any(|w| *w);
+    let any_dry = wet.iter().any(|w| !*w);
+    let mut out = vec![0u8; FIELD * FIELD];
+    if !(any_wet && any_dry) {
+        // all land or all water: saturated
+        out.fill(if any_wet { 0 } else { 255 });
+        return (cell_m as f32, out);
+    }
+    // squared distance to the nearest cell of the other kind (Felzenszwalb's 1D transforms, once
+    // per kind): exact Euclidean on the grid
+    let dist = |target: bool| -> Vec<f64> {
+        let inf = 1e12;
+        let mut f: Vec<f64> = wet.iter().map(|w| if *w == target { 0.0 } else { inf }).collect();
+        let mut tmp = vec![0.0; m];
+        for y in 0..m {
+            edt(&mut f[y * m..(y + 1) * m], &mut tmp);
+        }
+        let mut col = vec![0.0; m];
+        for x in 0..m {
+            for y in 0..m {
+                col[y] = f[y * m + x];
+            }
+            edt(&mut col, &mut tmp);
+            for y in 0..m {
+                f[y * m + x] = col[y];
+            }
+        }
+        f
+    };
+    let to_water = dist(true);
+    let to_land = dist(false);
+    for y in 0..FIELD {
+        for x in 0..FIELD {
+            let c = (y + APRON) * m + x + APRON;
+            let sd = if wet[c] { -(to_land[c].sqrt() - 0.5) } else { to_water[c].sqrt() - 0.5 };
+            out[y * FIELD + x] = (128.0 + sd * FIELD_SCALE).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    (cell_m as f32, out)
+}
+
+/// Time spent on shoreline fields (ns), for the benchmark's worker line.
+pub static FIELD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub struct TileMesh {
     pub id: TileId,
     pub center: DVec3,
@@ -133,7 +235,7 @@ pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
         for i in 0..m {
             let d = face_dir(id.face, u0 + (i as f64 - 1.0) * step, v0 + (j as f64 - 1.0) * step);
             let (lat, lon) = lat_lon(d);
-            let e = terrain.height(lat, lon);
+            let e = terrain.height_at(lat, lon, id.edge() / (n - 1) as f64);
             elev[j * m + i] = e;
             pos[j * m + i] = d * (R_EARTH + e.max(0.0) as f64);
         }
@@ -148,7 +250,9 @@ pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
             let c = j * m + i;
             let (lat, lon) = lat_lon(pos[c]);
             if let Some(f) = terrain.cover.fractions(lat, lon, cell) {
-                cover[c] = [pack(&f[0..4]), pack(&f[4..8]), pack(&[f[8], f[9], 1.0, 0.0])];
+                // the last byte: the biome number (biomes.rs), picks the ground scans (globe.rchit)
+                let biome = terrain.biome(lat, lon) as f32 / 255.0;
+                cover[c] = [pack(&f[0..4]), pack(&f[4..8]), pack(&[f[8], f[9], 1.0, biome])];
             }
         }
     }
@@ -207,6 +311,13 @@ pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
             push(&mut verts, p, normals[j * n + i], elev[c], cover[c], tex(i, j));
         }
     }
+    // the shoreline field (globe.rchit reads it after the vertices)
+    let tf = std::time::Instant::now();
+    let (cell_m, field) = water_field(id, terrain);
+    FIELD_NS.fetch_add(tf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    verts.push(cell_m);
+    verts.extend(field.chunks_exact(4).map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
+    debug_assert_eq!(verts.len(), TILE_FLOATS);
     TileMesh { id, center, verts }
 }
 

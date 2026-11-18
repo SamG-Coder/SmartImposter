@@ -322,7 +322,7 @@ void main() {
     if (mat == MAT_TERRAIN) {
         vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
         float spread = g.camFwd.w;
-        uint layerMask = uint(g.lodParams.w); // scanned ground layers present (bit per layer)
+        uint layerMask = floatBitsToUint(g.lodParams.w); // scanned ground layers present (bit per layer)
         // Water data from the terrain mesh UVs (world.rs): x = water depth over the bed (m), y = bank
         // proximity.
         Vec2Ref RV = Vec2Ref(m.uv);

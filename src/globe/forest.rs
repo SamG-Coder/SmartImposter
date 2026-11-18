@@ -45,6 +45,35 @@ pub struct Species {
     pub ferns: Vec<usize>,
     pub heath: Vec<usize>,
     pub shrubs: Vec<usize>,
+    /// per variant: the biomes it grows in (bit = biomes.rs number; bit 0 = no biome data)
+    pub biomes: Vec<u16>,
+}
+
+/// Biomes an understory species belongs to (bit per biomes.rs number), by catalog name: desert
+/// shrubs stay out of the Alps, bilberry and anemone in temperate and boreal forests. Unknown
+/// names grow everywhere.
+pub fn understory_biomes(name: &str) -> u16 {
+    let bits = |b: &[u8]| b.iter().fold(1u16, |m, x| m | 1 << x);
+    let n = name.to_ascii_lowercase();
+    if n.contains("greasewood") {
+        bits(&[7, 8, 12, 13])
+    } else if n.contains("bilberry") || n.contains("lingonberry") {
+        bits(&[4, 5, 6, 10, 11])
+    } else if n.contains("anemone") || n.contains("spindle") {
+        bits(&[4, 5])
+    } else if n.contains("heather") {
+        bits(&[4, 5, 6, 8, 10, 11])
+    } else if n.contains("huckleberry") {
+        bits(&[4, 5, 12])
+    } else if n.contains("bracken") || n.contains("fern") {
+        bits(&[1, 2, 3, 4, 5, 6])
+    } else if n.contains("cotton") {
+        bits(&[5, 6, 9, 10, 11])
+    } else if n.contains("dry_grass") || n.contains("dry grass") {
+        bits(&[7, 8, 10, 12, 13])
+    } else {
+        u16::MAX
+    }
 }
 
 /// Understory tiles: this quadtree level (~76 m), within UNDER_RADIUS of the camera.
@@ -119,7 +148,13 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 if list.is_empty() || r_keep > p {
                     continue;
                 }
-                let vid = list[((r_pick * 7.31).fract() * list.len() as f64) as usize % list.len()];
+                // only what belongs in this biome
+                let bit = 1u16 << terrain.biome(lat, lon).min(15);
+                let ok: Vec<usize> = list.iter().copied().filter(|v| sp.biomes.get(*v).is_none_or(|m| m & bit != 0)).collect();
+                if ok.is_empty() {
+                    continue;
+                }
+                let vid = ok[((r_pick * 7.31).fract() * ok.len() as f64) as usize % ok.len()];
                 let info = &sp.infos[vid];
                 let h = terrain.height(lat, lon).max(0.0) as f64;
                 let up = d;
@@ -184,6 +219,34 @@ pub struct TreeTile {
     pub aabbs: Vec<[f32; 6]>,
 }
 
+/// How strongly the species fields concentrate a species (e^(+-CONTRAST/2) around its mean share).
+const CONTRAST: f64 = 4.0;
+
+/// Smooth value noise in 3D (Earth-fixed metres / scale), in [0, 1].
+fn vnoise3(p: DVec3) -> f64 {
+    let c = p.floor();
+    let f = p - c;
+    let u = f * f * (DVec3::splat(3.0) - 2.0 * f);
+    let h = |x: f64, y: f64, z: f64| {
+        let k = hash(((c.x + x) as i64 as u64).wrapping_mul(0x9E37) ^ ((c.y + y) as i64 as u64).wrapping_mul(0x85EB_CA6B) ^ ((c.z + z) as i64 as u64).wrapping_mul(0xC2B2_AE35));
+        (k >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let lerp = |a: f64, b: f64, t: f64| a + (b - a) * t;
+    let x00 = lerp(h(0.0, 0.0, 0.0), h(1.0, 0.0, 0.0), u.x);
+    let x10 = lerp(h(0.0, 1.0, 0.0), h(1.0, 1.0, 0.0), u.x);
+    let x01 = lerp(h(0.0, 0.0, 1.0), h(1.0, 0.0, 1.0), u.x);
+    let x11 = lerp(h(0.0, 1.0, 1.0), h(1.0, 1.0, 1.0), u.x);
+    lerp(lerp(x00, x10, u.y), lerp(x01, x11, u.y), u.z)
+}
+
+/// A smooth field (0..1) for `seed` at a point (ECEF, m) with local vertical `up` and altitude
+/// `alt`: ~260 m across horizontally but ~70 m vertically, so its highs and lows run as bands
+/// along the contours of a slope, not as blobs.
+fn contour_field(p: DVec3, up: DVec3, alt: f64, seed: f64) -> f64 {
+    let q = p / 260.0 + up * (alt * (1.0 / 70.0 - 1.0 / 260.0)) + DVec3::new(seed * 31.7, seed * 17.3, seed * 7.9);
+    0.65 * vnoise3(q) + 0.35 * vnoise3(q * 2.3 + DVec3::splat(5.1))
+}
+
 fn hash(a: u64) -> u64 {
     let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 31;
@@ -199,27 +262,92 @@ impl Rng {
     }
 }
 
-/// Which species groups the catalog has: indices into `Species::species` by role.
+/// Trees of each biome (biomes.rs numbers; index 0: no biome data), as catalog species names
+/// (substrings) with weights. Species not downloaded are skipped, so a new Quixel species grows
+/// where it belongs as soon as it is in the catalog; where none of a biome's are present, the
+/// temperate list stands in. Stand-ins for species Quixel has no scan of follow docs/EARTH_PLAN.md
+/// section 5 (e.g. birch for eucalyptus, oak for acacia and teak, poplar crowns for rainforest).
+const BIOME_TREES: [&[(&str, f32)]; 15] = [
+    /* 0 none     */ &[("Silver_Birch", 0.5), ("Norway_Spruce", 0.5)],
+    /* 1 tropical moist */ &[("Black_Poplar", 0.3), ("Giant_Bamboo", 0.2), ("Alexandra_Palm", 0.12), ("Tropical_Palm", 0.08), ("European_Hornbeam", 0.15), ("English_Oak", 0.15)],
+    /* 2 tropical dry   */ &[("English_Oak", 0.4), ("European_Hornbeam", 0.25), ("Giant_Bamboo", 0.15), ("Baltic_Pine", 0.1), ("Tropical_Palm", 0.1)],
+    /* 3 tropical conifer */ &[("Baltic_Pine", 0.6), ("English_Oak", 0.4)],
+    /* 4 temperate broadleaf */ &[("European_Beech", 0.3), ("English_Oak", 0.22), ("Norway_Maple", 0.1), ("European_Hornbeam", 0.06), ("Silver_Birch", 0.08), ("European_Aspen", 0.07), ("Common_Hazel", 0.07), ("Rowan", 0.04), ("Norway_Spruce", 0.04), ("Elder", 0.02)],
+    /* 5 temperate conifer */ &[("Norway_Spruce", 0.4), ("Baltic_Pine", 0.2), ("European_Beech", 0.16), ("Silver_Birch", 0.06), ("European_Aspen", 0.06), ("Rowan", 0.05), ("Norway_Maple", 0.04), ("Dead_Pine", 0.03)],
+    /* 6 boreal   */ &[("Norway_Spruce", 0.38), ("Baltic_Pine", 0.3), ("Silver_Birch", 0.2), ("European_Aspen", 0.08), ("Rowan", 0.02), ("Dead_Pine", 0.02)],
+    /* 7 savanna  */ &[("English_Oak", 0.45), ("Silver_Birch", 0.2), ("Aleppo_Pine", 0.15), ("Tropical_Palm", 0.1), ("Giant_Bamboo", 0.1)],
+    /* 8 temperate grassland */ &[("English_Oak", 0.4), ("Black_Poplar", 0.25), ("Goat_Willow", 0.2), ("Silver_Birch", 0.15)],
+    /* 9 flooded  */ &[("Goat_Willow", 0.45), ("Black_Alder", 0.3), ("Black_Poplar", 0.25)],
+    /* 10 montane */ &[("Baltic_Pine", 0.45), ("Norway_Spruce", 0.3), ("Silver_Birch", 0.15), ("Rowan", 0.1)],
+    /* 11 tundra  */ &[("Silver_Birch", 0.5), ("Goat_Willow", 0.3), ("Baltic_Pine", 0.2)],
+    /* 12 Mediterranean */ &[("Aleppo_Pine", 0.5), ("English_Oak", 0.35), ("Baltic_Pine", 0.15)],
+    /* 13 desert  */ &[("Tropical_Palm", 0.5), ("Aleppo_Pine", 0.3), ("Goat_Willow", 0.2)],
+    /* 14 mangroves */ &[("Goat_Willow", 0.5), ("Black_Alder", 0.5)],
+];
+/// Wet ground (water nearby) favours these, in any biome where they are not out of place.
+const WET_TREES: &[(&str, f32)] = &[("Black_Alder", 2.5), ("Goat_Willow", 1.5), ("Black_Poplar", 0.8)];
+/// Conifers: they take over with altitude in the temperate and montane biomes (4, 5, 10).
+const CONIFERS: &[&str] = &["Spruce", "Pine"];
+
+/// The catalog species of each biome (indices into `Species::species`, weights, conifer?).
 pub struct Roles {
-    beech: Option<usize>,
-    alder: Option<usize>,
-    poplar: Option<usize>,
-    aspen: Option<usize>,
-    hazel: Option<usize>,
-    any: Vec<usize>,
+    biome: Vec<Vec<(usize, f32, bool)>>,
+    wet: Vec<(usize, f32)>,
 }
 
 impl Roles {
     pub fn new(im: &Species) -> Self {
-        let find = |k: &str| im.species.iter().position(|s| s.0.contains(k));
-        Roles {
-            beech: find("Beech"),
-            alder: find("Alder"),
-            poplar: find("Poplar"),
-            aspen: find("Aspen"),
-            hazel: find("Hazel"),
-            any: (0..im.species.len()).collect(),
+        let find = |k: &str| im.species.iter().position(|s| s.0.contains(k) && !s.1.is_empty());
+        let resolve = |list: &[(&str, f32)]| -> Vec<(usize, f32, bool)> {
+            list.iter().filter_map(|(n, w)| find(n).map(|i| (i, *w, CONIFERS.iter().any(|c| n.contains(c))))).collect()
+        };
+        let mut biome: Vec<Vec<(usize, f32, bool)>> = BIOME_TREES.iter().map(|l| resolve(l)).collect();
+        let temperate = biome[4].clone();
+        let any: Vec<(usize, f32, bool)> = (0..im.species.len()).filter(|i| !im.species[*i].1.is_empty()).map(|i| (i, 1.0, false)).collect();
+        for b in biome.iter_mut() {
+            if b.is_empty() {
+                *b = if temperate.is_empty() { any.clone() } else { temperate.clone() };
+            }
         }
+        let wet = WET_TREES.iter().filter_map(|(n, w)| find(n).map(|i| (i, *w))).collect();
+        Roles { biome, wet }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.biome.iter().all(|b| b.is_empty())
+    }
+
+    /// A species for a tree at this site: the biome's mix, conifers higher up in the temperate
+    /// and montane biomes, alders / willows / poplars on wet ground. `r` in [0, 1).
+    fn pick(&self, biome: u8, alt: f32, wet: f32, cool: f32, field: &dyn Fn(usize) -> f32, r: f32) -> Option<usize> {
+        let list = self.biome.get(biome as usize).unwrap_or(&self.biome[0]);
+        let lowland = 1.0 - ((alt - 800.0) / 700.0).clamp(0.0, 1.0);
+        let mountains = matches!(biome, 4 | 5 | 10);
+        let mut w: Vec<(usize, f32)> = list
+            .iter()
+            .map(|&(i, wt, conifer)| {
+                let alt_k = if !mountains { 1.0 } else if conifer { 0.35 + 0.65 * (1.0 - lowland) } else { 0.3 + 0.7 * lowland };
+                let aspect = if conifer { 1.0 + 0.7 * cool } else { 1.0 - 0.4 * cool };
+                (i, wt * alt_k * aspect.max(0.1) * (1.0 - 0.6 * wet) * field(i))
+            })
+            .collect();
+        if wet > 0.0 && !matches!(biome, 13) {
+            for &(i, wt) in &self.wet {
+                w.push((i, wt * wet * if biome == 6 || biome == 11 { 0.5 } else { 1.0 } * field(i)));
+            }
+        }
+        let total: f32 = w.iter().map(|x| x.1).sum();
+        if total <= 0.0 {
+            return list.first().map(|x| x.0);
+        }
+        let mut acc = 0.0;
+        for (i, wt) in &w {
+            acc += wt / total;
+            if r <= acc {
+                return Some(*i);
+            }
+        }
+        w.last().map(|x| x.0)
     }
 }
 
@@ -229,7 +357,7 @@ impl Roles {
 pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> TreeTile {
     let center = id.center_dir() * R_EARTH;
     let mut tile = TreeTile { id, center, recs: Vec::new(), aabbs: Vec::new() };
-    if roles.any.is_empty() || terrain.cover.is_empty() {
+    if roles.is_empty() || terrain.cover.is_empty() {
         return tile;
     }
     let (u0, v0, s) = id.uv();
@@ -237,6 +365,35 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
     let spacing = SPACING * (1u64 << (TREE_LEVEL - id.level)) as f64;
     let n = (id.edge() / spacing).ceil() as usize;
     let mut rng = Rng(hash(((id.face as u64) << 56) ^ ((id.level as u64) << 48) ^ ((id.x as u64) << 24) ^ id.y as u64));
+    // The slope's facing (cool slopes favour conifers) from a coarse grid of heights over the
+    // tile: 17 x 17 samples instead of two extra 30 m lookups per tree.
+    const G: usize = 17;
+    let fine = id.level >= TREE_LEVEL - 1;
+    let gdir: Vec<DVec3> = (0..G * G).map(|k| face_dir(id.face, u0 + s * (k % G) as f64 / (G - 1) as f64, v0 + s * (k / G) as f64 / (G - 1) as f64)).collect();
+    let grid: Vec<f32> = gdir
+        .iter()
+        .map(|d| {
+            let (la, lo) = lat_lon(*d);
+            terrain.height_at(la, lo, spacing)
+        })
+        .collect();
+    let gstep = id.edge() / (G - 1) as f64;
+    // The species and age fields vary over 70-260 m: evaluated on the grid (per species, when a
+    // tree first asks for it) and interpolated per tree, not ~20 noise lookups for every tree.
+    let fields: std::cell::RefCell<Vec<Option<Vec<f32>>>> = std::cell::RefCell::new(vec![None; im.species.len() + 1]);
+    let field_at = |slot: usize, seed: f64, fu: f64, fv: f64| -> f32 {
+        let mut f = fields.borrow_mut();
+        let g = f[slot].get_or_insert_with(|| {
+            gdir.iter().zip(&grid).map(|(d, h)| contour_field(*d * (R_EARTH + *h as f64), *d, *h as f64, seed) as f32).collect()
+        });
+        let (x, y) = (fu * (G - 1) as f64, fv * (G - 1) as f64);
+        let (x0, y0) = ((x as usize).min(G - 2), (y as usize).min(G - 2));
+        let (tx, ty) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+        let at = |i: usize, j: usize| g[j * G + i];
+        let a = at(x0, y0) + (at(x0 + 1, y0) - at(x0, y0)) * tx;
+        let b = at(x0, y0 + 1) + (at(x0 + 1, y0 + 1) - at(x0, y0 + 1)) * tx;
+        a + (b - a) * ty
+    };
     for j in 0..n {
         for i in 0..n {
             let (fu, fv) = ((i as f64 + rng.f()) / n as f64, (j as f64 + rng.f()) / n as f64);
@@ -248,37 +405,41 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             if tree <= 0.0 || r_keep > tree as f64 * 0.95 {
                 continue;
             }
-            let h = terrain.height(lat, lon).max(0.0) as f64;
+            let h = terrain.height_at(lat, lon, spacing).max(0.0) as f64;
             // site: wet ground near water, altitude
             let wet = terrain.cover.fractions(lat, lon, 60.0).map(|g| g[super::landcover::WATER] + g[8]).unwrap_or(0.0);
             let alt = h as f32;
-            let r = rng.f() as f32;
-            let lowland = 1.0 - ((alt - 900.0) / 600.0).clamp(0.0, 1.0);
-            let mut w: Vec<(Option<usize>, f32)> = vec![
-                (roles.beech, 0.55 * (0.3 + 0.7 * lowland) * (1.0 - wet)),
-                (roles.aspen, 0.22 + 0.35 * (1.0 - lowland)),
-                (roles.alder, 0.05 + 2.5 * wet),
-                (roles.poplar, (0.06 + 0.8 * wet) * lowland),
-                (roles.hazel, 0.12 * lowland),
-            ];
-            w.retain(|x| x.0.is_some() && x.1 > 0.0);
-            let sp = if w.is_empty() {
-                roles.any[(r * roles.any.len() as f32) as usize % roles.any.len()]
+            // Where species grow: each has a smooth field that runs along the contours, so a
+            // species dominates bands of the slope and gives way gradually to its neighbours
+            // (stands merge at their edges); cooler slopes (facing the pole) and steep ones favour
+            // conifers. Each tree then draws from those shares.
+
+            let cool = if fine {
+                // the grid cell's gradient, in tile axes, turned to north: d(height) / d(north) < 0
+                // means the slope faces the pole (in the north; the sign flips in the south)
+                let (gx, gy) = (((fu * (G - 1) as f64) as usize).min(G - 2), ((fv * (G - 1) as f64) as usize).min(G - 2));
+                let at = |x: usize, y: usize| grid[y * G + x] as f64;
+                let du = (at(gx + 1, gy) + at(gx + 1, gy + 1) - at(gx, gy) - at(gx, gy + 1)) / (2.0 * gstep);
+                let dv = (at(gx, gy + 1) + at(gx + 1, gy + 1) - at(gx, gy) - at(gx + 1, gy)) / (2.0 * gstep);
+                let up = d;
+                let east = DVec3::Z.cross(up).normalize();
+                let north = up.cross(east);
+                let eu = (face_dir(id.face, u0 + (fu + 0.01) * s, v0 + fv * s) - d).normalize();
+                let ev = (face_dir(id.face, u0 + fu * s, v0 + (fv + 0.01) * s) - d).normalize();
+                // gradient vector on the ground from its components along the tile axes
+                let g = eu * du + ev * dv;
+                let dn = g.dot(north);
+                (-dn * 3.0 * lat.signum()).clamp(-1.0, 1.0) as f32
             } else {
-                let total: f32 = w.iter().map(|x| x.1).sum();
-                let mut acc = 0.0;
-                let mut pick = w[0].0.unwrap();
-                for (sp, wt) in &w {
-                    acc += wt / total;
-                    if r <= acc {
-                        pick = sp.unwrap();
-                        break;
-                    }
-                }
-                pick
+                0.0
             };
+            let field = |sp: usize| (CONTRAST as f32 * (field_at(sp, sp as f64, fu, fv) - 0.5)).exp();
+            let biome = terrain.biome(lat, lon);
+            let Some(sp) = roles.pick(biome, alt, wet, cool, &field, rng.f() as f32) else { continue };
             let vars = &im.species[sp].1;
-            let k = ((rng.f().powf(1.7) * vars.len() as f64) as usize).min(vars.len() - 1); // mostly mature
+            // variants run from old (large) to young: stands of an age, also as smooth bands
+            let age = (field_at(im.species.len(), 101.0, fu, fv) as f64 * 1.3 - 0.15 + (rng.f() - 0.5) * 0.35).clamp(0.0, 0.999);
+            let k = ((age.powf(1.7) * vars.len() as f64) as usize).min(vars.len() - 1); // mostly mature
             let vid = vars[k];
             let info = &im.infos[vid];
             // frame: up = local vertical, random yaw

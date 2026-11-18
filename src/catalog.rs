@@ -168,8 +168,8 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
 
 /// Ground layers in shader order (tri.rchit): Fab library folder name prefix of each Megascans
 /// surface (`<Name>-<first 8 hex digits of the Fab listing id>`).
-pub const GROUND_LAYERS: [&str; 12] = [
-    "Forest_Floor",
+pub const GROUND_LAYERS: [&str; 26] = [
+    "Forest_Floor-cf8af196",     // (a second Forest_Floor scan exists: pin this one)
     "Mossy_Grass",
     "Uncut_Grass",
     "Grass_Dried",
@@ -181,6 +181,21 @@ pub const GROUND_LAYERS: [&str; 12] = [
     "Mossy_Riverbed-ecca0e0f",   // https://www.fab.com/listings/ecca0e0f-0ae5-4f4c-8db0-49537d799253
     "Pebbles_Round-60ac923a",    // https://www.fab.com/listings/60ac923a-b915-40b0-92af-9748ba20c453
     "Wet_Grass_Ground-138dc11e", // https://www.fab.com/listings/138dc11e-bdbd-41cd-8c63-6e16846d0b72
+    // the globe's biomes (globe.rchit groundMaterial); the forest scene uses the first 12
+    "Beach_Sand",            // 12 sea coasts
+    "Sand-",                 // 13 dunes, sandy desert
+    "Arid_Soil_Ground",      // 14 dry desert and Mediterranean soil
+    "Soil_Clay",             // 15 tropical red soil
+    "Tundra_Rocky_Ground",   // 16 tundra
+    "Lichened_Rocky_Ground", // 17 tundra, boreal outcrops
+    "Mossy_Forest_Floor",    // 18 boreal forest floor
+    "Icelandic_Glacier",     // 19 glaciers and ice caps
+    "Soil_Mud",              // 20 wetlands, mangroves, tidal flats
+    "Salt_Covered_Mud",      // 21 salt pans
+    "Ploughed_Soil",         // 22 cropland
+    "Icelandic_Lava_Sand",   // 23 volcanic sand
+    "Sparse_Grassy_Soil",    // 24 steppe
+    "Dried_Grass-57a98bb5",  // 25 savanna, dry grassland
 ];
 
 /// Ground surfaces from the Fab library cache (Quixel scans exported as glTF with UE textures).

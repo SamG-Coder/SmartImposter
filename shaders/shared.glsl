@@ -10,9 +10,10 @@
 #define FLAG_IMPOSTOR_HI 512u
 #define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
+#define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
 #define MAX_VARIANTS 128 // atlas slots (one per plant variant)
-#define MAX_SPECIES 16
-#define MAX_GROUND_TEX 40 // 3 per ground layer (12 layers); the last two slots are the far / near masks
+#define MAX_SPECIES 32
+#define MAX_GROUND_TEX 80 // 3 per ground layer (26 layers); the last two slots are the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
 #define NEAR_HALF 2048.0
 #define TERRAIN_HALF 60000.0

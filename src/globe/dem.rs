@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Rows per tile (1 arc-second) at every latitude.
 const ROWS: i64 = 3600;
@@ -159,8 +159,10 @@ struct Slot {
 }
 
 thread_local! {
-    /// Each worker's last tile (weak: never keeps an evicted tile alive).
-    static LAST: std::cell::RefCell<((i32, i32), Weak<Tile>)> = const { std::cell::RefCell::new(((i32::MIN, 0), Weak::new())) };
+    /// Each worker's recent tiles, held and read in place: a sample touches no shared counter
+    /// (13 workers cloning one tile's Arc per sample made the cache line bounce between cores).
+    static LAST: std::cell::RefCell<([((i32, i32), Option<Arc<Tile>>); 4], usize)> =
+        std::cell::RefCell::new((std::array::from_fn(|_| ((i32::MIN, 0), None)), 0));
 }
 
 pub struct Glo30 {
@@ -228,17 +230,28 @@ impl Glo30 {
     }
 
     /// The decoded tile, loading it on first use (concurrent callers wait for the same load).
-    fn tile(&self, key: (i32, i32)) -> Option<Arc<Tile>> {
-        if let Some(t) = LAST.with(|l| {
+    /// Read from tile `key` (in this worker's cache, or loaded into it).
+    fn with_tile<R>(&self, key: (i32, i32), f: impl FnOnce(&Tile) -> R) -> Option<R> {
+        let mut f = Some(f);
+        let hit = LAST.with(|l| {
             let l = l.borrow();
-            if l.0 == key {
-                l.1.upgrade()
-            } else {
-                None
-            }
-        }) {
-            return Some(t);
+            l.0.iter().find(|e| e.0 == key).and_then(|e| e.1.as_ref()).map(|t| (f.take().unwrap())(t))
+        });
+        if hit.is_some() {
+            return hit;
         }
+        let t = self.tile(key)?;
+        let r = (f.take().unwrap())(&t);
+        LAST.with(|l| {
+            let mut l = l.borrow_mut();
+            let i = l.1;
+            l.0[i] = (key, Some(t));
+            l.1 = (i + 1) % 4;
+        });
+        Some(r)
+    }
+
+    fn tile(&self, key: (i32, i32)) -> Option<Arc<Tile>> {
         if !self.index.contains(&key) {
             return None;
         }
@@ -263,7 +276,6 @@ impl Glo30 {
                 }
             })
             .clone()?;
-        LAST.with(|l| *l.borrow_mut() = (key, Arc::downgrade(&t)));
         Some(t)
     }
 
@@ -278,7 +290,6 @@ impl Glo30 {
         let y0 = fy.floor();
         let ty = (fy - y0) as f32;
         let y0 = y0 as i64;
-        let mut cur: Option<((i32, i32), Arc<Tile>)> = None;
         let mut rows = [0f32; 4];
         for (k, dy) in (-1..=2).enumerate() {
             let r = (y0 + dy).clamp(0, 180 * ROWS - 1);
@@ -289,19 +300,20 @@ impl Glo30 {
             let x0 = fx.floor();
             let tx = (fx - x0) as f32;
             let x0 = x0 as i64;
+            let cols = [-1i64, 0, 1, 2].map(|dx| (x0 + dx).rem_euclid(360 * w));
+            let key = |c: i64| (tlat, (c.div_euclid(w) - 180) as i32);
             let mut p = [0f32; 4];
-            for (m, dx) in (-1..=2).enumerate() {
-                let c = (x0 + dx).rem_euclid(360 * w);
-                let key = (tlat, (c.div_euclid(w) - 180) as i32);
-                let t = match &cur {
-                    Some((k2, t)) if *k2 == key => t.clone(),
-                    _ => {
-                        let t = self.tile(key)?;
-                        cur = Some((key, t.clone()));
-                        t
+            if key(cols[0]) == key(cols[3]) {
+                // the usual case: the row's four samples in one tile, one cache lookup
+                self.with_tile(key(cols[0]), |t| {
+                    for m in 0..4 {
+                        p[m] = t.data[(j * t.w + cols[m].rem_euclid(w)) as usize] as f32 * 0.5;
                     }
-                };
-                p[m] = t.data[(j * t.w + c.rem_euclid(w)) as usize] as f32 * 0.5;
+                })?;
+            } else {
+                for m in 0..4 {
+                    p[m] = self.with_tile(key(cols[m]), |t| t.data[(j * t.w + cols[m].rem_euclid(w)) as usize] as f32 * 0.5)?;
+                }
             }
             rows[k] = cr(p[0], p[1], p[2], p[3], tx);
         }
@@ -314,6 +326,7 @@ pub struct Terrain {
     pub etopo: Etopo,
     pub glo: Glo30,
     pub cover: LandCover,
+    pub biomes: Option<super::biomes::Biomes>,
 }
 
 impl Terrain {
@@ -322,7 +335,13 @@ impl Terrain {
             etopo: Etopo::load(&root.join("etopo"))?,
             glo: Glo30::load(&root.join("glo30"))?,
             cover: LandCover::load(&root.join("worldcover"))?,
+            biomes: super::biomes::Biomes::load(&root.join("ecoregions"))?,
         })
+    }
+
+    /// RESOLVE biome number at lat / lon (biomes.rs; 0 = none or no biome data).
+    pub fn biome(&self, lat: f64, lon: f64) -> u8 {
+        self.biomes.as_ref().map(|b| b.biome(lat, lon)).unwrap_or(0)
     }
 
     /// Elevation (m): 30 m data where its tiles exist, ETOPO elsewhere. GLO-30 flattens the sea to
@@ -332,6 +351,17 @@ impl Terrain {
         match self.glo.height(lat, lon) {
             Some(fine) if !(fine == 0.0 && coarse < 0.0) => fine,
             _ => coarse,
+        }
+    }
+
+    /// Elevation for points `spacing` metres apart: the 30 m data only where the points are close
+    /// enough to show it; coarser samples (far terrain, the planet-wide tiles) read ETOPO, without
+    /// decoding a 26 MB tile for a sample every few kilometres.
+    pub fn height_at(&self, lat: f64, lon: f64, spacing: f64) -> f32 {
+        if spacing > 400.0 {
+            self.etopo.height(lat, lon)
+        } else {
+            self.height(lat, lon)
         }
     }
 

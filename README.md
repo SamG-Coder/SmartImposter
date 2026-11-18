@@ -425,6 +425,34 @@ so far:
   - Land cover: ESA WorldCover 2021 (10 m) where present, as fractions per terrain vertex. They pick
     the Quixel ground scans (forest floor, grass, rock on cliffs, glaciers, gravel, wetland) and mark
     lakes and rivers.
+- **Time, sun and moon.** A UTC clock drives the sun and the moon (Astronomical Almanac /
+  Meeus formulas: sun to ~0.01 degrees, moon to ~0.3), so the Earth turns under them: day and
+  night, the seasons, and from orbit the terminator sweeping across the planet. The moon has its
+  real phase and brightness (~2.4 millionths of sunlight at full); at night it is the light, and the
+  eye adapts (pre-exposure in main.rgen, so moonlit radiance survives the 16-bit targets). `,` `.`
+  step an hour (Shift: a day), `/` cycles the speed (real time, a minute, an hour or a day per
+  second, stopped); `--time 2026-06-21T19:30` starts at a UTC time.
+- **Water and shores.** Every terrain tile carries a 64 x 64 signed distance to the shore (from the
+  10 m land cover, ETOPO where there is none), filtered per pixel: coastlines and lake shores are
+  smooth curves at any distance. The same field gives the depth (lakes shelve to ~18 m, the sea to
+  ~12 m and then ETOPO's seafloor), so the water is see-through over its bed: shallows show the
+  pebbles or sand, foam at the waterline, a wet strip and a pebble or beach-sand strip on the shore,
+  deep blue sea and dark lakes further out.
+- **Biomes.** RESOLVE Ecoregions 2017 (846 ecoregions in 14 biomes, `tools/bake_biomes.py` ->
+  a 3.7 km grid) chooses per place:
+  - which trees grow (globe/forest.rs `BIOME_TREES`: e.g. spruce, pine, birch in the taiga; beech,
+    oak, maple, hornbeam in temperate forest; Aleppo pine and oak in Mediterranean scrub; palms in
+    oases and the tropics), with conifers taking over with altitude in temperate mountains and
+    alders / willows / poplars on wet ground;
+  - which understory plants belong there (bilberry and anemone in temperate and boreal forest,
+    greasewood in deserts and steppe, ...);
+  - which ground scans cover the land (globe.rchit: mossy forest floor in the taiga, red soil in
+    the tropics, dry grass and red soil in savanna, sand and arid soil in deserts, tundra stones
+    and lichen in the Arctic, mud in wetlands and mangroves, glacier ice, ploughed fields, beach
+    sand on sea coasts).
+
+  Species and scans are found by name: a Quixel asset that is not downloaded is skipped (the
+  biome's other species, or a stand-in, take its place) and grows where it belongs once it is.
 - **`--site lat,lon`: a real place in the forest renderer.** The local tangent plane at that point
   (with the Earth's curvature), heights from GLO-30 / ETOPO, lakes and rivers from WorldCover,
   streams from a priority-flood drainage of the real 30 m heights, and the forest grown only where
@@ -459,9 +487,18 @@ Streaming on an RTX 5080 at 1920x1080, DLSS-RR Quality, `--bench-move` over 900 
 Earlier, with synchronous per-tile uploads, the same runs had p99 64–68 ms and maxima of 76–110 ms.
 A cold view streams in fully in ~1.8 s after the first frame (was 4.3 s).
 
-**Still to do** (see the plan): the plant library per biome (free Quixel species, see the plan's
-asset list; the globe uses the Alpine forest's species everywhere), ocean waves, clouds and
-seasons.
+Quixel species in the globe so far (docs/QUIXEL_DOWNLOADS.md): European Beech, Black Alder,
+Black Poplar, European Aspen, Common Hazel, Norway Spruce, Baltic Pine, Silver Birch, English Oak,
+Goat Willow, Norway Maple, Aleppo Pine, Dead Pine, Rowan, Elder, Giant Bamboo, Bilberry, Wood
+Anemone, European Spindle, Greasewood, Bracken, Heather, Huckleberry Oak and 7 grasses; 26 ground
+scans. Megaplants are exported from Unreal with `tools/ue_export_megaplants.py` (the USD plugins
+must be enabled) and converted with `tools/megaplant_to_mtree.py` (needs Pixar's `usd-core`).
+Impostor atlases share a memory budget (`SI_IMPOSTOR_MB`, default 20% of VRAM): with many
+species their texels grow uniformly instead of running out of memory.
+
+**Still to do** (see the plan): the glTF 3D plants (palms, cacti, Xanadu, marram and ribbon
+grass, poppies, dandelions) need an importer; rivers from HydroRIVERS (the 10 m land cover has the
+wide ones); ocean waves, clouds, stars and seasons.
 
 ## Getting started
 
@@ -554,7 +591,7 @@ cargo run --release
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
-| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--sun azimuth,elevation]` | the 1:1 globe; `--views` takes the same five numbers per view; `--bench-move m` flies along the heading at constant height |
+| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--time 2026-06-21T10:30] [--time-rate s]` | the 1:1 globe; `--views` takes the same five numbers per view; `--time` is UTC (default 10:30 local solar time on the June solstice), `--time-rate` simulated seconds per second (default real time, stopped when capturing); `--bench-move m` flies along the heading at constant height |
 
 | Environment | Meaning |
 |---|---|
@@ -589,6 +626,8 @@ cargo run --release
 | O | AO rays per pixel |
 | P | print the camera as `--cam` (globe: as `--at`) |
 | M (site mode) | back to the globe above the same place |
+| `,` `.` / Arrows (globe) | clock back / forward an hour (Shift: a day; up / down: a day) |
+| `/` (globe) | clock speed: real time, 1 min/s, 1 h/s, 1 day/s, stopped |
 | F11 / F12 | fullscreen / screenshot |
 
 ## Tools
@@ -596,6 +635,7 @@ cargo run --release
 | Script | Purpose |
 |---|---|
 | `tools/fetch_earth.py` | download the globe's data (Copernicus GLO-30, ESA WorldCover, ecoregions, rivers, lakes) into `assets/earth/`, converting the elevation tiles as they arrive |
+| `tools/bake_biomes.py` | rasterise the RESOLVE ecoregions into the globe's biome grid (`assets/earth/ecoregions/eco_grid.bin`) |
 | `tools/ue_export_megaplants.py` | run inside Unreal: export every Megaplant's meshes, Nanite assembly hierarchy, textures and material parameters |
 | `tools/megaplant_to_mtree.py` | flatten an exported Megaplant into `.mtree` + species `.json` |
 | `tools/grass_to_mtree.py` | Megascans 3D grass (Fab glTF) → grass-patch species pack |
@@ -642,10 +682,10 @@ shaders/
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
-- **Globe:** one species set everywhere (the Alpine forest's), Copernicus tiles above 50°
-  latitude (narrower tiles) are skipped, the ground colour without land cover data is a latitude
-  stand-in, and the ocean has no waves. Site mode uses the forest scene's lowland species
-  everywhere. Terrain pools take ~1–2 GB of VRAM in a typical view.
+- **Globe:** tropical, desert and mangrove trees are stand-ins until their Quixel species are
+  imported (palms and cacti are glTF downloads without an importer yet); the ground colour without
+  land cover data is a latitude stand-in; the ocean has no waves; no stars. Site mode uses the
+  forest scene's lowland species everywhere. Terrain pools take ~1–2 GB of VRAM in a typical view.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 
