@@ -38,6 +38,141 @@ pub fn tree_range(eye_height: f64) -> f64 {
 pub struct Species {
     pub infos: Vec<ImpostorInfo>,
     pub species: Vec<(String, Vec<usize>)>,
+    /// understory variants: grass patches (meadow, dry, wet), ferns, shrubs (heath, other)
+    pub grass: Vec<usize>,
+    pub dry_grass: Vec<usize>,
+    pub wet_grass: Vec<usize>,
+    pub ferns: Vec<usize>,
+    pub heath: Vec<usize>,
+    pub shrubs: Vec<usize>,
+}
+
+/// Understory tiles: this quadtree level (~76 m), within UNDER_RADIUS of the camera.
+pub const UNDER_LEVEL: u8 = 17;
+pub const UNDER_RADIUS: f64 = 700.0;
+
+/// Understory tiles around the camera (same quadtree, its own level), nearest first.
+pub fn under_tiles(cam: DVec3) -> Vec<(f64, TileId)> {
+    let d = cam.normalize();
+    let ground = d * R_EARTH;
+    let (face, u, v) = dir_to_face_uv(d);
+    let cells = 1u32 << UNDER_LEVEL;
+    let to_cell = |c: f64| (((c + 1.0) * 0.5 * cells as f64).floor() as i64).clamp(0, cells as i64 - 1);
+    let (cx, cy) = (to_cell(u), to_cell(v));
+    let edge = 0.5 * std::f64::consts::PI * R_EARTH / cells as f64;
+    let k = (UNDER_RADIUS / edge).ceil() as i64 + 1;
+    let mut out = Vec::new();
+    for y in cy - k..=cy + k {
+        for x in cx - k..=cx + k {
+            if x < 0 || y < 0 || x >= cells as i64 || y >= cells as i64 {
+                continue;
+            }
+            let id = TileId { face, level: UNDER_LEVEL, x: x as u32, y: y as u32 };
+            let dist = (id.center_dir() * R_EARTH - ground).length();
+            if dist < UNDER_RADIUS {
+                out.push((dist, id));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    out
+}
+
+/// Grass patches, ferns and shrubs of one understory tile from the 20 m land cover, as in the
+/// forest scene: meadows and fields get grass (dry on cropland), forest floor gets ferns and a
+/// few shrubs, shrubland heather and shrubs, wetland wet grass. Grass patches lie on the slope.
+pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile {
+    let center = id.center_dir() * R_EARTH;
+    let mut tile = TreeTile { id, center, recs: Vec::new(), aabbs: Vec::new() };
+    if terrain.cover.is_empty() {
+        return tile;
+    }
+    let (u0, v0, s) = id.uv();
+    let edge = id.edge();
+    let mut rng = Rng(hash(0xA5A5 ^ ((id.face as u64) << 56) ^ ((id.x as u64) << 24) ^ id.y as u64));
+    // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass
+    for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2)] {
+        let n = (edge / spacing).ceil() as usize;
+        for j in 0..n {
+            for i in 0..n {
+                let (fu, fv) = ((i as f64 + rng.f()) / n as f64, (j as f64 + rng.f()) / n as f64);
+                let (r_keep, r_pick, r_size, r_yaw) = (rng.f(), rng.f(), rng.f(), rng.f());
+                let d = face_dir(id.face, u0 + fu * s, v0 + fv * s);
+                let (lat, lon) = lat_lon(d);
+                let Some(g) = terrain.cover.class_group(lat, lon) else { continue };
+                use super::landcover as lc;
+                let (p, list): (f64, &Vec<usize>) = match (layer, g) {
+                    (2, lc::GRASS) => (0.9, &sp.grass),
+                    (2, lc::CROP) => (0.8, &sp.dry_grass),
+                    (2, lc::WETLAND) => (0.85, &sp.wet_grass),
+                    (2, lc::SHRUB) => (0.5, &sp.grass),
+                    (2, lc::BARE) | (2, lc::MOSS) => (0.15, &sp.dry_grass),
+                    (2, lc::TREE) => (0.06, &sp.grass),
+                    (1, lc::TREE) => (0.45, &sp.ferns),
+                    (1, lc::WETLAND) => (0.2, &sp.ferns),
+                    (0, lc::SHRUB) => (0.55, if r_pick < 0.6 { &sp.heath } else { &sp.shrubs }),
+                    (0, lc::TREE) => (0.12, &sp.shrubs),
+                    (0, lc::GRASS) | (0, lc::MOSS) => (0.05, &sp.heath),
+                    _ => continue,
+                };
+                let list = if list.is_empty() { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
+                if list.is_empty() || r_keep > p {
+                    continue;
+                }
+                let vid = list[((r_pick * 7.31).fract() * list.len() as f64) as usize % list.len()];
+                let info = &sp.infos[vid];
+                let h = terrain.height(lat, lon).max(0.0) as f64;
+                let up = d;
+                let east = DVec3::Z.cross(up).normalize();
+                let north = up.cross(east);
+                // grass patches lie on the slope (flat discs a few metres across)
+                let mut y = up;
+                if layer == 2 {
+                    let m = 1.0 / 111_320.0;
+                    let dx = (terrain.height(lat, lon + 1.5 * m / lat.to_radians().cos()) - terrain.height(lat, lon - 1.5 * m / lat.to_radians().cos())) as f64 / 3.0;
+                    let dz = (terrain.height(lat + 1.5 * m, lon) - terrain.height(lat - 1.5 * m, lon)) as f64 / 3.0;
+                    y = (up - east * dx - north * dz).normalize();
+                }
+                let a = r_yaw * std::f64::consts::TAU;
+                let x0 = east * a.cos() + north * a.sin();
+                let x = (x0 - y * x0.dot(y)).normalize();
+                let z = x.cross(y);
+                let sc = 0.7 + 0.6 * r_size;
+                let (x, y, z) = (x * sc, y * sc, z * sc);
+                let t = d * (R_EARTH + h - 0.03) - center;
+                let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
+                let seed = 1 + (rng.f() * 8190.0) as u32;
+                let mut rec = [0u32; 16];
+                for (ri, row) in rows.iter().enumerate() {
+                    for (ci, v) in row.iter().enumerate() {
+                        rec[ri * 4 + ci] = (*v as f32).to_bits();
+                    }
+                }
+                rec[12] = vid as u32 | seed << 8;
+                let (bmin, bmax) = (info.bmin, info.bmax);
+                let mut lo = [f32::MAX; 3];
+                let mut hi = [f32::MIN; 3];
+                for c in 0..8 {
+                    let p = [
+                        if c & 1 == 0 { bmin[0] } else { bmax[0] } as f64,
+                        if c & 2 == 0 { bmin[1] } else { bmax[1] } as f64,
+                        if c & 4 == 0 { bmin[2] } else { bmax[2] } as f64,
+                    ];
+                    for (k, row) in rows.iter().enumerate() {
+                        let v = (row[0] * p[0] + row[1] * p[1] + row[2] * p[2] + row[3]) as f32;
+                        lo[k] = lo[k].min(v);
+                        hi[k] = hi[k].max(v);
+                    }
+                }
+                if tile.recs.len() >= MAX_PER_TILE {
+                    return tile;
+                }
+                tile.recs.push(rec);
+                tile.aabbs.push([lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]);
+            }
+        }
+    }
+    tile
 }
 
 pub struct TreeTile {

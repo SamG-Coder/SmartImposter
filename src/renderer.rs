@@ -353,6 +353,8 @@ pub struct Renderer {
     globe_dummy: Option<(Buffer, Buffer, Image)>,
     /// Globe mode: this frame's camera (ECEF), its frame rotation and globe.rchit's globals.
     globe_view: Option<(glam::DVec3, glam::DMat3, crate::globe::scene::GlobeGlobals)>,
+    /// Globe mode: plant records currently drawn as meshes (1 both / 2 mesh only).
+    globe_states: std::collections::HashMap<u32, u32>,
 }
 
 /// World -> view for NGX: row-major, row vectors (v_view = v_world * M), x right, y up, z forward.
@@ -1016,6 +1018,7 @@ impl Renderer {
             globe: None,
             globe_dummy: None,
             globe_view: None,
+            globe_states: std::collections::HashMap::new(),
         };
         let _ = r.set_layout;
         // Globe mode: terrain and trees stream in around the camera (globe/scene.rs); the static
@@ -1030,7 +1033,30 @@ impl Renderer {
                         species.push((sp.name.clone(), v));
                     }
                 }
-                let sp = crate::globe::forest::Species { infos: r.imp_infos.clone(), species };
+                // understory variants by kind / name (catalog.rs Kind)
+                let mut sp = crate::globe::forest::Species { infos: r.imp_infos.clone(), species, ..Default::default() };
+                for s in &r.catalog.species {
+                    let v: Vec<usize> = s.variants.clone().collect();
+                    let n = s.name.to_ascii_lowercase();
+                    match s.kind {
+                        crate::catalog::Kind::Grass if n.contains("dry") => sp.dry_grass.extend(v),
+                        crate::catalog::Kind::Grass if n.contains("cotton") => sp.wet_grass.extend(v),
+                        crate::catalog::Kind::Grass => sp.grass.extend(v),
+                        crate::catalog::Kind::Plant => sp.ferns.extend(v),
+                        crate::catalog::Kind::Shrub if n.contains("heather") => sp.heath.extend(v),
+                        crate::catalog::Kind::Shrub => sp.shrubs.extend(v),
+                        _ => {}
+                    }
+                }
+                if sp.dry_grass.is_empty() {
+                    sp.dry_grass = sp.grass.clone();
+                }
+                if sp.wet_grass.is_empty() {
+                    sp.wet_grass = sp.grass.clone();
+                }
+                if sp.heath.is_empty() {
+                    sp.heath = sp.shrubs.clone();
+                }
                 r.globe = Some(crate::globe::scene::GlobeScene::new(&r.gpu, terrain, sp)?);
             }
             None => {
@@ -1993,6 +2019,55 @@ impl Renderer {
             self.lod_frame = self.lod_frame.wrapping_add(1);
             self.inst_data.clear();
             self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
+            // Mesh LOD as in the forest scene: trees near the camera get their mesh parts as
+            // instances (dissolving against the impostor inside the band).
+            let mut states = std::collections::HashMap::new();
+            if lod > 0.0 {
+                let band = g.lod_params[0];
+                let reach = ((lod + band) * self.max_lod_scale + 4.0) as f64;
+                let rotf = glam::Mat3::from_cols(rot.x_axis.as_vec3(), rot.y_axis.as_vec3(), rot.z_axis.as_vec3());
+                let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+                let band_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
+                let (insts, inst_data) = (&mut self.insts, &mut self.inst_data);
+                let (catalog, pack, blas, infos) = (&self.catalog, &self.pack, &self.blas, &self.imp_infos);
+                scene.near_trees(ecef, reach, |rec, tile_c, r| {
+                    let f = |k: usize| f32::from_bits(r[k]);
+                    let v = (r[12] & 0xFF) as usize;
+                    let ls = catalog.variants[v].lod_scale;
+                    let m = glam::Mat3::from_cols(glam::Vec3::new(f(0), f(4), f(8)), glam::Vec3::new(f(1), f(5), f(9)), glam::Vec3::new(f(2), f(6), f(10)));
+                    // plant -> camera frame
+                    let tile = glam::Affine3A::from_mat3_translation(rotf, (rot * (tile_c - ecef)).as_vec3());
+                    let plant = tile * glam::Affine3A::from_mat3_translation(m, glam::Vec3::new(f(3), f(7), f(11)));
+                    let c = infos[v].center_radius;
+                    let center = plant.transform_point3(glam::Vec3::new(c[0], c[1], c[2]));
+                    let d = center.length();
+                    let (a, b) = ((lod - band * 0.5) * ls, (lod + band * 0.5) * ls);
+                    let state = if d < a { 2u32 } else if d < b { 1 } else { return };
+                    states.insert(rec, state);
+                    let seed = ((r[12] >> 8) & 0x1FFF) << 11;
+                    let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT) | if state == 1 { INST_HAS_MESH } else { 0 };
+                    for p in &pack.trees[v].parts {
+                        let alpha = catalog.mesh_alpha[p.mesh as usize];
+                        let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
+                        insts.push(accel::make_instance(&(plant * p.xform), p.mesh | seed, 1, sbt, flags, blas[p.mesh as usize].addr));
+                        inst_data.push(InstInfo { center: center.to_array(), data });
+                    }
+                });
+            }
+            {
+                // per-plant LOD state for impostor.rint (dissolve / skip where the mesh draws)
+                let st: &mut [u32] = bytemuck::cast_slice_mut(scene.plant_state.mapped());
+                for (k, _) in self.globe_states.iter() {
+                    if !states.contains_key(k) {
+                        st[*k as usize] = 0;
+                    }
+                }
+                for (k, v) in &states {
+                    st[*k as usize] = *v;
+                }
+            }
+            self.globe_states = states;
+            self.near_count = self.globe_states.len();
             let a = scene.index_addr();
             gg.addr = [a as u32, (a >> 32) as u32, 0, 0];
             gg.params[1] = self.lod_frame as f32;

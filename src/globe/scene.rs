@@ -64,6 +64,8 @@ struct TreeTileGpu {
     blas: Option<Accel>,
     aabbs: Option<Buffer>,
     center: DVec3,
+    /// finest tiles: the plant records on the CPU too (mesh LOD near the camera)
+    recs: Vec<[u32; 16]>,
 }
 
 type Queue = Arc<(Mutex<VecDeque<TileId>>, Condvar)>;
@@ -213,7 +215,13 @@ impl GlobeScene {
         let tree_queue: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let (tree_tx, tree_rx) = mpsc::channel();
         let (et, roles, sp) = (terrain.clone(), Arc::new(Roles::new(&species)), Arc::new(species));
-        spawn_workers(4, &tree_queue, tree_tx, move |id| forest::grow_tile(id, &et, &sp, &roles));
+        spawn_workers(4, &tree_queue, tree_tx, move |id| {
+            if id.level == forest::UNDER_LEVEL {
+                forest::grow_understory(id, &et, &sp)
+            } else {
+                forest::grow_tile(id, &et, &sp, &roles)
+            }
+        });
 
         let mut s = GlobeScene {
             terrain: terrain.clone(),
@@ -339,7 +347,8 @@ impl GlobeScene {
                 geoms.push((accel::aabb_geometry(ab.addr), n as u32));
                 aabbs = Some(ab);
             }
-            entries.push((t.id, base, n as u32, aabbs, t.center));
+            let keep_recs = if t.id.level >= forest::TREE_LEVEL { t.recs.clone() } else { Vec::new() };
+            entries.push((t.id, base, n as u32, aabbs, t.center, keep_recs));
         }
         if !copies.is_empty() {
             let (src, dst) = (staging.raw, self.plants.raw);
@@ -347,9 +356,9 @@ impl GlobeScene {
         }
         gpu.destroy_buffer(&mut staging);
         let mut blases = accel::build_blases(gpu, &geoms)?.into_iter();
-        for (id, base, count, aabbs, center) in entries {
+        for (id, base, count, aabbs, center, recs) in entries {
             let blas = if count > 0 { blases.next() } else { None };
-            self.trees.insert(id, TreeTileGpu { base, count, blas, aabbs, center });
+            self.trees.insert(id, TreeTileGpu { base, count, blas, aabbs, center, recs });
         }
         Ok(())
     }
@@ -414,7 +423,8 @@ impl GlobeScene {
         let t = std::time::Instant::now();
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
         self.range = forest::tree_range(eye);
-        let near = forest::tiles_near(cam, self.range);
+        let mut near = forest::under_tiles(cam);
+        near.extend(forest::tiles_near(cam, self.range));
         if std::env::var("SI_TREE_STATS").is_ok() && self.frame % 60 == 0 {
             println!("  tiles_near: {} tiles in {:.2} ms", near.len(), t.elapsed().as_secs_f64() * 1e3);
         }
@@ -487,6 +497,21 @@ impl GlobeScene {
             }
         }
         self.trees_drawn = trees_drawn;
+    }
+
+    /// Trees of the finest tiles within `radius` of the camera (ECEF): (plant record index, tile
+    /// centre, record: object -> tile rows, variant | seed << 8).
+    pub fn near_trees(&self, cam: DVec3, radius: f64, mut f: impl FnMut(u32, DVec3, &[u32; 16])) {
+        let edge = 0.5 * std::f64::consts::PI * R_EARTH / (1u64 << forest::TREE_LEVEL) as f64;
+        let ground = cam.normalize() * R_EARTH; // tile centres are at sea level: compare along the ground
+        for t in self.trees.values() {
+            if t.recs.is_empty() || (t.center - ground).length() > radius + edge {
+                continue;
+            }
+            for (i, r) in t.recs.iter().enumerate() {
+                f(t.base + i as u32, t.center, r);
+            }
+        }
     }
 
     pub fn write_globals(&mut self, g: &GlobeGlobals) {

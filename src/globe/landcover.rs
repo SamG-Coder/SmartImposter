@@ -18,7 +18,13 @@ const PER_DEG: f64 = N as f64 / 3.0;
 /// Class groups stored per terrain vertex (tiles.rs), in this order.
 pub const GROUPS: usize = 10;
 pub const TREE: usize = 0;
+pub const SHRUB: usize = 1;
+pub const GRASS: usize = 2;
+pub const CROP: usize = 3;
+pub const BARE: usize = 5;
 pub const WATER: usize = 7;
+pub const WETLAND: usize = 8;
+pub const MOSS: usize = 9;
 
 pub fn group(class: u8) -> Option<usize> {
     Some(match class {
@@ -149,6 +155,11 @@ impl LandCover {
         let y = ((tlat as f64 + 3.0 - lat) * PER_DEG) as usize;
         let x = ((lon - tlon as f64) * PER_DEG) as usize;
         t[y.min(N - 1) * N + x.min(N - 1)]
+    }
+
+    /// Class group at lat / lon (None = no data).
+    pub fn class_group(&self, lat: f64, lon: f64) -> Option<usize> {
+        group(self.class(lat, lon))
     }
 
     /// Class fractions over a square of `size` metres around lat / lon (k x k samples).
