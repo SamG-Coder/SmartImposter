@@ -4,19 +4,25 @@
 //! Coordinates are Earth-centred (ECEF, float64): +X at latitude 0 / longitude 0, +Y at
 //! longitude 90 E, +Z the north pole. Tile meshes are float32 relative to the tile centre.
 
-use super::etopo::Etopo;
+use super::dem::Terrain;
 use glam::DVec3;
 use std::f64::consts::PI;
 
 pub const R_EARTH: f64 = 6_371_000.0;
 /// Vertices per tile side (32 x 32 cells).
 pub const GRID: usize = 33;
-/// Finest level: ~610 m tiles, ~19 m cells. ETOPO itself is ~1.85 km per sample.
+/// Finest level over ETOPO only: ~610 m tiles, ~19 m cells (the data is ~1.85 km per sample).
 pub const MAX_LEVEL: u8 = 14;
+/// Finest level over the 30 m data: ~150 m tiles, ~4.8 m cells.
+pub const MAX_LEVEL_FINE: u8 = 16;
 /// Split a tile while the camera is closer than this many tile edge lengths.
 pub const SPLIT_K: f64 = 5.0;
-/// Floats per vertex: position (3), normal (3), elevation (m), water (0/1).
-pub const VSTRIDE: usize = 8;
+/// Floats per vertex: position (3), normal (3), elevation (m), land cover (3 words of 4 unorm8:
+/// tree shrub grass crop | built bare snow water | wetland moss has-data -), texture
+/// coordinates in metres (2).
+pub const VSTRIDE: usize = 12;
+/// Texture coordinates repeat every TEX_PERIOD metres (a multiple of every texture repeat).
+pub const TEX_PERIOD: f64 = 131_072.0;
 
 #[derive(Clone, Copy, Hash, Eq, PartialEq, Debug, PartialOrd, Ord)]
 pub struct TileId {
@@ -80,9 +86,27 @@ pub fn dir_from_lat_lon(lat: f64, lon: f64) -> DVec3 {
 }
 
 /// Ground radius at a direction: sea level over the oceans, terrain on land.
-pub fn ground_radius(etopo: &Etopo, d: DVec3) -> f64 {
+pub fn ground_radius(terrain: &Terrain, d: DVec3) -> f64 {
     let (lat, lon) = lat_lon(d);
-    R_EARTH + etopo.height(lat, lon).max(0.0) as f64
+    R_EARTH + terrain.height(lat, lon).max(0.0) as f64
+}
+
+/// Deepest level for a tile: finer where the 30 m data is.
+pub fn max_level(id: TileId, terrain: &Terrain) -> u8 {
+    if id.level < 8 {
+        return MAX_LEVEL_FINE; // big tiles: decide further down
+    }
+    let (u, v, s) = id.uv();
+    let mut b = [f64::MAX, f64::MIN, f64::MAX, f64::MIN];
+    for (a, c) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.5, 0.5)] {
+        let (lat, lon) = lat_lon(face_dir(id.face, u + a * s, v + c * s));
+        b = [b[0].min(lat), b[1].max(lat), b[2].min(lon), b[3].max(lon)];
+    }
+    if terrain.fine_in(b[0], b[1], b[2], b[3]) {
+        MAX_LEVEL_FINE
+    } else {
+        MAX_LEVEL
+    }
 }
 
 pub struct TileMesh {
@@ -95,7 +119,7 @@ pub struct TileMesh {
 /// Build a tile: positions from ETOPO (oceans at sea level, flagged as water), normals from the
 /// neighbouring samples (one sample beyond the edge, so they match across tiles), and skirts
 /// hanging below the edges that hide the cracks between tiles of different levels.
-pub fn build_tile(id: TileId, etopo: &Etopo) -> TileMesh {
+pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
     let (u0, v0, s) = id.uv();
     let n = GRID;
     let step = s / (n - 1) as f64;
@@ -106,16 +130,47 @@ pub fn build_tile(id: TileId, etopo: &Etopo) -> TileMesh {
         for i in 0..m {
             let d = face_dir(id.face, u0 + (i as f64 - 1.0) * step, v0 + (j as f64 - 1.0) * step);
             let (lat, lon) = lat_lon(d);
-            let e = etopo.height(lat, lon);
+            let e = terrain.height(lat, lon);
             elev[j * m + i] = e;
             pos[j * m + i] = d * (R_EARTH + e.max(0.0) as f64);
         }
     }
     let center = id.center_dir() * R_EARTH;
+    // land cover per vertex, averaged over the vertex's footprint
+    let cell = id.edge() / (n - 1) as f64;
+    let pack = |f: &[f32]| u32::from_le_bytes([(f[0] * 255.0 + 0.5) as u8, (f[1] * 255.0 + 0.5) as u8, (f[2] * 255.0 + 0.5) as u8, (f[3] * 255.0 + 0.5) as u8]);
+    let mut cover = vec![[0u32; 3]; m * m];
+    for j in 1..m - 1 {
+        for i in 1..m - 1 {
+            let c = j * m + i;
+            let (lat, lon) = lat_lon(pos[c]);
+            if let Some(f) = terrain.cover.fractions(lat, lon, cell) {
+                cover[c] = [pack(&f[0..4]), pack(&f[4..8]), pack(&[f[8], f[9], 1.0, 0.0])];
+            }
+        }
+    }
+    // texture coordinates: arc length along the cube face (m), relative to a multiple of
+    // TEX_PERIOD near the tile so they stay small and continuous within the tile
+    let arc = std::f64::consts::FRAC_PI_4 * R_EARTH;
+    let (bu, bv) = ((u0 * arc / TEX_PERIOD).floor() * TEX_PERIOD, (v0 * arc / TEX_PERIOD).floor() * TEX_PERIOD);
+    let tex = |i: usize, j: usize| [((u0 + i as f64 * step) * arc - bu) as f32, ((v0 + j as f64 * step) * arc - bv) as f32];
     let mut verts = Vec::with_capacity((n * n + 4 * n) * VSTRIDE);
-    let push = |verts: &mut Vec<f32>, p: DVec3, nrm: DVec3, e: f32| {
+    let push = |verts: &mut Vec<f32>, p: DVec3, nrm: DVec3, e: f32, c: [u32; 3], uv: [f32; 2]| {
         let q = p - center;
-        verts.extend_from_slice(&[q.x as f32, q.y as f32, q.z as f32, nrm.x as f32, nrm.y as f32, nrm.z as f32, e, (e < 0.0) as u32 as f32]);
+        verts.extend_from_slice(&[
+            q.x as f32,
+            q.y as f32,
+            q.z as f32,
+            nrm.x as f32,
+            nrm.y as f32,
+            nrm.z as f32,
+            e,
+            f32::from_bits(c[0]),
+            f32::from_bits(c[1]),
+            f32::from_bits(c[2]),
+            uv[0],
+            uv[1],
+        ]);
     };
     let mut normals = vec![DVec3::ZERO; n * n];
     for j in 0..n {
@@ -128,7 +183,7 @@ pub fn build_tile(id: TileId, etopo: &Etopo) -> TileMesh {
                 nrm = -nrm;
             }
             normals[j * n + i] = nrm;
-            push(&mut verts, pos[c], nrm, elev[c]);
+            push(&mut verts, pos[c], nrm, elev[c], cover[c], tex(i, j));
         }
     }
     // skirts: the edge vertices again, lowered
@@ -146,7 +201,7 @@ pub fn build_tile(id: TileId, etopo: &Etopo) -> TileMesh {
             let (i, j) = edge_vertex(k, side);
             let c = (j + 1) * m + i + 1;
             let p = pos[c] - pos[c].normalize() * drop;
-            push(&mut verts, p, normals[j * n + i], elev[c]);
+            push(&mut verts, p, normals[j * n + i], elev[c], cover[c], tex(i, j));
         }
     }
     TileMesh { id, center, verts }
@@ -185,11 +240,11 @@ pub fn index_buffer() -> Vec<u32> {
 
 /// Tile selection for one frame. `resident(id)` tells whether a tile is on the GPU. Returns the
 /// tiles to draw (each covering its area once) and the missing tiles to request, nearest first.
-pub fn select(cam: DVec3, resident: &dyn Fn(TileId) -> bool) -> (Vec<TileId>, Vec<(f64, TileId)>) {
+pub fn select(cam: DVec3, resident: &dyn Fn(TileId) -> bool, terrain: &Terrain) -> (Vec<TileId>, Vec<(f64, TileId)>) {
     let mut draw = Vec::new();
     let mut want = Vec::new();
     for f in 0..6 {
-        visit(TileId::root(f), cam, resident, &mut draw, &mut want);
+        visit(TileId::root(f), cam, resident, terrain, &mut draw, &mut want);
     }
     want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
     (draw, want)
@@ -213,18 +268,18 @@ fn over_horizon(id: TileId, cam: DVec3) -> bool {
     theta - alpha > horizon
 }
 
-fn visit(id: TileId, cam: DVec3, resident: &dyn Fn(TileId) -> bool, draw: &mut Vec<TileId>, want: &mut Vec<(f64, TileId)>) {
+fn visit(id: TileId, cam: DVec3, resident: &dyn Fn(TileId) -> bool, terrain: &Terrain, draw: &mut Vec<TileId>, want: &mut Vec<(f64, TileId)>) {
     if id.level > 1 && over_horizon(id, cam) {
         return;
     }
     let d = tile_distance(id, cam);
-    let split = id.level < MAX_LEVEL && d < SPLIT_K * id.edge();
+    let split = d < SPLIT_K * id.edge() && id.level < MAX_LEVEL_FINE && id.level < max_level(id, terrain);
     if split {
         let kids = id.children();
         let missing: Vec<TileId> = kids.iter().copied().filter(|k| !resident(*k)).collect();
         if missing.is_empty() {
             for k in kids {
-                visit(k, cam, resident, draw, want);
+                visit(k, cam, resident, terrain, draw, want);
             }
             return;
         }

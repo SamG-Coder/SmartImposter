@@ -3,8 +3,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-
-const float PI = 3.14159265;
+#include "shared.glsl"
 
 struct GlobeGlobals {
     vec4 camRight;
@@ -17,10 +16,14 @@ struct GlobeGlobals {
 };
 
 struct GlobePayload {
-    vec3 n;      // shading normal (world)
-    float t;     // hit distance, < 0 on miss
-    float elev;  // ETOPO elevation (m), negative = sea floor
-    float water; // 1 = ocean surface
+    vec3 n;         // shading normal (world)
+    float t;        // hit distance, < 0 on miss
+    float elev;     // elevation (m), negative = sea floor
+    float hasCover; // 1 where land cover data exists
+    vec2 uv;        // texture coordinates (m)
+    vec4 coverA;    // land cover fractions: tree, shrub, grass, crop
+    vec4 coverB;    // built, bare, snow / ice, water
+    vec2 coverC;    // wetland, moss / lichen
 };
 
 // ---- atmosphere (single scattering, Rayleigh + Mie, ray marched): works from the ground to orbit

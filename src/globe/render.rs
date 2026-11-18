@@ -2,7 +2,7 @@
 //! relative to the camera (float64 on the CPU, float32 on the GPU), tiles built on worker threads
 //! and uploaded as they arrive, and one ray tracing pipeline (globe.rgen / globe.rchit).
 
-use super::etopo::Etopo;
+use super::dem::Terrain;
 use super::tiles::{self, TileId, TileMesh, VSTRIDE};
 use crate::accel::{self, Accel, Tlas};
 use crate::gpu::{align_up, Buffer, Gpu, Image, Swapchain};
@@ -40,6 +40,8 @@ pub struct GlobeGlobals {
 }
 
 const MAX_TILES_DRAWN: u32 = 16_384;
+/// Ground scans (catalog.rs GROUND_LAYERS) x albedo / normal / ORM. Must match globe.rgen.
+pub const GROUND_TEX: u32 = 36;
 const CACHE_TILES: usize = 14_000;
 const UPLOADS_PER_FRAME: usize = 160;
 
@@ -77,10 +79,15 @@ pub struct GlobeRenderer {
     tri_count: u32,
     elev_tex: Image,
     sampler: vk::Sampler,
+    ground: Vec<Image>,
+    ground_sampler: vk::Sampler,
+    /// bit per ground scan present
+    pub ground_mask: u32,
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     acquire_sem: vk::Semaphore,
     tiles: HashMap<TileId, TileGpu>,
+    terrain: Arc<Terrain>,
     pending: HashSet<TileId>,
     queue: Queue,
     done_rx: mpsc::Receiver<TileMesh>,
@@ -93,7 +100,7 @@ pub struct GlobeRenderer {
 }
 
 impl GlobeRenderer {
-    pub fn new(display: RawDisplayHandle, window: RawWindowHandle, w: u32, h: u32, etopo: Arc<Etopo>, vsync: bool) -> Result<Self> {
+    pub fn new(display: RawDisplayHandle, window: RawWindowHandle, w: u32, h: u32, terrain: Arc<Terrain>, vsync: bool) -> Result<Self> {
         let gpu = Gpu::new(display, window, false)?;
         println!("GPU: {}", gpu.device_name);
         let swap = gpu.create_swapchain(w, h, vk::SwapchainKHR::null(), vsync)?;
@@ -111,6 +118,11 @@ impl GlobeRenderer {
             b(2, vk::DescriptorType::UNIFORM_BUFFER, rt),
             b(3, vk::DescriptorType::STORAGE_BUFFER, rt),
             b(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, rt),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(5)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(GROUND_TEX)
+                .stage_flags(rt),
         ];
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)? };
         let pipe_layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None)? };
@@ -119,7 +131,7 @@ impl GlobeRenderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 1 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 + GROUND_TEX },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)? };
         let set = unsafe { d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout]))?[0] };
@@ -140,9 +152,9 @@ impl GlobeRenderer {
         let t = std::time::Instant::now();
         let elev_tex = crate::textures::upload_with_mips(
             &gpu,
-            etopo.w as u32,
-            etopo.h as u32,
-            bytemuck::cast_slice(etopo.raw()),
+            terrain.etopo.w as u32,
+            terrain.etopo.h as u32,
+            bytemuck::cast_slice(terrain.etopo.raw()),
             vk::Format::R16_SNORM,
             "etopo",
         )?;
@@ -159,6 +171,26 @@ impl GlobeRenderer {
             )?
         };
         println!("Elevation grid on the GPU ({:.1}s)", t.elapsed().as_secs_f32());
+        // Quixel ground scans (the forest scene's layers): missing ones are 1x1 placeholders
+        let found = crate::catalog::find_ground();
+        let ground_mask = found.iter().enumerate().map(|(i, g)| (g.is_some() as u32) << i).sum::<u32>();
+        let mut ground = crate::textures::load_ground(&gpu, &found)?;
+        while ground.len() < GROUND_TEX as usize {
+            ground.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
+        }
+        ground.truncate(GROUND_TEX as usize);
+        let ground_sampler = unsafe {
+            d.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
+                    .max_lod(vk::LOD_CLAMP_NONE),
+                None,
+            )?
+        };
         let cb = unsafe {
             d.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default().command_pool(gpu.cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
@@ -172,7 +204,7 @@ impl GlobeRenderer {
         let (done_tx, done_rx) = mpsc::channel();
         let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(2);
         for _ in 0..workers {
-            let (q, tx, et) = (queue.clone(), done_tx.clone(), etopo.clone());
+            let (q, tx, et) = (queue.clone(), done_tx.clone(), terrain.clone());
             std::thread::spawn(move || loop {
                 let id = {
                     let (lock, cv) = &*q;
@@ -207,10 +239,14 @@ impl GlobeRenderer {
             tri_count,
             elev_tex,
             sampler,
+            ground,
+            ground_sampler,
+            ground_mask,
             cb,
             fence,
             acquire_sem,
             tiles: HashMap::new(),
+            terrain: terrain.clone(),
             pending: HashSet::new(),
             queue,
             done_rx,
@@ -228,7 +264,7 @@ impl GlobeRenderer {
             level = level.iter().flat_map(|t| t.children()).collect();
         }
         let meshes: Vec<TileMesh> = std::thread::scope(|s| {
-            let hs: Vec<_> = ids.chunks(16).map(|c| s.spawn(|| c.iter().map(|&id| tiles::build_tile(id, &etopo)).collect::<Vec<_>>())).collect();
+            let hs: Vec<_> = ids.chunks(16).map(|c| s.spawn(|| c.iter().map(|&id| tiles::build_tile(id, &terrain)).collect::<Vec<_>>())).collect();
             hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
         });
         r.upload(meshes)?;
@@ -331,6 +367,11 @@ impl GlobeRenderer {
         let ubo = [vk::DescriptorBufferInfo::default().buffer(self.ubo.raw).range(vk::WHOLE_SIZE)];
         let table = [vk::DescriptorBufferInfo::default().buffer(self.table.raw).range(vk::WHOLE_SIZE)];
         let elev = [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(self.elev_tex.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let ground: Vec<_> = self
+            .ground
+            .iter()
+            .map(|g| vk::DescriptorImageInfo::default().sampler(self.ground_sampler).image_view(g.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL))
+            .collect();
         let mut tlas_write =
             vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(0).descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR).push_next(&mut as_info);
         tlas_write.descriptor_count = 1;
@@ -340,6 +381,7 @@ impl GlobeRenderer {
             vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ubo),
             vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&table),
             vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&elev),
+            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(5).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
     }
@@ -444,7 +486,7 @@ impl GlobeRenderer {
         // which tiles to draw, which to build next
         let (draw, want) = {
             let tiles = &self.tiles;
-            tiles::select(cam, &|id| tiles.contains_key(&id))
+            tiles::select(cam, &|id| tiles.contains_key(&id), &self.terrain)
         };
         {
             let (lock, cv) = &*self.queue;
@@ -485,6 +527,7 @@ impl GlobeRenderer {
         self.table.mapped()[..table.len() * 8].copy_from_slice(bytemuck::cast_slice(&table));
         g.addr = [self.idx.addr as u32, (self.idx.addr >> 32) as u32, 0, 0];
         g.params[1] = self.frame as f32;
+        g.params[3] = self.ground_mask as f32;
         self.ubo.mapped()[..std::mem::size_of::<GlobeGlobals>()].copy_from_slice(bytemuck::bytes_of(&g));
 
         let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {

@@ -185,7 +185,7 @@ pub const GROUND_LAYERS: [&str; 12] = [
 
 /// Ground surfaces from the Fab library cache (Quixel scans exported as glTF with UE textures).
 /// Override the root with SI_GROUND_DIR. Missing layers are None (procedural stand-in).
-fn find_ground() -> Vec<Option<GroundMaterial>> {
+pub fn find_ground() -> Vec<Option<GroundMaterial>> {
     // Fab library cache: SI_GROUND_DIR at run time, else at build time (.cargo/config.toml [env]).
     let root = std::env::var("SI_GROUND_DIR").unwrap_or_else(|_| option_env!("SI_GROUND_DIR").unwrap_or("assets/ground").into());
     let mut out = Vec::new();

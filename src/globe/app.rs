@@ -5,7 +5,7 @@
 //! Space / E up, Q / C down; Shift x5, Ctrl x0.2; wheel = speed. Speed follows the height above
 //! the ground. Arrow keys move the sun. F12 screenshot. 1 / 2 / 0 debug views. -/= exposure.
 
-use super::etopo::Etopo;
+use super::dem::Terrain;
 use super::render::{GlobeGlobals, GlobeRenderer};
 use super::tiles::{self, dir_from_lat_lon, lat_lon, R_EARTH};
 use anyhow::Result;
@@ -110,7 +110,7 @@ impl Cam {
 struct State {
     window: Arc<Window>,
     r: GlobeRenderer,
-    etopo: Arc<Etopo>,
+    etopo: Arc<Terrain>,
     cam: Cam,
     keys: HashSet<KeyCode>,
     looking: bool,
@@ -138,7 +138,7 @@ fn sun_for(v: [f64; 5]) -> [f64; 2] {
     [15.0, v[1] - 40.0]
 }
 
-fn place(etopo: &Etopo, v: [f64; 5]) -> Cam {
+fn place(etopo: &Terrain, v: [f64; 5]) -> Cam {
     let d = dir_from_lat_lon(v[0], v[1]);
     let ground = tiles::ground_radius(etopo, d);
     Cam { pos: d * (ground + v[2].max(1.7)), heading: v[3].to_radians(), pitch: v[4].to_radians().clamp(-1.5707, 1.5707) }
@@ -150,7 +150,7 @@ impl App {
         let window = Arc::new(el.create_window(
             Window::default_attributes().with_title("SmartImposter Earth (loading...)").with_inner_size(winit::dpi::PhysicalSize::new(a.width, a.height)),
         )?);
-        let etopo = Arc::new(Etopo::load(std::path::Path::new("assets/earth/etopo"))?);
+        let etopo = Arc::new(Terrain::load(std::path::Path::new("assets/earth"))?);
         let size = window.inner_size();
         let t = Instant::now();
         let r = GlobeRenderer::new(window.display_handle()?.as_raw(), window.window_handle()?.as_raw(), size.width, size.height, etopo.clone(), a.vsync)?;
