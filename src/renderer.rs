@@ -40,7 +40,8 @@ pub struct Globals {
     pub sun_dir: [f32; 4],
     pub params: [f32; 4],
     pub iparams: [u32; 4],
-    /// x mesh<->impostor band width, y hi->lo impostor distance, z its band width, w variant count (set by the renderer)
+    /// x mesh<->impostor band width, y hi->lo impostor distance, z its band width, w the scanned
+    /// ground layers loaded (a bit mask, set by the renderer)
     pub lod_params: [f32; 4],
     /// Previous frame camera (same layout as cam_pos..cam_fwd) for TAA reprojection.
     pub prev_pos: [f32; 4],
@@ -189,6 +190,8 @@ struct VariantAtlas {
     base: BcAtlas,
     full: Option<BcAtlas>,
     loading: bool,
+    /// the upload buffer range its full atlas is being read into
+    upload: Option<u64>,
     /// update_atlases check that last wanted the full atlas
     wanted: u64,
 }
@@ -205,6 +208,8 @@ impl VariantAtlas {
 
 /// Variants growing within this distance (m) of the camera are candidates for their full atlas.
 const ATLAS_RADIUS: f64 = 900.0;
+/// Upload buffer for full atlases in flight (the largest stream is ~125 MB).
+const ATLAS_STAGING: u64 = 256 << 20;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -246,7 +251,7 @@ impl ImpostorSettings {
 /// and frames keep at least 8 texels.
 fn atlas_mips(res: u32) -> u32 {
     let mut m = 1;
-    while (res >> m) >= 8 && (res >> m) % 4 == 0 {
+    while (res >> m) >= 8 && (res >> m).is_multiple_of(4) {
         m += 1;
     }
     m
@@ -321,7 +326,6 @@ globe cpu ms: {}", parts.join(" | "))
 pub struct FrameStats {
     pub near_trees: usize,
     pub instances: usize,
-    pub rebuilt: bool,
 }
 
 pub struct Renderer {
@@ -379,7 +383,8 @@ pub struct Renderer {
     species_buf: Buffer,
     blas: Vec<Accel>,
     _aabbs: Vec<Buffer>,
-    imp_blas: Vec<Accel>,
+    /// the impostor proxies' BLASes (one AABB per variant): referenced by the TLAS instances
+    _imp_blas: Vec<Accel>,
     imp_info: Buffer,
     imp_infos: Vec<ImpostorInfo>,
     /// per variant: base atlas always, full atlas near the camera (atlas.rs)
@@ -388,6 +393,13 @@ pub struct Renderer {
     /// GPU memory the full atlases may take (SI_IMPOSTOR_MB)
     atlas_budget: u64,
     atlas_frame: u64,
+    /// persistently mapped upload buffer the loader reads full atlases into, its free ranges,
+    /// the uploads to record into this frame (variant, offset) and the ranges to free once the
+    /// frame that copied them is done (offset, length)
+    atlas_staging: Buffer,
+    atlas_ranges: crate::atlas::Ranges,
+    atlas_uploads: Vec<(usize, u64)>,
+    atlas_retire: Vec<(u64, u64)>,
     sampler: vk::Sampler,
     pub catalog: Catalog,
     tlas: Tlas,
@@ -706,10 +718,6 @@ impl Renderer {
         let mut atlases = Vec::new();
         let mut atlas_bytes = 0u64;
         let mut raw_bytes = 0u64;
-        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 37% of the GPU's largest
-        // device-local heap, room made by compressed textures and compacted BLASes): with many
-        // species (the globe's biomes), every variant's texels grow by the same factor until they
-        // fit, instead of running out of memory.
         // GPU memory for the full atlases of the variants near the camera (SI_IMPOSTOR_MB, default
         // 25% of the largest device-local heap); every variant keeps its base atlas besides
         let atlas_budget = {
@@ -722,6 +730,7 @@ impl Renderer {
                 .unwrap_or(8 << 30);
             std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 4)
         };
+        let atlas_staging = gpu.create_buffer(ATLAS_STAGING, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas uploads")?;
         // everything that changes a bake (atlas.rs cache key), shared by all variants
         let bake_key = crate::atlas::Key::new()
             .bytes(spv!("bake.rgen"))
@@ -736,7 +745,6 @@ impl Renderer {
             .u64(imp.vis_rays as u64)
             .u64(has_tex as u64)
             .get();
-        let imp = imp;
         for (v, t) in pack.trees.iter().enumerate() {
             let vi = &catalog.variants[v];
             let sp = &species[vi.species.min(species.len() - 1)];
@@ -786,7 +794,7 @@ impl Renderer {
                 k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
             });
             let key = mesh_key.u64(res as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
-            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name, key), base, full: None, loading: false, wanted: 0 };
+            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name, key), base, full: None, loading: false, upload: None, wanted: 0 };
             atlas_bytes += full.full_bytes();
             raw_bytes += (size as u64 * size as u64 * 16) * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
             atlases.push(full);
@@ -1123,13 +1131,17 @@ impl Renderer {
             species_buf,
             blas,
             _aabbs: aabbs,
-            imp_blas,
+            _imp_blas: imp_blas,
             imp_info,
             imp_infos,
             atlases,
             atlas_loader: crate::atlas::Loader::spawn(),
             atlas_budget,
             atlas_frame: 0,
+            atlas_staging,
+            atlas_ranges: crate::atlas::Ranges::new(ATLAS_STAGING),
+            atlas_uploads: Vec::new(),
+            atlas_retire: Vec::new(),
             sampler,
             catalog,
             tlas,
@@ -1766,12 +1778,21 @@ impl Renderer {
     }
 
     /// BC blocks (concatenated `regions` of an atlas.rs stream) into an atlas whose level 0 is
-    /// the stream's level `skip`.
+    /// the stream's level `skip`, now (startup: a one-time submit and wait).
     fn upload_atlas(&self, a: &BcAtlas, regions: &[crate::atlas::Region], data: &[u8], skip: u32) -> Result<()> {
         let mut staging = self.gpu.create_buffer(data.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas staging")?;
         staging.mapped()[..data.len()].copy_from_slice(data);
+        self.gpu.one_time(|cb| self.cmd_upload_atlas(cb, a, regions, staging.raw, 0, skip))?;
+        self.gpu.destroy_buffer(&mut staging);
+        Ok(())
+    }
+
+    /// Record the copies of an atlas.rs stream at `offset` in `src` into `a` (level 0 = the
+    /// stream's level `skip`), with the layout transitions; the atlas is readable by the ray
+    /// tracing shaders recorded after it.
+    fn cmd_upload_atlas(&self, cb: vk::CommandBuffer, a: &BcAtlas, regions: &[crate::atlas::Region], src: vk::Buffer, offset: u64, skip: u32) {
         let imgs = [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw];
-        self.gpu.one_time(|cb| unsafe {
+        unsafe {
             for img in imgs {
                 self.gpu.image_barrier(
                     cb,
@@ -1784,7 +1805,7 @@ impl Renderer {
                     vk::AccessFlags2::TRANSFER_WRITE,
                 );
             }
-            let mut at = 0u64;
+            let mut at = offset;
             for r in regions {
                 let region = vk::BufferImageCopy {
                     buffer_offset: at,
@@ -1792,7 +1813,7 @@ impl Renderer {
                     image_extent: vk::Extent3D { width: r.size, height: r.size, depth: 1 },
                     ..Default::default()
                 };
-                self.gpu.device.cmd_copy_buffer_to_image(cb, staging.raw, imgs[r.img], vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                self.gpu.device.cmd_copy_buffer_to_image(cb, src, imgs[r.img], vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
                 at += r.bytes;
             }
             for img in imgs {
@@ -1807,9 +1828,19 @@ impl Renderer {
                     vk::AccessFlags2::SHADER_READ,
                 );
             }
-        })?;
-        self.gpu.destroy_buffer(&mut staging);
-        Ok(())
+        }
+    }
+
+    /// This frame's full-atlas uploads, recorded before the ray tracing; their upload ranges are
+    /// freed after the frame's fence.
+    fn record_atlas_uploads(&mut self, cb: vk::CommandBuffer) {
+        for (v, offset) in std::mem::take(&mut self.atlas_uploads) {
+            let (grid, res, mips) = (self.atlases[v].grid, self.atlases[v].res, self.atlases[v].mips);
+            if let Some(full) = &self.atlases[v].full {
+                self.cmd_upload_atlas(cb, full, &crate::atlas::layout(grid, res, mips), self.atlas_staging.raw, offset, 0);
+            }
+            self.atlas_retire.push((offset, crate::atlas::stream_bytes(grid, res, mips)));
+        }
     }
 
     /// A variant's full atlas from its whole cache stream, and the info the shaders read.
@@ -1839,22 +1870,38 @@ impl Renderer {
     /// the angle of one display pixel (radians).
     fn update_atlases(&mut self, pixel: f32) -> Result<()> {
         self.atlas_frame += 1;
+        // the previous frame has copied its uploads out
+        for (offset, len) in std::mem::take(&mut self.atlas_retire) {
+            self.atlas_ranges.release(offset, len);
+        }
         let mut dirty = false;
-        for _ in 0..2 {
-            match self.atlas_loader.rx.try_recv() {
-                Ok((v, Ok(stream))) => {
-                    self.atlases[v].loading = false;
-                    self.install_full(v, &stream)?;
+        while let Ok((v, r)) = self.atlas_loader.rx.try_recv() {
+            let a = &mut self.atlases[v];
+            a.loading = false;
+            let offset = a.upload.take().expect("an upload range for every request");
+            match r {
+                Ok(()) => {
+                    // the images now, filled by copies recorded into this frame (record_atlas_uploads)
+                    let t0 = std::time::Instant::now();
+                    let full = create_bc_atlas(&self.gpu, &format!("{} full", a.name), a.grid, a.res, a.mips)?;
+                    if std::env::var("SI_ATLAS_LOG").is_ok() {
+                        println!("atlas {} full: {:.1} MB, images created in {:.2} ms", self.atlases[v].name, full.bytes() as f64 / 1e6, t0.elapsed().as_secs_f64() * 1e3);
+                    }
+                    if let Some(mut old) = self.atlases[v].full.replace(full) {
+                        old.destroy(&self.gpu);
+                    }
+                    self.set_atlas_info(v);
+                    self.atlas_uploads.push((v, offset));
                     dirty = true;
                 }
-                Ok((v, Err(e))) => {
-                    self.atlases[v].loading = false;
-                    eprintln!("impostor atlas {}: {e:#}", self.atlases[v].name);
+                Err(e) => {
+                    eprintln!("impostor atlas {}: {e:#}", a.name);
+                    let len = crate::atlas::stream_bytes(a.grid, a.res, a.mips);
+                    self.atlas_ranges.release(offset, len);
                 }
-                Err(_) => break,
             }
         }
-        if self.atlas_frame % 10 == 0 {
+        if self.atlas_frame.is_multiple_of(10) {
             if let (Some(scene), Some((ecef, _, _))) = (&self.globe, self.globe_view) {
                 let n = self.atlases.len();
                 let mut dist = vec![f32::INFINITY; n];
@@ -1882,8 +1929,14 @@ impl Renderer {
                     let a = &mut self.atlases[v];
                     a.wanted = self.atlas_frame;
                     if a.full.is_none() && !a.loading {
-                        a.loading = true;
-                        self.atlas_loader.request(v, a.path.clone());
+                        // read straight into the upload buffer (later, when it is full)
+                        let len = crate::atlas::stream_bytes(a.grid, a.res, a.mips);
+                        if let Some(offset) = self.atlas_ranges.alloc(len) {
+                            let addr = self.atlas_staging.mapped().as_mut_ptr() as usize + offset as usize;
+                            a.loading = true;
+                            a.upload = Some(offset);
+                            self.atlas_loader.request(v, a.path.clone(), crate::atlas::Dest { addr, len: len as usize });
+                        }
                     }
                 }
                 for v in 0..n {
@@ -1899,7 +1952,11 @@ impl Renderer {
             }
         }
         if dirty {
+            let t0 = std::time::Instant::now();
             self.write_set(self.main_set, self.tlas.accel.raw, None);
+            if std::env::var("SI_ATLAS_LOG").is_ok() {
+                println!("atlas descriptors rewritten in {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
+            }
         }
         Ok(())
     }
@@ -2062,7 +2119,7 @@ impl Renderer {
             // The instance buffers are still read by the frame in flight: upload after its fence.
             self.upload_pending = true;
         }
-        Ok(FrameStats { near_trees: self.near_count, instances: self.insts.len(), rebuilt: changed })
+        Ok(FrameStats { near_trees: self.near_count, instances: self.insts.len() })
     }
 
     /// Copy the instance list built by update_instances into the TLAS instance buffer and the
@@ -2277,7 +2334,7 @@ impl Renderer {
         }
         unsafe { self.gpu.device.device_wait_idle()? };
         self.resize_count += 1;
-        if self.resize_count <= 3 || self.resize_count % 100 == 0 {
+        if self.resize_count <= 3 || self.resize_count.is_multiple_of(100) {
             println!("swapchain resize #{} to {}x{}", self.resize_count, w, h);
         }
         let new = self.gpu.create_swapchain(w, h, self.swap.raw, self.vsync)?;
@@ -2471,6 +2528,7 @@ impl Renderer {
                 // this frame's streamed tiles: copies and BLAS builds before the TLAS build
                 scene.record(&self.gpu, cb);
             }
+            self.record_atlas_uploads(cb);
             if self.tlas_dirty {
                 self.tlas.cmd_build(&self.gpu, cb, self.insts.len() as u32);
                 self.tlas_dirty = false;

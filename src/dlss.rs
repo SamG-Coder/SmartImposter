@@ -56,12 +56,8 @@ mod ffi {
         ) -> i32;
         pub fn si_dlss_create(cb: vk::CommandBuffer, rw: u32, rh: u32, ow: u32, oh: u32, quality: i32) -> i32;
         pub fn si_dlss_evaluate(cb: vk::CommandBuffer, e: *const SiDlssEval) -> i32;
-        pub fn si_dlss_shutdown();
     }
 }
-
-/// Whether the shim was compiled in.
-pub const COMPILED: bool = cfg!(dlss);
 
 /// Instance and device extensions NGX needs (empty without DLSS).
 pub fn required_extensions() -> (Vec<CString>, Vec<CString>) {
@@ -135,13 +131,6 @@ pub fn evaluate(cb: vk::CommandBuffer, e: &SiDlssEval) -> Result<(), String> {
     }
     #[allow(unreachable_code)]
     Err("no DLSS".into())
-}
-
-pub fn shutdown() {
-    #[cfg(dlss)]
-    unsafe {
-        ffi::si_dlss_shutdown()
-    };
 }
 
 /// The renderer's sub-pixel jitter (globals.glsl taaJitter): Halton(2,3), 32-frame cycle, [0,1)^2.

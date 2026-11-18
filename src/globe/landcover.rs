@@ -55,7 +55,7 @@ pub fn group(class: u8) -> Option<usize> {
 /// Index of a 3 degree tile (south-west corner) in the presence grid.
 fn cell((lat, lon): (i32, i32)) -> Option<usize> {
     let (y, x) = ((lat + 90) / 3, (lon + 180) / 3);
-    (lat >= -90 && lat < 90 && lon >= -180 && lon < 180).then(|| y as usize * 120 + x as usize)
+    ((-90..90).contains(&lat) && (-180..180).contains(&lon)).then(|| y as usize * 120 + x as usize)
 }
 
 fn coords(name: &str) -> Option<(i32, i32)> {
@@ -116,11 +116,15 @@ fn open_cog(path: &Path) -> Result<Cog> {
 
 type Lazy<T> = Arc<(OnceLock<Option<Arc<T>>>, AtomicU64)>;
 
+/// A decoded 1024 x 1024 block: tile (south-west corner) and block index within it.
+type BlockKey = (i32, i32, u32);
+/// A worker's recent blocks (a ring, with the next slot to replace).
+type RecentBlocks = ([(BlockKey, Option<Arc<Vec<u8>>>); 8], usize);
+
 thread_local! {
-    /// Each worker's last block (weak: never keeps an evicted block alive).
-    /// Each worker's recent blocks (weak: never keeps an evicted block alive). Several: a tile's
-    /// vertices read full-resolution blocks and overviews in turn, and samples straddle blocks.
-    static LAST: std::cell::RefCell<([((i32, i32, u32), Option<Arc<Vec<u8>>>); 8], usize)> =
+    /// Each worker's recent blocks. Several: a tile's vertices read full-resolution blocks and
+    /// overviews in turn, and samples straddle blocks.
+    static LAST: std::cell::RefCell<RecentBlocks> =
         std::cell::RefCell::new((std::array::from_fn(|_| ((i32::MIN, 0, 0), None)), 0));
 }
 
@@ -130,7 +134,7 @@ pub struct LandCover {
     /// the same as a 60 x 120 grid of 3 degree cells (the hot path: no hashing)
     present: Vec<bool>,
     cogs: Mutex<HashMap<(i32, i32), Lazy<Cog>>>,
-    blocks: Mutex<HashMap<(i32, i32, u32), Lazy<Vec<u8>>>>,
+    blocks: Mutex<HashMap<BlockKey, Lazy<Vec<u8>>>>,
     clock: AtomicU64,
 }
 

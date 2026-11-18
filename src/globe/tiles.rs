@@ -149,11 +149,11 @@ fn edt(f: &mut [f64], tmp: &mut [f64]) {
         z[k + 1] = f64::INFINITY;
     }
     k = 0;
-    for q in 0..n {
+    for (q, out) in tmp.iter_mut().enumerate().take(n) {
         while z[k + 1] < q as f64 {
             k += 1;
         }
-        tmp[q] = (q as f64 - v[k] as f64).powi(2) + f[v[k]];
+        *out = (q as f64 - v[k] as f64).powi(2) + f[v[k]];
     }
     f.copy_from_slice(&tmp[..n]);
 }

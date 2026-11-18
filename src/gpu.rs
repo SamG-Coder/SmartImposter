@@ -33,7 +33,6 @@ pub struct Image {
     pub format: vk::Format,
     pub width: u32,
     pub height: u32,
-    pub mips: u32,
 }
 
 pub struct RtProps {
@@ -46,7 +45,6 @@ pub struct RtProps {
 pub struct Swapchain {
     pub raw: vk::SwapchainKHR,
     pub images: Vec<vk::Image>,
-    pub format: vk::Format,
     pub extent: vk::Extent2D,
     pub done: Vec<vk::Semaphore>,
 }
@@ -54,13 +52,13 @@ pub struct Swapchain {
 pub struct Gpu {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
-    pub debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
+    /// the validation layers' message callback (SI_VALIDATION), alive as long as the instance
+    pub _debug: Option<(ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT)>,
     pub surface_fn: ash::khr::surface::Instance,
     pub surface: vk::SurfaceKHR,
     pub pdev: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: vk::Queue,
-    pub queue_family: u32,
     pub swapchain_fn: ash::khr::swapchain::Device,
     pub accel_fn: ash::khr::acceleration_structure::Device,
     pub rt_fn: ash::khr::ray_tracing_pipeline::Device,
@@ -85,7 +83,7 @@ unsafe extern "system" fn debug_cb(
 }
 
 pub fn align_up(v: u64, a: u64) -> u64 {
-    (v + a - 1) / a * a
+    v.div_ceil(a) * a
 }
 
 impl Gpu {
@@ -261,13 +259,12 @@ impl Gpu {
                 rt_fn: ash::khr::ray_tracing_pipeline::Device::new(&instance, &device),
                 entry,
                 instance,
-                debug,
+                _debug: debug,
                 surface_fn,
                 surface,
                 pdev,
                 device,
                 queue,
-                queue_family,
                 rt,
                 allocator: ManuallyDrop::new(Mutex::new(allocator)),
                 cmd_pool,
@@ -294,7 +291,7 @@ impl Gpu {
             e.1 += 1;
         }
         let mut v: Vec<_> = by.into_iter().collect();
-        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        v.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
         let mut out = format!(
             "GPU memory: {:.2} GB allocated, {:.2} GB reserved in blocks
 ",
@@ -393,7 +390,7 @@ impl Gpu {
             for m in 0..mips {
                 mip_views.push(make_view(m, 1)?);
             }
-            Ok(Image { raw, alloc: Some(alloc), view, mip_views, format, width: w, height: h, mips })
+            Ok(Image { raw, alloc: Some(alloc), view, mip_views, format, width: w, height: h })
         }
     }
 
@@ -469,7 +466,7 @@ impl Gpu {
                 self.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b2));
             })?;
             self.destroy_buffer(&mut staging);
-            Ok(Image { raw, alloc: Some(alloc), view, mip_views: Vec::new(), format, width: n, height: n, mips: 1 })
+            Ok(Image { raw, alloc: Some(alloc), view, mip_views: Vec::new(), format, width: n, height: n })
         }
     }
 
@@ -619,7 +616,7 @@ impl Gpu {
             for _ in &images {
                 done.push(self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?);
             }
-            Ok(Swapchain { raw, images, format: fmt.format, extent, done })
+            Ok(Swapchain { raw, images, extent, done })
         }
     }
 

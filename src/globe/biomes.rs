@@ -34,12 +34,7 @@ pub struct Biomes {
     grid: Vec<u16>,
     /// ECO_ID -> biome number
     biome_of: Vec<u8>,
-    /// ECO_ID -> realm (Palearctic, Nearctic, Neotropic, Afrotropic, Indomalayan, Australasia,
-    /// Oceania, Antarctica) as a small index
-    realm_of: Vec<u8>,
 }
-
-pub const REALMS: [&str; 8] = ["Palearctic", "Nearctic", "Neotropic", "Afrotropic", "Indomalayan", "Australasia", "Oceania", "Antarctica"];
 
 impl Biomes {
     pub fn load(dir: &Path) -> Result<Option<Self>> {
@@ -60,17 +55,15 @@ impl Biomes {
         }
         let grid: Vec<u16> = bytemuck::pod_collect_to_vec(&raw);
         let table: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.join("eco_table.json")).context("eco_table.json")?)?;
-        let (mut biome_of, mut realm_of) = (vec![0u8; 65536], vec![255u8; 65536]);
+        let mut biome_of = vec![0u8; 65536];
         if let Some(m) = table.as_object() {
             for (k, v) in m {
                 let Ok(id) = k.parse::<usize>() else { continue };
                 biome_of[id] = v.get(0).and_then(|x| x.as_u64()).unwrap_or(0) as u8;
-                let realm = v.get(1).and_then(|x| x.as_str()).unwrap_or("");
-                realm_of[id] = REALMS.iter().position(|r| *r == realm).map(|i| i as u8).unwrap_or(255);
             }
         }
         println!("Biomes: RESOLVE ecoregions {}x{} grid", w, h);
-        Ok(Some(Biomes { w, h, grid, biome_of, realm_of }))
+        Ok(Some(Biomes { w, h, grid, biome_of }))
     }
 
     fn eco(&self, lat: f64, lon: f64) -> u16 {
@@ -82,10 +75,5 @@ impl Biomes {
     /// Biome number at lat / lon (0 = none).
     pub fn biome(&self, lat: f64, lon: f64) -> u8 {
         self.biome_of[self.eco(lat, lon) as usize]
-    }
-
-    /// Biogeographic realm index into REALMS (255 = none).
-    pub fn realm(&self, lat: f64, lon: f64) -> u8 {
-        self.realm_of[self.eco(lat, lon) as usize]
     }
 }

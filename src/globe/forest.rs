@@ -2,6 +2,7 @@
 //! WorldCover has tree cover, standing on the Copernicus / ETOPO terrain. Every tree is one AABB
 //! of a per-tile cluster BLAS, drawn by impostor.rint / impostor.rchit (scene.rs).
 
+use super::biomes as b;
 use super::dem::Terrain;
 use super::tiles::{face_dir, lat_lon, TileId, R_EARTH};
 use crate::renderer::ImpostorInfo;
@@ -60,49 +61,49 @@ pub fn understory_biomes(name: &str) -> u16 {
     let bits = |b: &[u8]| b.iter().fold(1u16, |m, x| m | 1 << x);
     let n = name.to_ascii_lowercase();
     if n.contains("cact") {
-        bits(&[13])
+        bits(&[b::DESERT])
     } else if n.contains("yucca") {
-        bits(&[8, 12, 13])
+        bits(&[b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN, b::DESERT])
     } else if n.contains("wheat") {
-        bits(&[4, 5, 7, 8, 12])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::SAVANNA, b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN])
     } else if n.contains("desert_rock") {
-        bits(&[7, 12, 13])
+        bits(&[b::SAVANNA, b::MEDITERRANEAN, b::DESERT])
     } else if n.contains("dead_shrub") {
-        bits(&[7, 8, 12, 13])
+        bits(&[b::SAVANNA, b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN, b::DESERT])
     } else if n.contains("palm") || n.contains("xanadu") {
-        bits(&[1, 2, 3, 7, 14])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::SAVANNA, b::MANGROVES])
     } else if n.contains("leather_fern") {
-        bits(&[1, 2, 3, 4, 14])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::MANGROVES])
     } else if n.contains("tundra_grass") {
-        bits(&[6, 10, 11])
+        bits(&[b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("ribbon") || n.contains("poppy") || n.contains("dandelion") {
-        bits(&[4, 5, 8, 12])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN])
     } else if n.contains("marram") {
-        bits(&[12])
+        bits(&[b::MEDITERRANEAN])
     } else if n.contains("reed") {
-        bits(&[1, 2, 3, 4, 7, 8, 9, 12, 14])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::SAVANNA, b::TEMPERATE_GRASSLAND, b::FLOODED, b::MEDITERRANEAN, b::MANGROVES])
     } else if n.contains("boulder") {
-        bits(&[4, 5, 6, 10, 11])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("logs") {
-        bits(&[4, 5, 6, 10])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::MONTANE])
     } else if n.contains("snag") {
-        bits(&[5, 6, 10, 11])
+        bits(&[b::TEMPERATE_CONIFER, b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("greasewood") {
-        bits(&[7, 8, 12, 13])
+        bits(&[b::SAVANNA, b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN, b::DESERT])
     } else if n.contains("bilberry") || n.contains("lingonberry") {
-        bits(&[4, 5, 6, 10, 11])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("anemone") || n.contains("spindle") {
-        bits(&[4, 5])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER])
     } else if n.contains("heather") {
-        bits(&[4, 5, 6, 8, 10, 11])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::TEMPERATE_GRASSLAND, b::MONTANE, b::TUNDRA])
     } else if n.contains("huckleberry") {
-        bits(&[4, 5, 12])
+        bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::MEDITERRANEAN])
     } else if n.contains("bracken") || n.contains("fern") {
-        bits(&[1, 2, 3, 4, 5, 6])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL])
     } else if n.contains("cotton") {
-        bits(&[5, 6, 9, 10, 11])
+        bits(&[b::TEMPERATE_CONIFER, b::BOREAL, b::FLOODED, b::MONTANE, b::TUNDRA])
     } else if n.contains("dry_grass") || n.contains("dry grass") {
-        bits(&[7, 8, 10, 12, 13])
+        bits(&[b::SAVANNA, b::TEMPERATE_GRASSLAND, b::MONTANE, b::MEDITERRANEAN, b::DESERT])
     } else {
         u16::MAX
     }
@@ -112,10 +113,10 @@ pub fn understory_biomes(name: &str) -> u16 {
 /// Mediterranean, savanna and steppe plants in between, moist biomes keep their colour.
 pub fn dryness(biome: u8) -> u32 {
     match biome {
-        13 => 15,
-        7 | 12 => 10,
-        8 => 7,
-        2 => 5,
+        b::DESERT => 15,
+        b::SAVANNA | b::MEDITERRANEAN => 10,
+        b::TEMPERATE_GRASSLAND => 7,
+        b::TROPICAL_DRY => 5,
         _ => 0,
     }
 }
@@ -179,8 +180,8 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 use super::landcover as lc;
                 let biome = terrain.biome(lat, lon);
                 // deserts and dry scrub: dry grass only, and far fewer plants (mostly bare ground)
-                let arid = matches!(biome, 13);
-                let dryish = matches!(biome, 7 | 12);
+                let arid = biome == b::DESERT;
+                let dryish = matches!(biome, b::SAVANNA | b::MEDITERRANEAN);
                 let (p, list): (f64, &Vec<usize>) = match (layer, g) {
                     (2, lc::GRASS) | (2, lc::SHRUB) | (2, lc::BARE) if arid => (0.12, &sp.dry_grass),
                     (2, lc::GRASS) | (2, lc::SHRUB) if dryish => (if g == lc::GRASS { 0.8 } else { 0.4 }, &sp.dry_grass),
@@ -430,7 +431,7 @@ impl Roles {
     fn pick(&self, biome: u8, alt: f32, wet: f32, cool: f32, field: &dyn Fn(usize) -> f32, r: f32) -> Option<usize> {
         let list = self.biome.get(biome as usize).unwrap_or(&self.biome[0]);
         let lowland = 1.0 - ((alt - 800.0) / 700.0).clamp(0.0, 1.0);
-        let mountains = matches!(biome, 4 | 5 | 10);
+        let mountains = matches!(biome, b::TEMPERATE_BROADLEAF | b::TEMPERATE_CONIFER | b::MONTANE);
         let mut w: Vec<(usize, f32)> = list
             .iter()
             .map(|&(i, wt, conifer)| {
@@ -439,9 +440,9 @@ impl Roles {
                 (i, wt * alt_k * aspect.max(0.1) * (1.0 - 0.6 * wet) * field(i))
             })
             .collect();
-        if wet > 0.0 && !matches!(biome, 13) {
+        if wet > 0.0 && biome != b::DESERT {
             for &(i, wt) in &self.wet {
-                w.push((i, wt * wet * if biome == 6 || biome == 11 { 0.5 } else { 1.0 } * field(i)));
+                w.push((i, wt * wet * if biome == b::BOREAL || biome == b::TUNDRA { 0.5 } else { 1.0 } * field(i)));
             }
         }
         let total: f32 = w.iter().map(|x| x.1).sum();

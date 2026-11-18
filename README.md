@@ -1,28 +1,38 @@
 # SmartImposter
 
-**A hardware ray-traced forest renderer, written from scratch in Rust + Vulkan. Every plant beyond
-its mesh distance is a parallax octahedral impostor evaluated by the RTX cores, and NVIDIA DLSS Ray
-Reconstruction turns one noisy sample per pixel into the final image.**
+**A hardware ray-traced renderer of forests and of the whole Earth, written from scratch in Rust +
+Vulkan. Every plant beyond its mesh distance is a parallax octahedral impostor evaluated by the RTX
+cores, and NVIDIA DLSS Ray Reconstruction turns one noisy sample per pixel into the final image.**
 
 ![Meadow at the forest edge, 1440p, DLSS-RR DLAA](docs/images/hero.jpg)
 
-The world holds **440,899 plants of 14 species**:
+It runs in three modes, all through the same renderer:
+
+- **A generated forest** (the default): a 144 km landscape from a tectonic uplift and river
+  erosion simulation, with a forest grown on it by seed dispersal and succession, in any of eight
+  biomes (`--biome temperate|boreal|rainforest|savanna|desert|tundra|mediterranean|alpine`).
+- **A real place** (`--site lat,lon`): the same forest scene on real terrain and land cover.
+- **The whole Earth at 1:1** (`--globe`): terrain, land cover, forests, clouds and the sea streamed
+  in from orbit down to standing height.
+
+The default temperate forest holds **about 6.2 million plants** in an 8 km radius:
 
 | Layer | Count | Species |
 |---|---|---|
-| Canopy trees | 103,052 | European beech, black alder, black poplar, European aspen, common hazel |
-| Shrubs | 56,512 | heather, huckleberry oak |
-| Ferns | 182,752 | bracken |
-| Grass patches | 98,583 | wild grass, grass clumps, tall grass, tufted grass, dry grass, cotton grass |
+| Canopy trees | 5,872,027 | European beech, black alder, black poplar, European aspen, common hazel |
+| Shrubs | 101,189 | heather, huckleberry oak |
+| Ferns | 140,250 | bracken |
+| Grass patches | 116,223 | wild grass, grass clumps, tall grass, tufted grass, dry grass, cotton grass |
+| Boulders and deadwood | 2,032 | mossy boulders, fallen logs, snags |
 
 Trees, shrubs and ferns are **Quixel Megaplants**, with every leaf as real geometry: up to
-**519 million triangles per tree** once all twig instances are expanded. The grass is **Quixel
-Megascans** alpha-tested cards. Near the camera everything is drawn as the real asset. Beyond that,
-each plant collapses to a single AABB in the acceleration structure, and an intersection shader
-ray-marches a baked, BC-compressed hemi-octahedral atlas of it. The bake runs on the same GPU, with
-the same ray tracing pipeline, in about 2 seconds at startup.
+**519 million triangles per tree** once all twig instances are expanded. The grass, palms, cacti
+and props are **Quixel Megascans**. Near the camera everything is drawn as the real asset. Beyond
+that, each plant collapses to a single AABB in the acceleration structure, and an intersection
+shader ray-marches a baked, BC-compressed hemi-octahedral atlas of it. The atlases are baked on the
+same GPU, with the same ray tracing pipeline, once, and cached.
 
-**At 1440p on an RTX 5080: 8.0 ms per frame with DLSS-RR Quality, 15.4 ms with DLAA.**
+**At 1440p on an RTX 5080: about 10 ms per frame with DLSS-RR Quality, 15–20 ms with DLAA.**
 
 | ![Forest interior](docs/images/canopy.jpg) | ![Flyover](docs/images/overview.jpg) |
 |---|---|
@@ -43,7 +53,7 @@ the same ray tracing pipeline, in about 2 seconds at startup.
   4. [Lighting impostors like the real plant](#4-lighting-impostors-like-the-real-plant)
   5. [Grass](#5-grass)
   6. [LOD and draw distance](#6-lod-and-draw-distance)
-  7. [Forest layout and ground](#7-forest-layout-and-ground)
+  7. [Terrain, rivers, forest growth, ground and biomes](#7-terrain-rivers-forest-growth-and-ground)
   8. [Materials](#8-materials)
   9. [Frame: DLSS Ray Reconstruction](#9-frame-dlss-ray-reconstruction-or-taa)
   10. [Performance work](#10-performance-work)
@@ -63,14 +73,20 @@ the same ray tracing pipeline, in about 2 seconds at startup.
   own TAA.
 - **Shader Execution Reordering.** On RTX 40/50 the primary rays are regrouped by what they hit
   before shading.
-- **A mixed forest from data.** Every species pack in `assets/species` is loaded. Four scattered
-  layers (canopy, shrubs, ferns, grass) follow biome fields: beech stands, alder on wet ground,
-  poplar and hazel at forest edges, aspen groves, heather on dry open ground, bracken under the
-  canopy, cotton grass in wet meadows.
+- **Forests that grow.** The canopy comes out of a seed-dispersal and succession simulation on
+  eroded terrain: beech stands, alder on wet ground, poplar and hazel at forest edges, aspen groves,
+  heather on dry open ground, bracken under the canopy, cotton grass in wet meadows. Eight biome
+  presets put other species, understory, ground and climate on the same landscape.
+- **The Earth at 1:1.** A cube-sphere quadtree of terrain tiles from orbit to 5 m cells, from
+  Copernicus 30 m elevation, ESA 10 m land cover and the RESOLVE ecoregions, with trees to the
+  horizon, a physically based atmosphere, volumetric clouds placed by climate, an FFT ocean, and the
+  real sun and moon.
 - **Megascans grass.** Clumps are grouped into 3 m patches. Real alpha-tested cards near the
   camera, compressed impostors beyond, the ground texture past the draw distance.
-- **Compressed, size-aware atlases.** Each variant's atlas is sized to the plant and BC-compressed
-  on the GPU right after the bake: 52 variants in 2.05 GB instead of 10.1 GB.
+- **Compressed, cached, streamed atlases.** Each variant's atlas is sized to the plant,
+  BC-compressed on the GPU (3.25 bytes per texel instead of 16) and cached on disk. On the GPU every
+  variant keeps a small base atlas; only the variants growing near the camera stream in their full
+  one.
 - **Impostors that light like the real plant.** Traced, layered self-shadowing, plus the *normal
   spread* of the leaves or blades baked per texel. Impostor brightness is within a few percent of
   the real meshes, front-lit, back-lit and from above, for trees and grass alike.
@@ -82,32 +98,46 @@ the same ray tracing pipeline, in about 2 seconds at startup.
 
 ## Performance
 
-RTX 5080, 2560x1440, camera moving or freshly placed every frame. DLAA is the quality reference.
+RTX 5080, 2560x1440, average over 300 frames. DLAA is the quality reference.
 
-| Scene | DLAA | DLSS-RR Quality | DLSS-RR Balanced |
+**The generated forest** (the default temperate biome, ~6.2M plants):
+
+| View | DLAA | DLSS-RR Quality | DLSS-RR Balanced |
 |---|---|---|---|
-| Meadow at eye level (hero image) | 15.4 ms | 8.0 ms | 6.5 ms |
-| Meadow from 15 m, looking down | 16.5 ms | 8.7 ms | 7.2 ms |
-| Forest interior | 11.3 ms | 6.1 ms | 5.3 ms |
-| 1.8 km fly-through (median) | 11.0 ms | | |
+| Clearing at eye level (`0,1.7,0,0,2`) | 18.6 ms | 9.7 ms | 7.9 ms |
+| Forest interior (`-150,1.7,-150,40,4`) | 19.8 ms | 10.4 ms | 8.6 ms |
+| From 45 m (`0,45,0,30,-10`) | 15.3 ms | 8.0 ms | 6.7 ms |
+
+```
+smart_imposter --size 2560x1440 --dlss quality --views "0,1.7,0,0,2;-150,1.7,-150,40,4;0,45,0,30,-10" --frames 300 --shot shots/perf.png
+```
 
 Quality renders at 1708x960 and is about 2x faster than DLAA. It's a little softer on grass blades:
 
 ![DLAA vs DLSS-RR Quality](docs/images/dlss_modes.jpg)
 
-Where the time goes, DLAA meadow view (GPU timestamps, printed by every screenshot run):
+Where the time goes in the clearing at DLAA (GPU timestamps, printed by every screenshot run):
+ray tracing (primary, sun shadow and AO rays) 12.9 ms, DLSS Ray Reconstruction 5.3 ms, tonemap,
+sharpen and blit 0.07 ms; the CPU's LOD pass and instance list (~0.1 ms) overlap the previous
+frame's GPU work. `SI_PROF_SKIP` takes out the shadow and AO rays to see their share.
 
-| Pass | Time |
-|---|---|
-| Ray tracing: primary rays and shading | 5.5 ms |
-| Ray tracing: sun shadow rays | 1.9 ms |
-| Ray tracing: ambient occlusion rays | 1.5 ms |
-| DLSS Ray Reconstruction (DLAA, 1440p) | 5.1 ms |
-| TLAS rebuild, tonemap, sharpen, blit | 0.2 ms |
-| CPU: LOD for 440k plants and instance list (overlapped with the GPU) | ~1 ms |
+**The globe** (DLSS-RR Quality, clouds on; GPU time once the view has streamed in):
 
-Startup (texture decode, BLAS build, bake and compression of 52 atlases) takes about 5.3 s. GPU
-memory: impostor atlases 2.05 GB, plant textures 0.85 GB, ground textures 0.27 GB.
+| View (`--at`) | GPU | GPU memory |
+|---|---|---|
+| Lake Como from 300 m (`46.05,9.25,300,200,-8`) | 16.3 ms | 8.5 GB |
+| In the treetops above Lake Como (`45.99,9.262,12,250,-4`) | 13.2 ms | 11.7 GB |
+| Aokigahara and Mount Fuji from 70 m (`35.47,138.62,70,140,-8`) | 18.5 ms | 11.7 GB |
+| The Earth from 12,000 km (`30,5,12000000,0,-90`) | 5.5 ms | 7.1 GB |
+
+Flying at 240 m/s, 300 m over Lake Como, with everything streaming in (`--bench-move 4`, 900
+frames): average 17.2 ms, 99th percentile 21–23 ms, worst 24–37 ms over repeated runs.
+
+Startup: the forest scene grows its ~6M trees in ~23 s (the succession simulation), then the
+renderer is ready in ~5 s (texture decode, BLAS builds, impostor atlases from the cache in ~1 s);
+the globe is ready in ~3 s. The first run bakes and caches every impostor atlas (~16 s for 207
+variants) and compresses the textures. GPU memory: ~8 GB for the forest scene, 7–12 GB on the
+globe depending on the view.
 
 ## How it works
 
@@ -136,8 +166,8 @@ part hierarchy, the textures and the material parameters. `megaplant_to_mtree.py
 hierarchy: small subtrees are merged into one mesh, large ones stay instanced. The result is unique
 meshes plus a list of (mesh, transform) parts per variant.
 
-The engine builds one BLAS per unique mesh: 162 meshes, 9.2M triangles, for 52 variants. A
-near tree costs one TLAS instance per part, not a copy of its geometry:
+The engine builds one BLAS per unique mesh: 517 meshes, 31.4M triangles, for 207 variants of 52
+species. A near tree costs one TLAS instance per part, not a copy of its geometry:
 
 | Species | Expanded triangles per variant | Parts per variant |
 |---|---|---|
@@ -174,7 +204,18 @@ atlases:
 | visibility | BC3, half resolution | sky visibility `a + b·up`, **normal spread** (length of the averaged normal) |
 
 Texels with zero coverage are left out of the block endpoint fit, so silhouette blocks keep their
-precision. That's 3.25 bytes per texel instead of 16. All 52 variants take 2.05 GB (6–125 MB each).
+precision. That's 3.25 bytes per texel instead of 16: all 207 variants take 7.4 GB at full
+resolution (0.6–125 MB each) instead of 36 GB.
+
+**Baked once, streamed by need** (`src/atlas.rs`). The compressed blocks of every variant go to
+`assets/cache/impostors`, keyed on the asset, the settings and the bake shaders, so later starts
+read them instead of baking (`SI_REBAKE=1` forces a bake). On the GPU every variant keeps a base
+atlas, its levels from 1/4 resolution down (0.46 GB for all 207), which is all a far impostor
+samples anyway. A variant gets its full atlas while one of its plants is close enough for the base
+atlas's texels to be bigger than a pixel, nearest first within `SI_IMPOSTOR_MB` (default 25% of
+VRAM): a loader thread reads it straight into a mapped upload buffer, and the copies are recorded
+into the frame like any other upload, so it never stalls a frame. The forest scene loads the full
+atlases of the variants that grow in it at startup.
 
 ### 3. The intersection shader (`shaders/impostor.rint`)
 
@@ -253,9 +294,10 @@ material's translucency tint.
   `tri.rahit` discards hits where the texture's opacity is below the cutoff. The cutoff drops with
   distance, since box-filtered mips thin the blades' coverage. This runs for camera, shadow and AO
   rays, and in the impostor bake, so impostors and shadows have the shape of the blades.
-- **Placement:** a fourth scatter layer (2.3 m spacing, 600 m radius) on open ground and forest
-  edges: wild grass and grass clumps as the base, dry grass on dry ground, cotton grass on wet
-  ground, tall and tufted grass in drifts. Each patch tilts to the slope.
+- **Placement:** a scatter layer (2.3 m spacing, 600 m radius) on open ground and forest edges:
+  wild grass and grass clumps as the base, dry grass on dry ground, cotton grass on wet ground,
+  tall and tufted grass in drifts (the temperate mix; each biome preset has its own). Each patch
+  tilts to the slope.
 - **LOD:** real cards to ~20 m, compressed impostors beyond, then a dissolve into the ground
   texture at 140–200 m.
 
@@ -401,7 +443,8 @@ supersampled resolution, tonemapping each sample before averaging.
 ### 10. Performance work
 
 The goal was speed without any visible change at DLAA. Every candidate was measured with GPU
-timestamps and compared with the previous build's image (old and new builds run alternately, twice):
+timestamps and compared with the previous build's image (old and new builds run alternately,
+twice). These were measured on the first, smaller forest (440k plants in a 1.4 km radius):
 
 | Change | Result |
 |---|---|
@@ -572,40 +615,46 @@ Streaming on an RTX 5080 at 1920x1080, DLSS-RR Quality, `--bench-move` over 900 
 Earlier, with synchronous per-tile uploads, the same runs had p99 64–68 ms and maxima of 76–110 ms.
 A cold view streams in fully in ~1.8 s after the first frame (was 4.3 s).
 
-Quixel species in the globe so far (docs/QUIXEL_DOWNLOADS.md): European Beech, Black Alder,
-Black Poplar, European Aspen, Common Hazel, Norway Spruce, Baltic Pine, Silver Birch, English Oak,
-Goat Willow, Norway Maple, Aleppo Pine, Dead Pine, Rowan, Elder, Giant Bamboo, Bilberry, Wood
-Anemone, European Spindle, Greasewood, Bracken, Heather, Huckleberry Oak and 7 grasses; 26 ground
-scans. Megaplants are exported from Unreal with `tools/ue_export_megaplants.py` (the USD plugins
-must be enabled) and converted with `tools/megaplant_to_mtree.py` (needs Pixar's `usd-core`).
-GPU memory is kept in check without losing detail: textures are block-compressed on first use
-and cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
+The Quixel species (52 packs, 207 variants; docs/QUIXEL_DOWNLOADS.md): 16 trees (European beech,
+black alder, black poplar, European aspen, common hazel, Norway spruce, Baltic pine, silver birch,
+English oak, goat willow, Norway maple, Aleppo pine, dead pine, rowan, elder, giant bamboo), shrubs
+and forest plants (heather, huckleberry oak, greasewood, European spindle, bilberry, wood anemone,
+bracken, leather fern, Xanadu, Zamia, five palms, yuccas, dead shrubs), scanned props (cacti,
+boulders, logs, snags), 13 grasses and 26 ground scans. Megaplants
+are exported from Unreal with `tools/ue_export_megaplants.py` (the USD plugins must be enabled) and
+converted with `tools/megaplant_to_mtree.py` (needs Pixar's `usd-core`); the Megascans glTF
+downloads go through `tools/fab_to_mtree.py` and `tools/grass_to_mtree.py`.
+
+GPU memory is kept in check without losing detail: textures are block-compressed on first use and
+cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
 >= 35 dB for almost all of them, a quarter of RGBA8 or less; static and streamed BLASes are
 compacted (the tree meshes 1.9 -> 0.7 GB); tree AABBs are build input only; plant records carry
-no padding. Impostor atlases are baked once into `assets/cache/impostors` (BC blocks per variant,
-re-baked when the asset, the settings or a bake shader changes; `SI_REBAKE=1` forces it; 6.8 GB
-on disk). On the GPU every variant keeps only a base atlas (its levels from 1/4 resolution
-down, 0.46 GB for all 207), and the variants growing near the camera stream their full atlas in
-on a loader thread (`atlas.rs`, `Renderer::update_atlases`): a variant goes full while the base
-atlas's texels would be larger than a pixel on its nearest plant, nearest first within
-`SI_IMPOSTOR_MB` (default 25% of VRAM), and drops back once the camera has moved on. Far impostors
-sample the low levels either way, so nothing changes on screen, and the atlases no longer need
-shrinking to fit: a typical view holds 2-3.7 GB of full atlases where all of them took 6 GB at
-reduced resolution. Terrain tiles nothing has drawn for 4 s are evicted and empty vertex pool and
-BLAS heap chunks are given back, so memory stays flat when the camera jumps across the planet
-(`--tour`). `SI_MEM=1` prints the GPU memory by allocation with the benchmark output (and after
-each tour shot).
+no padding; impostor atlases stream by need (see [Baking and compressing the
+impostor](#2-baking-and-compressing-the-impostor)). Terrain tiles nothing has drawn for 4 s are
+evicted, and empty vertex pool and BLAS heap chunks are given back, so memory stays flat when the
+camera jumps across the planet. `SI_MEM=1` prints the GPU memory by allocation with the benchmark
+output (and after each tour shot).
 
-**Still to do** (see the plan): the glTF 3D plants (palms, cacti, Xanadu, marram and ribbon
-grass, poppies, dandelions) need an importer; rivers from HydroRIVERS (the 10 m land cover has the
-wide ones); ocean waves, clouds, stars and seasons.
+**Scripted tours and video** (`--tour`, `src/tour.rs`). A tour file is a list of shots: spline keys
+(latitude, longitude, height above the ground, heading, pitch) with a local solar time, cloud cover,
+date and exposure compensation per shot. Each shot waits in black until its terrain, trees, ocean
+and full atlases have streamed in, then fades in, flies its keys with eased, constant-speed motion
+and fades out. Animation steps a fixed 1/60 s per frame, so with `--tour-pace 40` (each frame on
+screen for 40 ms) a 60 fps recorder captures every frame however heavy the scene;
+`tools/record_tour.ps1` records it with OBS Studio and `tools/tour_post.py` drops the repeated
+frames, cuts the loading gaps and adds titles, giving smooth 60 fps video.
+[`tours/showcase.txt`](tours/showcase.txt) is a five-minute flight over ten forests.
+
+**Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
+stars, seasons in the vegetation, and wind.
 
 ## Getting started
 
 ### Requirements
 - A GPU with Vulkan hardware ray tracing (`VK_KHR_ray_tracing_pipeline`, `VK_KHR_acceleration_structure`). Developed on an RTX 5080 (16 GB).
-- About 4.5 GB of free VRAM for atlases and textures at the defaults. Lower it with
-  `--imp-res 320`, `--imp-texel 0.08`, `SI_TEX_MAX=1024` or `--species Beech,Alder`.
+- About 8 GB of VRAM for the forest scene and 12 GB for the globe at the defaults (16 GB
+  recommended). Lower it with `SI_IMPOSTOR_MB=2000`, `--imp-res 320`, `SI_TEX_MAX=1024` or
+  `--species Beech,Alder` (forest scene).
 - Rust (stable) and the [Vulkan SDK](https://vulkan.lunarg.com/), for `glslangValidator`.
 - Python 3.12 with `usd-core`, `numpy` and `pillow`, for the asset converters.
 - Optional, for DLSS Ray Reconstruction: an NVIDIA RTX GPU, the
@@ -633,15 +682,25 @@ license doesn't allow redistribution, so this repository contains no assets. Get
    tools/.venv/Scripts/python tools/megaplant_to_mtree.py assets/megaplants/Tree_European_Beech assets/species/Tree_European_Beech
    ```
    This writes `assets/species/<Species>.mtree` and `.json` (kind, textures, Unreal tints,
-   variants, heights). The engine loads every pack in `assets/species`. Species it doesn't know
-   by name are spread evenly through the matching layer.
+   variants, heights). The engine loads every pack in `assets/species`. Species are found by
+   name: the forest scene grows the ones its biome preset names (`src/biome.rs`; any species with
+   `--species`), the globe the ones its biome tables name (`globe/forest.rs`); a missing one is
+   skipped.
 4. Grass (optional): add Megascans 3D grass to your Fab library (Grass Clumps, Wild Grass, Tall
    Grass, Tufted Grass, Dry Grass, Cotton Grass), download the glTF format, and convert each:
    ```
    tools/.venv/Scripts/python tools/grass_to_mtree.py <FabLibrary>/Grass_Clumps-<id> assets/species/Grass_Clumps
    ```
    Options: `--patch 2.6` (patch diameter, m), `--patches 3` (variants), `--density 1.0`.
-5. Ground (optional): add the Fab surfaces listed in `catalog.rs` `GROUND_LAYERS` (Forest Floor,
+5. Other Megascans plants and props (optional): palms, ferns and yuccas (alpha-tested cards) and
+   scanned solids (cacti, boulders, logs, snags), from their Fab glTF downloads:
+   ```
+   tools/.venv/Scripts/python tools/fab_to_mtree.py plant <FabLibrary>/<Plant>-<id> assets/species/Shrub_<Name> --kind shrub
+   tools/.venv/Scripts/python tools/fab_to_mtree.py solid assets/species/Prop_<Name> <FabLibrary>/<Scan>-<id> [...]
+   ```
+   A `solid` group (all the cacti, say) becomes one species with a shared texture atlas; see the
+   script's header for the options.
+6. Ground (optional): add the Fab surfaces listed in `catalog.rs` `GROUND_LAYERS` (Forest Floor,
    Mossy Grass, Uncut Grass, Grass Dried, rock cliffs, snow, gravel, riverbed, pebbles, wet grass;
    glTF, 2K). The engine finds them in your Fab library cache: set `SI_GROUND_DIR` to it, at run
    time or at build time in `.cargo/config.toml` (`[env]`). Missing surfaces fall back to
@@ -676,13 +735,18 @@ cargo run --release
 | Flag | Meaning |
 |---|---|
 | `--size 2560x1440`, `--fullscreen` | window size / borderless fullscreen |
+| `--vsync`, `--validation` | present with vsync; Vulkan validation layers (also `SI_VALIDATION`) |
 | `--dlss dlaa\|quality\|balanced\|performance\|ultra\|off` | DLSS Ray Reconstruction mode (default quality) |
-| `--fly` | automatic showcase fly-through (1.8 km loop) |
+| `--fly [--fly-speed 13 --fly-start 0]` | forest scene: automatic showcase fly-through (1.8 km loop): speed (m/s), start (m along the path) |
 | `--ss 2` | supersampling factor for the TAA path (default 1.5) |
 | `--lod 50`, `--lod-band 12` | mesh distance for a 16 m plant and dissolve band width |
+| `--lod2 100`, `--lod2-band 24` | forest scene: high-detail to low-detail impostor distance and its band |
+| `--ao 1` | AO rays per pixel (0-2; key O) |
+| `--sun 35,38`, `--haze 1` | sun azimuth / elevation (degrees) and aerial perspective strength (forest scene; defaults from the biome) |
 | `--species Beech,Fern` | load only matching species packs |
+| `--asset path.mtree` | a single plant asset (the older single-species route, when `assets/species` is empty) |
 | `--imp-texel 0.055 --imp-res 448 --imp-grid 12` | impostor texel size (m), maximum frame resolution, views per side |
-| `--spacing 7 --radius 1400` | canopy tree spacing and forest radius |
+| `--spacing 7 --radius 8000` | forest scene: canopy tree spacing and forest radius (m, the defaults) |
 | `--sharpen 0.5`, `--no-taa` | post-processing |
 | `--clouds on\|off`, `--cloud-cover 0.45` | globe: volumetric clouds and how much of the sky they cover (0-1, before the weather systems and latitude belts); key U toggles them |
 | `--tree-thinning smooth\|stepped` | globe: how distant trees thin out (see [Trees to the horizon](#the-earth-a-11-globe-and-real-places)); key N toggles it |
@@ -696,15 +760,26 @@ cargo run --release
 | `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
 | `--tour tours/showcase.txt [--tour-pace 40]` | globe: fly a scripted tour (`src/tour.rs`: shots of spline keys, local time, cloud cover, exposure; black while each shot streams in, then a fade in and out) and exit. Each frame steps 1/60 s; with a pace above 16.7 ms it plays slower than real time so a 60 fps recorder captures every frame (`tools/record_tour.ps1` + `tools/tour_post.py` turn that into a 60 fps video). `SI_TOUR_STILLS=1` saves stills per shot |
 | `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--time 2026-06-21T10:30] [--time-rate s]` | the 1:1 globe; `--views` takes the same five numbers per view; `--time` is UTC (default 10:30 local solar time on the June solstice), `--time-rate` simulated seconds per second (default real time, stopped when capturing); `--bench-move m` flies along the heading at constant height |
+| `smart_imposter --convert-dem <tif>...` | convert Copernicus GeoTIFFs to the engine's `.dem` next to them (in parallel) and delete the GeoTIFFs (`tools/fetch_earth.py` runs it as tiles arrive) |
 
 | Environment | Meaning |
 |---|---|
 | `DLSS_SDK` | (build) DLSS SDK root; enables Ray Reconstruction |
 | `SI_DLSS_DIR` | folder with `nvngx_dlssd.dll` (default `assets/dlss`) |
+| `SI_DLSS_JITTER` | DLSS jitter sign test: `+x` and / or `+y` pass the raw sample offset instead of the (measured sharpest) flipped one |
 | `SI_NO_SER` | disable Shader Execution Reordering |
+| `SI_VALIDATION` | same as `--validation` |
 | `SI_PROF_SKIP` | profiling: 1 no sun-shadow rays, 2 no AO rays, 3 neither |
-| `SI_TEX_MAX` | maximum plant/ground texture size (default 2048) |
+| `SI_TEX_MAX`, `SI_GROUND_TEX_MAX` | maximum plant / ground texture size (default 2048) |
 | `SI_GROUND_DIR` | Fab library cache with the ground surfaces |
+| `SI_IMPOSTOR_MB` | GPU memory for full impostor atlases (default 25% of VRAM) |
+| `SI_REBAKE` | re-bake every impostor atlas instead of reading the cache |
+| `SI_ATLAS_LOG` | log full-atlas uploads (image creation and descriptor update times) |
+| `SI_MEM` | print GPU memory by allocation with the benchmark output and after each tour shot |
+| `SI_TOUR_STILLS` | `--tour`: save three stills per shot to `shots/` |
+| `SI_STREAM_LOG`, `SI_TREE_STATS` | globe: log streaming every frame; tree tile statistics |
+| `SI_NO_UNDER` | globe: no understory (profiling) |
+| `SI_PARTS` | list every variant's parts and triangle counts at startup |
 | `SI_FOREST_MAP` | print a coarse plant-count map |
 | `SI_DUMP_ATLAS` | same as `--dump-atlas` |
 
@@ -721,6 +796,8 @@ cargo run --release
 | L | DLSS Ray Reconstruction on/off |
 | J | cycle DLSS mode: DLAA, Quality, Balanced, Performance, Ultra Performance |
 | `[` `]` | mesh distance |
+| `;` `'` | high- to low-detail impostor distance (forest scene) |
+| G | aerial perspective on/off |
 | 0–5 | debug views |
 | K | supersampling 1x / 1.5x / 2x (TAA path) |
 | T | TAA on/off |
@@ -746,8 +823,9 @@ cargo run --release
 | `tools/megaplant_to_mtree.py` | flatten an exported Megaplant into `.mtree` + species `.json` |
 | `tools/grass_to_mtree.py` | Megascans 3D grass (Fab glTF) → grass-patch species pack |
 | `tools/usd_to_mtree.py`, `tools/ue_export.py` | single-species route from a Fab USD download |
-| `tools/compare.ps1`, `tools/treestats.py` | render the same view as impostors and as meshes in several debug modes and compare tree-pixel statistics |
+| `tools/compare.ps1`, `tools/grid.py`, `tools/treestats.py` | render the same view as impostors and as meshes in several debug modes, lay the pairs out in a labelled grid and compare tree-pixel statistics |
 | `tools/sweep.ps1`, `tools/sweep_plot.py` | tree brightness vs camera distance, smooth vs hard LOD switching |
+| `tools/fab_to_mtree.py` | Megascans plants (alpha-tested cards: palms, ferns, yuccas) and scanned solids (cacti, boulders, logs, snags, sharing one texture atlas) from Fab glTF → species packs |
 | `tools/usd_inspect.py`, `tools/usd_details.py`, `tools/uv_check.py`, `tools/leaf_check.py` | asset inspection |
 | `tools/make_docs_images.py` | build the README images from renders |
 | `tools/record_tour.ps1` | record a `--tour` with OBS Studio (profile setup in the script header) |
@@ -757,28 +835,38 @@ cargo run --release
 
 ```
 src/
-  main.rs      window, input, fly-cam, multi-view capture, CLI
-  renderer.rs  pipelines, SBT, impostor bake + BC compression, LOD state machine, TLAS,
-               DLSS / TAA / resolve / sharpen passes, GPU profiling
-  dlss.rs      DLSS Ray Reconstruction (NGX) bindings, compiled only with the DLSS SDK
-  catalog.rs   species packs, per-variant LOD scale and draw distance, ground surfaces
-  gpu.rs       Vulkan device (RT, SER and NGX extensions), buffers, images, swapchain
-  accel.rs     BLAS / TLAS building, instance records
-  asset.rs     .mtree loader
-  textures.rs  parallel PNG decode, per-species normalisation, GPU mip generation
-  world.rs     terrain (eroded or a real site), forest succession, biome scatter, ground masks
-  biome.rs     --biome presets for the eroded terrain: species roles, understory, ground scans, climate
-  erosion.rs   uplift + stream-power erosion, priority flood, drainage, river polylines
-  globe/       the 1:1 Earth as a mode of the renderer: scene (streaming, pooled GPU storage,
-               BLAS builds in the frame, instances), tiles (cube-sphere quadtree, tile meshes),
-               forest (tree and understory tiles), etopo / dem / landcover (data readers)
-  flypath.rs   arc-length parameterised Catmull-Rom showcase path
+  main.rs       window, input, fly-cam, multi-view capture, the tour player, CLI
+  renderer.rs   pipelines, SBT, impostor bake + BC compression, atlas streaming, LOD state machine,
+                TLAS, DLSS / TAA / resolve / sharpen passes, GPU profiling
+  atlas.rs      impostor atlas cache files, stream layout, the loader thread, upload ranges
+  dlss.rs       DLSS Ray Reconstruction (NGX) bindings, compiled only with the DLSS SDK
+  catalog.rs    species packs, per-variant LOD scale and draw distance, ground surfaces
+  gpu.rs        Vulkan device (RT, SER and NGX extensions), buffers, images, swapchain
+  accel.rs      BLAS / TLAS building, instance records
+  asset.rs      .mtree loader
+  textures.rs   parallel PNG decode, BC7 / BC5 / BC4 cache, per-species normalisation, mips
+  bc7.rs        CPU texture block compression for the texture cache
+  cloudnoise.rs the clouds' tiling 3D Perlin-Worley / Worley noise, built once and cached
+  world.rs      the forest scene: terrain (eroded or a real site), succession, scatter, ground masks
+  biome.rs      --biome presets for the eroded terrain: species roles, understory, ground scans, climate
+  erosion.rs    uplift + stream-power erosion, priority flood, drainage, river polylines
+  tour.rs       scripted camera tours: the shot file, spline paths, easing, fades
+  flypath.rs    arc-length parameterised Catmull-Rom fly-through path (forest scene)
+  globe/        the 1:1 Earth as a mode of the renderer:
+    scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
+    tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
+    forest.rs     tree and understory tiles, species by biome
+    ocean.rs      the FFT sea (spectrum, cascades, whitecaps) on its own thread
+    sky.rs        UTC clock, sun and moon positions, moonlight
+    etopo.rs / dem.rs / landcover.rs / biomes.rs   the data readers
 native/
   dlss_shim.cpp  thin C ABI over the NGX Vulkan Ray Reconstruction API
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl, atmosphere.glsl)
+  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl, atmosphere.glsl, clouds.glsl)
+tools/   asset converters, the Earth data downloader, comparisons, tour recording (see Tools)
+tours/   tour files for --tour
 ```
 
 ## Limitations
@@ -791,10 +879,12 @@ shaders/
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
-- **Globe:** tropical, desert and mangrove trees are stand-ins until their Quixel species are
-  imported (palms and cacti are glTF downloads without an importer yet); the ground colour without
-  land cover data is a latitude stand-in; the ocean has no waves; no stars. Site mode uses the
-  forest scene's lowland species everywhere. Terrain pools take ~1–2 GB of VRAM in a typical view.
+- **Stand-in species:** the catalog is European and Mediterranean trees plus palms and desert
+  plants, so tropical forests are broad-crowned European species with bamboo and palms, and
+  savanna trees are oaks; mangroves are willows and alders.
+- **Globe:** the ground colour where there is no land cover data is a latitude stand-in; no stars;
+  site mode (`--site`) grows the temperate preset unless `--biome` picks another. Terrain pools take ~1–2 GB of
+  VRAM in a typical view.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 

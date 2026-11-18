@@ -362,7 +362,10 @@ fn stats(px: &[u8], mask: &[u8]) -> (f32, f32) {
 /// Load all textures on worker threads (capped at `max` texels per side): from the BC7 cache, or
 /// decoded, mip-mapped and BC7-encoded, then uploaded. Also returns each texture's statistics
 /// (mean linear luminance, mean blue; 0 for placeholders).
-fn load_jobs(gpu: &Gpu, jobs: &[Job], max: u32) -> Result<(Vec<Image>, Vec<(f32, f32)>)> {
+/// Textures and per-texture statistics (mean linear luminance, mean blue).
+type Loaded = (Vec<Image>, Vec<(f32, f32)>);
+
+fn load_jobs(gpu: &Gpu, jobs: &[Job], max: u32) -> Result<Loaded> {
     let t = std::time::Instant::now();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let done: Vec<std::sync::Mutex<Option<Result<Bc7Tex>>>> = jobs.iter().map(|_| std::sync::Mutex::new(None)).collect();
@@ -453,7 +456,11 @@ const FOLIAGE_LUMINANCE: f32 = 0.09; // Black Alder's, which the lighting was tu
 /// 4 textures per species (foliage CA, foliage NT, bark C, bark NAH); missing ones get neutral
 /// placeholders. Returns the textures, per species (foliage brightness scale, translucency mask
 /// mean), and false when no species has foliage textures (procedural leaf colours).
-pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<(Vec<Image>, Vec<(f32, f32)>, bool)> {
+/// The species textures, per species (foliage brightness scale, translucency mask mean), and
+/// whether any species has foliage textures.
+type SpeciesTextures = (Vec<Image>, Vec<(f32, f32)>, bool);
+
+pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<SpeciesTextures> {
     let mut jobs = Vec::new();
     for s in &cat.species {
         for &(src, format, enc, fill) in &SLOTS {

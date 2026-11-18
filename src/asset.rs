@@ -93,7 +93,7 @@ pub fn load(path: &str) -> Result<TreePack> {
         let normals = r.f32s(v * 3)?;
         let uvs = if version >= 2 { r.f32s(v * 2)? } else { vec![0.0; v * 2] };
         let indices = r.u32s(t * 3)?;
-        let padded = (t + 3) / 4 * 4;
+        let padded = t.div_ceil(4) * 4;
         let materials = r.bytes(padded)?.to_vec();
         meshes.push(MeshData { name, positions, normals, uvs, indices, materials });
     }
