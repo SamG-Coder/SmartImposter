@@ -127,6 +127,8 @@ struct State {
     view_frames: u32,
     shots: u32,
     capture_next: bool,
+    /// frame times (s) since the current view's tiles settled
+    times: Vec<f64>,
 }
 
 struct App {
@@ -177,6 +179,7 @@ impl App {
             view_frames: 0,
             shots: 0,
             capture_next: false,
+            times: Vec::new(),
         });
         Ok(())
     }
@@ -235,6 +238,7 @@ impl App {
             sun: f(sun, 20.0),
             planet: f(-s.cam.pos, R_EARTH as f32),
             params: [s.exposure, 0.0, s.debug as f32, 0.0],
+            misc: [0.0; 4],
             addr: [0; 4],
         };
 
@@ -242,7 +246,10 @@ impl App {
         let mut capture = s.capture_next;
         if !views.is_empty() {
             s.view_frames += 1;
-            if s.r.waiting == 0 && s.view_frames > 8 || s.view_frames > 900 {
+            if s.r.waiting == 0 && s.r.trees_waiting() == 0 {
+                s.times.push(dt);
+            }
+            if s.r.waiting == 0 && s.r.trees_waiting() == 0 && s.times.len() > 30 || s.view_frames > 1500 {
                 capture = true;
             }
         }
@@ -255,7 +262,9 @@ impl App {
                 (None, _) => format!("shots/globe_{:03}.png", s.shots),
             };
             crate::save_png(&path, w, h, &img)?;
-            println!("saved {path} ({} tiles drawn, {} cached)", s.r.drawn, s.r.tile_count());
+            let ms = if s.times.len() > 5 { s.times[5..].iter().sum::<f64>() / (s.times.len() - 5) as f64 * 1000.0 } else { 0.0 };
+            println!("saved {path} ({} tiles drawn, {} cached, {} trees, {:.1} ms/frame)", s.r.drawn, s.r.tile_count(), s.r.trees_drawn, ms);
+            s.times.clear();
             s.shots += 1;
             s.capture_next = false;
             if !views.is_empty() {
@@ -279,14 +288,15 @@ impl App {
             let alt = s.cam.pos.length() - tiles::ground_radius(&s.etopo, s.cam.pos);
             let alt_s = if alt > 10_000.0 { format!("{:.0} km", alt / 1000.0) } else { format!("{:.0} m", alt) };
             s.window.set_title(&format!(
-                "SmartImposter Earth | {:.0} fps | {:.4}, {:.4} | {} above ground | {} tiles drawn, {} cached, {} waiting",
+                "SmartImposter Earth | {:.0} fps | {:.4}, {:.4} | {} above ground | {} tiles drawn, {} cached, {} waiting | {} trees",
                 s.fps_n as f32 / el_t,
                 lat,
                 lon,
                 alt_s,
                 s.r.drawn,
                 s.r.tile_count(),
-                s.r.waiting
+                s.r.waiting,
+                s.r.trees_drawn
             ));
             s.fps_t = Instant::now();
             s.fps_n = 0;

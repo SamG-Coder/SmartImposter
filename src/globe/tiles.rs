@@ -250,14 +250,14 @@ pub fn select(cam: DVec3, resident: &dyn Fn(TileId) -> bool, terrain: &Terrain) 
     (draw, want)
 }
 
-fn tile_distance(id: TileId, cam: DVec3) -> f64 {
+pub fn tile_distance(id: TileId, cam: DVec3) -> f64 {
     let c = id.center_dir() * R_EARTH;
     let bound = id.edge() * 0.75 + 9_000.0f64.min(id.edge());
     ((cam - c).length() - bound).max(0.0)
 }
 
 /// Behind the planet (over the horizon, with room for mountains sticking up beyond it)?
-fn over_horizon(id: TileId, cam: DVec3) -> bool {
+pub fn over_horizon(id: TileId, cam: DVec3) -> bool {
     let r = cam.length();
     if r <= R_EARTH + 100.0 {
         return false;

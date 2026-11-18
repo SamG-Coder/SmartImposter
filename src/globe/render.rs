@@ -1,11 +1,14 @@
 //! Globe renderer: one BLAS per terrain tile, a TLAS rebuilt every frame with the tiles placed
 //! relative to the camera (float64 on the CPU, float32 on the GPU), tiles built on worker threads
-//! and uploaded as they arrive, and one ray tracing pipeline (globe.rgen / globe.rchit).
+//! and uploaded as they arrive, trees near the camera as impostors (per-tile cluster BLAS of tree
+//! AABBs, the forest scene's impostor shaders and baked atlases), one ray tracing pipeline.
 
 use super::dem::Terrain;
+use super::forest::{self, Impostors, Roles, TreeTile};
 use super::tiles::{self, TileId, TileMesh, VSTRIDE};
 use crate::accel::{self, Accel, Tlas};
 use crate::gpu::{align_up, Buffer, Gpu, Image, Swapchain};
+use crate::renderer::Globals;
 use anyhow::{Context, Result};
 use ash::vk;
 use bytemuck::{Pod, Zeroable};
@@ -33,23 +36,37 @@ pub struct GlobeGlobals {
     pub sun: [f32; 4],
     /// xyz planet centre relative to the camera, w = radius
     pub planet: [f32; 4],
-    /// x exposure, y frame index, z debug view, w unused
+    /// x exposure, y frame index, z debug view, w ground scans present (bit mask)
     pub params: [f32; 4],
+    /// x pixel angle (rad)
+    pub misc: [f32; 4],
     /// xy shared index buffer address (lo, hi)
     pub addr: [u32; 4],
 }
 
-const MAX_TILES_DRAWN: u32 = 16_384;
-/// Ground scans (catalog.rs GROUND_LAYERS) x albedo / normal / ORM. Must match globe.rgen.
-pub const GROUND_TEX: u32 = 36;
+const MAX_INSTANCES: u32 = 20_000;
 const CACHE_TILES: usize = 14_000;
 const UPLOADS_PER_FRAME: usize = 160;
+const TREE_UPLOADS_PER_FRAME: usize = 128;
+/// Ground scans (catalog.rs GROUND_LAYERS) x albedo / normal / ORM. Must match globe.rchit.
+pub const GROUND_TEX: u32 = 36;
+/// Impostor atlas slots (shared.glsl MAX_VARIANTS).
+const MAX_VARIANTS: u32 = crate::renderer::MAX_VARIANTS as u32;
 
 struct TileGpu {
     buf: Buffer,
     blas: Accel,
     center: DVec3,
     last_used: u64,
+}
+
+struct TreeTileGpu {
+    /// first plant record (u32::MAX: no trees)
+    base: u32,
+    count: u32,
+    blas: Option<Accel>,
+    aabbs: Option<Buffer>,
+    center: DVec3,
 }
 
 struct Pipe {
@@ -62,6 +79,81 @@ struct Pipe {
 
 type Queue = Arc<(Mutex<VecDeque<TileId>>, Condvar)>;
 
+/// First-fit allocator of record ranges in the plant buffer (free ranges sorted, merged on free).
+struct RangeAlloc {
+    free: Vec<(u32, u32)>,
+}
+
+impl RangeAlloc {
+    fn new(n: u32) -> Self {
+        RangeAlloc { free: vec![(0, n)] }
+    }
+    fn alloc(&mut self, n: u32) -> Option<u32> {
+        let i = self.free.iter().position(|r| r.1 >= n)?;
+        let start = self.free[i].0;
+        self.free[i].0 += n;
+        self.free[i].1 -= n;
+        if self.free[i].1 == 0 {
+            self.free.remove(i);
+        }
+        Some(start)
+    }
+    fn release(&mut self, start: u32, n: u32) {
+        let i = self.free.partition_point(|r| r.0 < start);
+        self.free.insert(i, (start, n));
+        // merge with the neighbours
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
+    }
+    fn free_records(&self) -> u32 {
+        self.free.iter().map(|r| r.1).sum()
+    }
+}
+
+fn spawn_workers<T: Send + 'static>(n: usize, queue: &Queue, tx: mpsc::Sender<T>, work: impl Fn(TileId) -> T + Send + Sync + 'static) {
+    let work = Arc::new(work);
+    for _ in 0..n {
+        let (q, tx, work) = (queue.clone(), tx.clone(), work.clone());
+        std::thread::spawn(move || loop {
+            let id = {
+                let (lock, cv) = &*q;
+                let mut g = lock.lock().unwrap();
+                loop {
+                    if let Some(id) = g.pop_front() {
+                        break id;
+                    }
+                    g = cv.wait(g).unwrap();
+                }
+            };
+            if tx.send(work(id)).is_err() {
+                return;
+            }
+        });
+    }
+}
+
+/// Replace a work queue's not-yet-started entries with `want` (nearest first).
+fn requeue(queue: &Queue, pending: &mut HashSet<TileId>, want: impl Iterator<Item = TileId>, have: impl Fn(&TileId) -> bool, limit: usize) {
+    let (lock, cv) = &**queue;
+    let mut q = lock.lock().unwrap();
+    for id in q.drain(..) {
+        pending.remove(&id);
+    }
+    for id in want.take(limit) {
+        if !pending.contains(&id) && !have(&id) {
+            pending.insert(id);
+            q.push_back(id);
+        }
+    }
+    cv.notify_all();
+}
+
 pub struct GlobeRenderer {
     pub gpu: Gpu,
     pub swap: Swapchain,
@@ -73,6 +165,7 @@ pub struct GlobeRenderer {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     ubo: Buffer,
+    fubo: Buffer,
     table: Buffer,
     tlas: Tlas,
     idx: Buffer,
@@ -83,6 +176,11 @@ pub struct GlobeRenderer {
     ground_sampler: vk::Sampler,
     /// bit per ground scan present
     pub ground_mask: u32,
+    imps: Impostors,
+    imp_info: Buffer,
+    atlas_sampler: vk::Sampler,
+    plants: Buffer,
+    plant_state: Buffer,
     cb: vk::CommandBuffer,
     fence: vk::Fence,
     acquire_sem: vk::Semaphore,
@@ -91,12 +189,19 @@ pub struct GlobeRenderer {
     pending: HashSet<TileId>,
     queue: Queue,
     done_rx: mpsc::Receiver<TileMesh>,
+    trees: HashMap<TileId, TreeTileGpu>,
+    records: RangeAlloc,
+    tree_pending: HashSet<TileId>,
+    tree_queue: Queue,
+    tree_rx: mpsc::Receiver<TreeTile>,
     frame: u64,
     vsync: bool,
     pub need_resize: bool,
     /// Tiles drawn / waiting for the last frame.
     pub drawn: usize,
     pub waiting: usize,
+    /// Trees in the TLAS for the last frame.
+    pub trees_drawn: usize,
 }
 
 impl GlobeRenderer {
@@ -107,39 +212,49 @@ impl GlobeRenderer {
         let (out, readback) = Self::create_out(&gpu, swap.extent)?;
         let d = gpu.device.clone();
 
-        // descriptors: TLAS, output image, globals, tile table
-        let b = |i: u32, ty: vk::DescriptorType, st: vk::ShaderStageFlags| {
-            vk::DescriptorSetLayoutBinding::default().binding(i).descriptor_type(ty).descriptor_count(1).stage_flags(st)
+        // descriptors: the impostor shaders' bindings (rt.glsl / impostor.rint: 3 globals, 5 impostor
+        // infos, 6 / 7 / 11 / 14 atlases, 23 plant records, 24 plant LOD state) plus the globe's own
+        let b = |i: u32, ty: vk::DescriptorType, n: u32| {
+            let st = vk::ShaderStageFlags::RAYGEN_KHR
+                | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+                | vk::ShaderStageFlags::MISS_KHR
+                | vk::ShaderStageFlags::INTERSECTION_KHR;
+            vk::DescriptorSetLayoutBinding::default().binding(i).descriptor_type(ty).descriptor_count(n).stage_flags(st)
         };
-        let rt = vk::ShaderStageFlags::RAYGEN_KHR | vk::ShaderStageFlags::CLOSEST_HIT_KHR | vk::ShaderStageFlags::MISS_KHR;
+        use vk::DescriptorType as DT;
         let bindings = [
-            b(0, vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, rt),
-            b(1, vk::DescriptorType::STORAGE_IMAGE, rt),
-            b(2, vk::DescriptorType::UNIFORM_BUFFER, rt),
-            b(3, vk::DescriptorType::STORAGE_BUFFER, rt),
-            b(4, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, rt),
-            vk::DescriptorSetLayoutBinding::default()
-                .binding(5)
-                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                .descriptor_count(GROUND_TEX)
-                .stage_flags(rt),
+            b(0, DT::ACCELERATION_STRUCTURE_KHR, 1),
+            b(1, DT::STORAGE_IMAGE, 1),
+            b(3, DT::UNIFORM_BUFFER, 1),
+            b(5, DT::STORAGE_BUFFER, 1),
+            b(6, DT::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS),
+            b(7, DT::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS),
+            b(11, DT::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS),
+            b(14, DT::COMBINED_IMAGE_SAMPLER, MAX_VARIANTS),
+            b(23, DT::STORAGE_BUFFER, 1),
+            b(24, DT::STORAGE_BUFFER, 1),
+            b(30, DT::UNIFORM_BUFFER, 1),
+            b(31, DT::STORAGE_BUFFER, 1),
+            b(32, DT::COMBINED_IMAGE_SAMPLER, 1),
+            b(33, DT::COMBINED_IMAGE_SAMPLER, GROUND_TEX),
         ];
         let set_layout = unsafe { d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)? };
         let pipe_layout = unsafe { d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]), None)? };
         let sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 1 + GROUND_TEX },
+            vk::DescriptorPoolSize { ty: DT::ACCELERATION_STRUCTURE_KHR, descriptor_count: 1 },
+            vk::DescriptorPoolSize { ty: DT::STORAGE_IMAGE, descriptor_count: 1 },
+            vk::DescriptorPoolSize { ty: DT::UNIFORM_BUFFER, descriptor_count: 2 },
+            vk::DescriptorPoolSize { ty: DT::STORAGE_BUFFER, descriptor_count: 4 },
+            vk::DescriptorPoolSize { ty: DT::COMBINED_IMAGE_SAMPLER, descriptor_count: 4 * MAX_VARIANTS + 1 + GROUND_TEX },
         ];
         let pool = unsafe { d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None)? };
         let set = unsafe { d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout]))?[0] };
         let pipe = Self::create_pipeline(&gpu, pipe_layout)?;
 
         let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
-        let table = gpu.create_buffer(MAX_TILES_DRAWN as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
-        let tlas = Tlas::new(&gpu, MAX_TILES_DRAWN)?;
+        let fubo = gpu.create_buffer(std::mem::size_of::<Globals>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "impostor globals")?;
+        let table = gpu.create_buffer(MAX_INSTANCES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
+        let tlas = Tlas::new(&gpu, MAX_INSTANCES)?;
         let indices = tiles::index_buffer();
         let idx = gpu.upload_buffer(
             bytemuck::cast_slice(&indices),
@@ -158,18 +273,21 @@ impl GlobeRenderer {
             vk::Format::R16_SNORM,
             "etopo",
         )?;
-        let sampler = unsafe {
-            d.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .max_lod(vk::LOD_CLAMP_NONE),
-                None,
-            )?
+        let linear = |u: vk::SamplerAddressMode, v: vk::SamplerAddressMode| -> Result<vk::Sampler> {
+            Ok(unsafe {
+                d.create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::LINEAR)
+                        .min_filter(vk::Filter::LINEAR)
+                        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                        .address_mode_u(u)
+                        .address_mode_v(v)
+                        .max_lod(vk::LOD_CLAMP_NONE),
+                    None,
+                )?
+            })
         };
+        let sampler = linear(vk::SamplerAddressMode::REPEAT, vk::SamplerAddressMode::CLAMP_TO_EDGE)?;
         println!("Elevation grid on the GPU ({:.1}s)", t.elapsed().as_secs_f32());
         // Quixel ground scans (the forest scene's layers): missing ones are 1x1 placeholders
         let found = crate::catalog::find_ground();
@@ -179,18 +297,16 @@ impl GlobeRenderer {
             ground.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
         }
         ground.truncate(GROUND_TEX as usize);
-        let ground_sampler = unsafe {
-            d.create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
-                    .address_mode_v(vk::SamplerAddressMode::REPEAT)
-                    .max_lod(vk::LOD_CLAMP_NONE),
-                None,
-            )?
-        };
+        let ground_sampler = linear(vk::SamplerAddressMode::REPEAT, vk::SamplerAddressMode::REPEAT)?;
+        let atlas_sampler = linear(vk::SamplerAddressMode::CLAMP_TO_EDGE, vk::SamplerAddressMode::CLAMP_TO_EDGE)?;
+
+        // trees: the forest scene's baked impostors, plant record slots
+        let imps = forest::load_impostors(&gpu)?;
+        let imp_info = gpu.upload_buffer(bytemuck::cast_slice(&imps.infos), vk::BufferUsageFlags::STORAGE_BUFFER, "globe impostor info")?;
+        let recs = forest::CAPACITY as u64;
+        let plants = gpu.create_buffer(recs * 64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "globe plants")?;
+        let plant_state = gpu.upload_buffer(&vec![0u8; recs as usize * 4], vk::BufferUsageFlags::STORAGE_BUFFER, "globe plant state")?;
+
         let cb = unsafe {
             d.allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default().command_pool(gpu.cmd_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1),
@@ -199,28 +315,24 @@ impl GlobeRenderer {
         let fence = unsafe { d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)? };
         let acquire_sem = unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None)? };
 
-        // tile builders
+        // terrain tile builders and tree tile growers
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let queue: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
         let (done_tx, done_rx) = mpsc::channel();
-        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).saturating_sub(2).max(2);
-        for _ in 0..workers {
-            let (q, tx, et) = (queue.clone(), done_tx.clone(), terrain.clone());
-            std::thread::spawn(move || loop {
-                let id = {
-                    let (lock, cv) = &*q;
-                    let mut g = lock.lock().unwrap();
-                    loop {
-                        if let Some(id) = g.pop_front() {
-                            break id;
-                        }
-                        g = cv.wait(g).unwrap();
-                    }
-                };
-                if tx.send(tiles::build_tile(id, &et)).is_err() {
-                    return;
-                }
-            });
-        }
+        let et = terrain.clone();
+        spawn_workers(cores.saturating_sub(4).max(2), &queue, done_tx, move |id| tiles::build_tile(id, &et));
+        let tree_queue: Queue = Arc::new((Mutex::new(VecDeque::new()), Condvar::new()));
+        let (tree_tx, tree_rx) = mpsc::channel();
+        let (et, roles) = (terrain.clone(), Arc::new(Roles::new(&imps)));
+        let info: Arc<forest::Impostors> = Arc::new(Impostors {
+            albedo: vec![],
+            normal: vec![],
+            depth: vec![],
+            vis: vec![],
+            infos: imps.infos.clone(),
+            species: imps.species.clone(),
+        });
+        spawn_workers(4, &tree_queue, tree_tx, move |id| forest::grow_tile(id, &et, &info, &roles));
 
         let mut r = GlobeRenderer {
             gpu,
@@ -233,6 +345,7 @@ impl GlobeRenderer {
             pool,
             set,
             ubo,
+            fubo,
             table,
             tlas,
             idx,
@@ -242,6 +355,11 @@ impl GlobeRenderer {
             ground,
             ground_sampler,
             ground_mask,
+            imps,
+            imp_info,
+            atlas_sampler,
+            plants,
+            plant_state,
             cb,
             fence,
             acquire_sem,
@@ -250,11 +368,17 @@ impl GlobeRenderer {
             pending: HashSet::new(),
             queue,
             done_rx,
+            trees: HashMap::new(),
+            records: RangeAlloc::new(forest::CAPACITY),
+            tree_pending: HashSet::new(),
+            tree_queue,
+            tree_rx,
             frame: 0,
             vsync,
             need_resize: false,
             drawn: 0,
             waiting: 0,
+            trees_drawn: 0,
         };
         // the coarse levels everywhere, built up front so the globe is never missing pieces
         let mut ids = Vec::new();
@@ -303,34 +427,36 @@ impl GlobeRenderer {
             gpu.shader_module(spv!("globe.rmiss"))?,
             gpu.shader_module(spv!("shadow.rmiss"))?,
             gpu.shader_module(spv!("globe.rchit"))?,
+            gpu.shader_module(spv!("impostor.rint"))?,
+            gpu.shader_module(spv!("impostor.rchit"))?,
         ];
         let kinds = [
             vk::ShaderStageFlags::RAYGEN_KHR,
             vk::ShaderStageFlags::MISS_KHR,
             vk::ShaderStageFlags::MISS_KHR,
             vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+            vk::ShaderStageFlags::INTERSECTION_KHR,
+            vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         ];
         let stages: Vec<_> =
             modules.iter().zip(kinds).map(|(m, k)| vk::PipelineShaderStageCreateInfo::default().stage(k).module(*m).name(c"main")).collect();
         let u = vk::SHADER_UNUSED_KHR;
-        let general = |s| {
+        let group = |ty, general, closest, intersection| {
             vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(s)
-                .closest_hit_shader(u)
+                .ty(ty)
+                .general_shader(general)
+                .closest_hit_shader(closest)
                 .any_hit_shader(u)
-                .intersection_shader(u)
+                .intersection_shader(intersection)
         };
+        use vk::RayTracingShaderGroupTypeKHR as G;
+        // hit records: 0 terrain triangles, 1 impostor trees
         let groups = [
-            general(0),
-            general(1),
-            general(2),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(u)
-                .closest_hit_shader(3)
-                .any_hit_shader(u)
-                .intersection_shader(u),
+            group(G::GENERAL, 0, u, u),
+            group(G::GENERAL, 1, u, u),
+            group(G::GENERAL, 2, u, u),
+            group(G::TRIANGLES_HIT_GROUP, u, 3, u),
+            group(G::PROCEDURAL_HIT_GROUP, u, 5, 4),
         ];
         let info = vk::RayTracingPipelineCreateInfoKHR::default().stages(&stages).groups(&groups).max_pipeline_ray_recursion_depth(1).layout(layout);
         let pipe = unsafe {
@@ -344,44 +470,57 @@ impl GlobeRenderer {
         let ba = gpu.rt.base_alignment as u64;
         let off_miss = align_up(stride, ba);
         let off_hit = align_up(off_miss + 2 * stride, ba);
-        let total = off_hit + stride;
-        let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 4, 4 * hs as usize)? };
+        let total = off_hit + 2 * stride;
+        let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 5, 5 * hs as usize)? };
         let mut sbt = gpu.create_buffer(total + ba, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR, MemoryLocation::CpuToGpu, "globe sbt")?;
         let base = align_up(sbt.addr, ba);
         let shift = (base - sbt.addr) as usize;
         {
             let m = sbt.mapped();
-            for (g, off) in [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit)] {
+            for (g, off) in [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride)] {
                 let dst = shift + off as usize;
                 m[dst..dst + hs as usize].copy_from_slice(&handles[g * hs as usize..(g + 1) * hs as usize]);
             }
         }
         let region = |off: u64, size: u64| vk::StridedDeviceAddressRegionKHR { device_address: base + off, stride, size };
-        Ok(Pipe { pipe, rgen: region(0, stride), miss: region(off_miss, 2 * stride), hit: region(off_hit, stride), _sbt: sbt })
+        Ok(Pipe { pipe, rgen: region(0, stride), miss: region(off_miss, 2 * stride), hit: region(off_hit, 2 * stride), _sbt: sbt })
     }
 
     fn write_set(&self) {
         let accels = [self.tlas.accel.raw];
         let mut as_info = vk::WriteDescriptorSetAccelerationStructureKHR::default().acceleration_structures(&accels);
         let img = [vk::DescriptorImageInfo::default().image_view(self.out.view).image_layout(vk::ImageLayout::GENERAL)];
-        let ubo = [vk::DescriptorBufferInfo::default().buffer(self.ubo.raw).range(vk::WHOLE_SIZE)];
-        let table = [vk::DescriptorBufferInfo::default().buffer(self.table.raw).range(vk::WHOLE_SIZE)];
-        let elev = [vk::DescriptorImageInfo::default().sampler(self.sampler).image_view(self.elev_tex.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
-        let ground: Vec<_> = self
-            .ground
-            .iter()
-            .map(|g| vk::DescriptorImageInfo::default().sampler(self.ground_sampler).image_view(g.view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL))
-            .collect();
+        let buf = |b: &Buffer| [vk::DescriptorBufferInfo::default().buffer(b.raw).range(vk::WHOLE_SIZE)];
+        let (ubo, fubo, table, infos, plants, state) =
+            (buf(&self.ubo), buf(&self.fubo), buf(&self.table), buf(&self.imp_info), buf(&self.plants), buf(&self.plant_state));
+        let tex = |s: vk::Sampler, v: vk::ImageView| vk::DescriptorImageInfo::default().sampler(s).image_view(v).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+        let elev = [tex(self.sampler, self.elev_tex.view)];
+        let ground: Vec<_> = self.ground.iter().map(|g| tex(self.ground_sampler, g.view)).collect();
+        // atlas arrays: unused slots repeat the first variant (every descriptor must be valid)
+        let atlas = |list: &Vec<Image>| -> Vec<vk::DescriptorImageInfo> {
+            (0..MAX_VARIANTS as usize).map(|i| tex(self.atlas_sampler, list[i.min(list.len() - 1)].view)).collect()
+        };
+        let (albedo, depth, vis, normal) = (atlas(&self.imps.albedo), atlas(&self.imps.depth), atlas(&self.imps.vis), atlas(&self.imps.normal));
         let mut tlas_write =
             vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(0).descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR).push_next(&mut as_info);
         tlas_write.descriptor_count = 1;
+        let w = |binding: u32, ty: vk::DescriptorType| vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(binding).descriptor_type(ty);
+        use vk::DescriptorType as DT;
         let writes = [
             tlas_write,
-            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&img),
-            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(2).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&ubo),
-            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&table),
-            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(4).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&elev),
-            vk::WriteDescriptorSet::default().dst_set(self.set).dst_binding(5).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground),
+            w(1, DT::STORAGE_IMAGE).image_info(&img),
+            w(3, DT::UNIFORM_BUFFER).buffer_info(&fubo),
+            w(5, DT::STORAGE_BUFFER).buffer_info(&infos),
+            w(6, DT::COMBINED_IMAGE_SAMPLER).image_info(&albedo),
+            w(7, DT::COMBINED_IMAGE_SAMPLER).image_info(&depth),
+            w(11, DT::COMBINED_IMAGE_SAMPLER).image_info(&vis),
+            w(14, DT::COMBINED_IMAGE_SAMPLER).image_info(&normal),
+            w(23, DT::STORAGE_BUFFER).buffer_info(&plants),
+            w(24, DT::STORAGE_BUFFER).buffer_info(&state),
+            w(30, DT::UNIFORM_BUFFER).buffer_info(&ubo),
+            w(31, DT::STORAGE_BUFFER).buffer_info(&table),
+            w(32, DT::COMBINED_IMAGE_SAMPLER).image_info(&elev),
+            w(33, DT::COMBINED_IMAGE_SAMPLER).image_info(&ground),
         ];
         unsafe { self.gpu.device.update_descriptor_sets(&writes, &[]) };
     }
@@ -425,6 +564,55 @@ impl GlobeRenderer {
         Ok(())
     }
 
+    /// Tree tiles: plant records into a free slot of the plant buffer, AABBs, one cluster BLAS each.
+    fn upload_trees(&mut self, grown: Vec<TreeTile>) -> Result<()> {
+        let grown: Vec<TreeTile> = grown.into_iter().filter(|t| !self.trees.contains_key(&t.id)).collect();
+        if grown.is_empty() {
+            return Ok(());
+        }
+        let total: usize = grown.iter().map(|t| t.recs.len()).sum();
+        let mut staging = self.gpu.create_buffer((total.max(1) * 64) as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "plant staging")?;
+        let mut copies = Vec::new();
+        let mut geoms = Vec::new();
+        let mut entries = Vec::new();
+        let mut off = 0usize;
+        for t in &grown {
+            let n = t.recs.len();
+            // empty tiles (no forest, or no land cover data there) take no records
+            let base = if n > 0 {
+                match self.records.alloc(n as u32) {
+                    Some(b) => b,
+                    None => break,
+                }
+            } else {
+                u32::MAX
+            };
+            let mut aabbs = None;
+            if n > 0 {
+                staging.mapped()[off * 64..(off + n) * 64].copy_from_slice(bytemuck::cast_slice(&t.recs));
+                copies.push(vk::BufferCopy { src_offset: (off * 64) as u64, dst_offset: base as u64 * 64, size: (n * 64) as u64 });
+                off += n;
+                let bytes: &[u8] = bytemuck::cast_slice(&t.aabbs);
+                let mut ab = self.gpu.create_buffer(bytes.len() as u64, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR, MemoryLocation::CpuToGpu, "tree aabbs")?;
+                ab.mapped()[..bytes.len()].copy_from_slice(bytes);
+                geoms.push((accel::aabb_geometry(ab.addr), n as u32));
+                aabbs = Some(ab);
+            }
+            entries.push((t.id, base, n as u32, aabbs, t.center));
+        }
+        if !copies.is_empty() {
+            let (src, dst) = (staging.raw, self.plants.raw);
+            self.gpu.one_time(|cb| unsafe { self.gpu.device.cmd_copy_buffer(cb, src, dst, &copies) })?;
+        }
+        self.gpu.destroy_buffer(&mut staging);
+        let mut blases = accel::build_blases(&self.gpu, &geoms)?.into_iter();
+        for (id, base, count, aabbs, center) in entries {
+            let blas = if count > 0 { blases.next() } else { None };
+            self.trees.insert(id, TreeTileGpu { base, count, blas, aabbs, center });
+        }
+        Ok(())
+    }
+
     fn evict(&mut self) {
         if self.tiles.len() <= CACHE_TILES {
             return;
@@ -437,6 +625,23 @@ impl GlobeRenderer {
             if let Some(mut t) = self.tiles.remove(&id) {
                 accel::destroy_accel(&self.gpu, &mut t.blas);
                 self.gpu.destroy_buffer(&mut t.buf);
+            }
+        }
+    }
+
+    fn evict_trees(&mut self, keep: &HashSet<TileId>) {
+        let gone: Vec<TileId> = self.trees.keys().filter(|id| !keep.contains(id)).copied().collect();
+        for id in gone {
+            if let Some(mut t) = self.trees.remove(&id) {
+                if let Some(mut b) = t.blas.take() {
+                    accel::destroy_accel(&self.gpu, &mut b);
+                }
+                if let Some(mut a) = t.aabbs.take() {
+                    self.gpu.destroy_buffer(&mut a);
+                }
+                if t.base != u32::MAX {
+                    self.records.release(t.base, t.count);
+                }
             }
         }
     }
@@ -467,7 +672,7 @@ impl GlobeRenderer {
         unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX)? };
         self.frame += 1;
 
-        // finished tiles -> GPU
+        // finished terrain tiles -> GPU
         let mut got = Vec::new();
         while got.len() < UPLOADS_PER_FRAME {
             match self.done_rx.try_recv() {
@@ -483,37 +688,57 @@ impl GlobeRenderer {
         self.upload(got)?;
         self.evict();
 
-        // which tiles to draw, which to build next
+        // trees near the camera
+        let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
+        let range = forest::tree_range(eye);
+        let near = forest::tiles_near(cam, range);
+        if self.frame % 120 == 0 && std::env::var("SI_TREE_STATS").is_ok() {
+            println!("trees: eye {eye:.0} m, range {:.0} km, {} tiles wanted, {} resident, {} pending, {:.1}M records free", range / 1000.0, near.len(), self.trees.len(), self.tree_pending.len(), self.records.free_records() as f64 / 1e6);
+        }
+        let keep: HashSet<TileId> = near.iter().map(|x| x.1).collect();
+        let mut grown = Vec::new();
+        while grown.len() < TREE_UPLOADS_PER_FRAME {
+            match self.tree_rx.try_recv() {
+                Ok(t) => {
+                    self.tree_pending.remove(&t.id);
+                    if keep.contains(&t.id) {
+                        grown.push(t);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        self.evict_trees(&keep);
+        self.upload_trees(grown)?;
+        {
+            let trees = &self.trees;
+            requeue(&self.tree_queue, &mut self.tree_pending, near.iter().map(|x| x.1), |id| trees.contains_key(id), 8192);
+        }
+
+        // which terrain tiles to draw, which to build next
         let (draw, want) = {
             let tiles = &self.tiles;
             tiles::select(cam, &|id| tiles.contains_key(&id), &self.terrain)
         };
         {
-            let (lock, cv) = &*self.queue;
-            let mut q = lock.lock().unwrap();
-            for id in q.drain(..) {
-                self.pending.remove(&id); // not started: re-prioritised below
-            }
-            for (_, id) in want.iter().take(1024) {
-                if !self.pending.contains(id) && !self.tiles.contains_key(id) {
-                    self.pending.insert(*id);
-                    q.push_back(*id);
-                }
-            }
-            cv.notify_all();
+            let tiles = &self.tiles;
+            requeue(&self.queue, &mut self.pending, want.iter().map(|x| x.1), |id| tiles.contains_key(id), 1024);
         }
         self.waiting = want.len();
 
-        let n = draw.len().min(MAX_TILES_DRAWN as usize);
-        let mut insts = Vec::with_capacity(n);
+        let max_tiles = (MAX_INSTANCES as usize).saturating_sub(self.trees.len());
+        let n = draw.len().min(max_tiles);
+        let mut insts = Vec::with_capacity(n + self.trees.len());
         let mut table: Vec<u64> = Vec::with_capacity(n);
+        let place = |c: DVec3| {
+            let off = c - cam;
+            glam::Affine3A::from_translation(glam::Vec3::new(off.x as f32, off.y as f32, off.z as f32))
+        };
         for (k, id) in draw.iter().take(n).enumerate() {
             let t = self.tiles.get_mut(id).unwrap();
             t.last_used = self.frame;
-            let off = t.center - cam;
-            let m = glam::Affine3A::from_translation(glam::Vec3::new(off.x as f32, off.y as f32, off.z as f32));
             insts.push(accel::make_instance(
-                &m,
+                &place(t.center),
                 k as u32,
                 0xFF,
                 0,
@@ -522,13 +747,32 @@ impl GlobeRenderer {
             ));
             table.push(t.buf.addr);
         }
+        let mut trees_drawn = 0usize;
+        for t in self.trees.values() {
+            if let Some(b) = &t.blas {
+                insts.push(accel::make_instance(&place(t.center), t.base, 0xFF, 1, vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE, b.addr));
+                trees_drawn += t.count as usize;
+            }
+        }
+        self.trees_drawn = trees_drawn;
         self.drawn = n;
         self.tlas.write(&insts);
         self.table.mapped()[..table.len() * 8].copy_from_slice(bytemuck::cast_slice(&table));
         g.addr = [self.idx.addr as u32, (self.idx.addr >> 32) as u32, 0, 0];
         g.params[1] = self.frame as f32;
         g.params[3] = self.ground_mask as f32;
+        let (w, h) = self.extent();
+        g.misc[0] = 2.0 * g.cam_fwd[3] / h as f32;
+        g.misc[1] = forest::NEAR as f32;
+        g.misc[2] = (forest::SPLIT * 0.5 * std::f64::consts::PI * tiles::R_EARTH / (1u64 << forest::TREE_LEVEL) as f64) as f32;
+        g.misc[3] = range as f32;
         self.ubo.mapped()[..std::mem::size_of::<GlobeGlobals>()].copy_from_slice(bytemuck::bytes_of(&g));
+        // the impostor shaders' globals: camera at the origin (camera-relative world), pixel
+        // spread, frame counter; no mesh band (impostors only)
+        let mut fg = Globals::default();
+        fg.cam_fwd[3] = g.misc[0];
+        fg.iparams[2] = self.frame as u32;
+        self.fubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&fg));
 
         let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {
             Ok((i, _)) => i,
@@ -539,13 +783,12 @@ impl GlobeRenderer {
             Err(e) => return Err(e.into()),
         };
         unsafe { d.reset_fences(&[self.fence])? };
-        let (w, h) = self.extent();
         let cb = self.cb;
         let swap_img = self.swap.images[idx as usize];
         unsafe {
             d.reset_command_buffer(cb, vk::CommandBufferResetFlags::empty())?;
             d.begin_command_buffer(cb, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
-            self.tlas.cmd_build(&self.gpu, cb, n as u32);
+            self.tlas.cmd_build(&self.gpu, cb, insts.len() as u32);
             self.gpu.memory_barrier(
                 cb,
                 vk::PipelineStageFlags2::TRANSFER,
@@ -638,6 +881,11 @@ impl GlobeRenderer {
 
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    /// Tree tiles still being grown.
+    pub fn trees_waiting(&self) -> usize {
+        self.tree_pending.len()
     }
 
     #[allow(dead_code)]

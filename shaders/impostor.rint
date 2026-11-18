@@ -175,7 +175,10 @@ void main() {
     vec3 po = plantOrigin(pr);
     uint vid = plantVariant(pr); // atlas slot = plant variant
     ImpostorInfo info = imps[vid];
-    float dTree = distance(g.camPos.xyz, M * info.centerRadius.xyz + po);
+    // Plant records are in the instance's space: world for the forest scene (identity instances),
+    // tile-local for the globe (instances placed relative to the camera).
+    vec3 camO = gl_WorldToObjectEXT * vec4(g.camPos.xyz, 1.0);
+    float dTree = distance(camO, M * info.centerRadius.xyz + po);
     float sc = info.lodScale; // LOD distances scale with plant size
     if ((st & 1u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree / sc)) return; // mesh copy wins
     // Small plants dissolve away over the last 20% of their draw distance (trans.w; 0 = no limit).
@@ -184,8 +187,8 @@ void main() {
     uint tier = 0u; // single atlas per variant (mips serve the far field)
 
     // Plant (object) space ray; not normalised, so t stays identical to world-space t.
-    vec3 o = Minv * (gl_WorldRayOriginEXT - po);
-    vec3 d = Minv * gl_WorldRayDirectionEXT;
+    vec3 o = Minv * (gl_ObjectRayOriginEXT - po);
+    vec3 d = Minv * gl_ObjectRayDirectionEXT;
 
     vec3 inv = 1.0 / d;
     vec3 ta = (info.bmin.xyz - o) * inv, tb = (info.bmax.xyz - o) * inv;
@@ -203,8 +206,8 @@ void main() {
     m.res = float(info.res);
 
     // Mip selection from the ray footprint at the entry point (ray cone from the camera).
-    vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * t0;
-    float dist = length(wp - g.camPos.xyz);
+    vec3 wp = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * t0;
+    float dist = length(wp - camO);
     float worldScale = sqrt(s2);
     float texel = 2.0 * m.R * worldScale / m.res;
     float footprint = dist * g.camFwd.w;

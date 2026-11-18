@@ -85,15 +85,15 @@ enum Lod {
 /// Per plant variant (= atlas slot); see rt.glsl.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct ImpostorInfo {
-    center_radius: [f32; 4],
-    bmin: [f32; 4],
-    bmax: [f32; 4],
-    trans: [f32; 4],
-    grid: u32,
-    res: u32,
-    mips: u32,
-    lod_scale: f32,
+pub struct ImpostorInfo {
+    pub center_radius: [f32; 4],
+    pub bmin: [f32; 4],
+    pub bmax: [f32; 4],
+    pub trans: [f32; 4],
+    pub grid: u32,
+    pub res: u32,
+    pub mips: u32,
+    pub lod_scale: f32,
 }
 
 #[repr(C)]
@@ -293,6 +293,7 @@ pub struct Renderer {
     _aabbs: Vec<Buffer>,
     imp_blas: Vec<Accel>,
     imp_info: Buffer,
+    imp_infos: Vec<ImpostorInfo>,
     atlases: Vec<BcAtlas>,
     sampler: vk::Sampler,
     pub catalog: Catalog,
@@ -954,6 +955,7 @@ impl Renderer {
             _aabbs: aabbs,
             imp_blas,
             imp_info,
+            imp_infos,
             atlases,
             sampler,
             catalog,
@@ -1265,6 +1267,17 @@ impl Renderer {
         })?;
         // Encoded blocks of one variant (all levels of all four atlases): < 4.5 bytes per level-0 texel.
         let enc_size = max_size as u64 * max_size as u64 * 9 / 2;
+        // The compressed atlases are also written to a cache file the globe (--globe) loads, unless
+        // an up-to-date one exists (same variants and resolutions).
+        let export_path = std::path::Path::new(crate::impcache::CACHE_PATH);
+        let key = crate::impcache::key(&self.pack.trees.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), &self.imp_infos);
+        let export = crate::impcache::needs_export(export_path, &key);
+        let mut readback = if export {
+            Some(self.gpu.create_buffer(enc_size, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "bc readback")?)
+        } else {
+            None
+        };
+        let mut exported: Vec<crate::impcache::Variant> = Vec::new();
         let mut enc = self.gpu.create_buffer(
             enc_size,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
@@ -1379,7 +1392,8 @@ impl Renderer {
 
             let size = grid * res;
             let a = &self.atlases[v];
-            self.gpu.one_time(|cb| unsafe {
+            let rb = readback.as_ref().map(|b| b.raw);
+            let jobs_out = self.gpu.one_time(|cb| unsafe {
                 let rw = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
                 let cs = vk::PipelineStageFlags2::COMPUTE_SHADER;
                 self.gpu.memory_barrier(cb, vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::SHADER_WRITE, cs, rw);
@@ -1447,6 +1461,14 @@ impl Renderer {
                 for (img, region) in &copies {
                     d.cmd_copy_buffer_to_image(cb, enc.raw, *img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[*region]);
                 }
+                if let Some(rb) = rb {
+                    d.cmd_copy_buffer(cb, enc.raw, rb, &[vk::BufferCopy::default().size(offset as u64 * 16)]);
+                }
+                let kind_of = |img: vk::Image| [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw].iter().position(|&x| x == img).unwrap() as u32;
+                let jobs_out: Vec<[u32; 4]> = copies
+                    .iter()
+                    .map(|(img, r)| [kind_of(*img), r.image_subresource.mip_level, r.image_extent.width, r.buffer_offset as u32])
+                    .collect();
                 for img in targets {
                     self.gpu.image_barrier(
                         cb,
@@ -1459,7 +1481,20 @@ impl Renderer {
                         vk::AccessFlags2::SHADER_READ,
                     );
                 }
+                (jobs_out, offset as usize * 16)
             })?;
+            if let Some(rb) = readback.as_mut() {
+                let vi = &self.catalog.variants[v];
+                exported.push(crate::impcache::Variant {
+                    name: tree.name.clone(),
+                    species: self.catalog.species[vi.species].name.clone(),
+                    kind: vi.kind as u32,
+                    height: vi.height,
+                    info: self.imp_infos[v],
+                    jobs: jobs_out.0,
+                    blocks: rb.mapped()[..jobs_out.1].to_vec(),
+                });
+            }
             if v == 0 {
                 if let Some(prefix) = self.dump_prefix.clone() {
                     self.dump_scratch(&scratch[0], size, &prefix)?;
@@ -1487,6 +1522,13 @@ impl Renderer {
             self.gpu.destroy_image(s);
         }
         self.gpu.destroy_buffer(&mut enc);
+        if let Some(mut rb) = readback.take() {
+            self.gpu.destroy_buffer(&mut rb);
+            match crate::impcache::write(export_path, &key, &exported) {
+                Ok(bytes) => println!("Impostor cache for the globe: {} ({:.2} GB)", export_path.display(), bytes as f64 / 1e9),
+                Err(e) => eprintln!("writing the impostor cache: {e}"),
+            }
+        }
         println!(
             "Baked {} impostors ({:.0}M source triangles) in {:.1}s",
             self.atlases.len(),

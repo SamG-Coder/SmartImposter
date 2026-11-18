@@ -4,6 +4,7 @@
 pub mod app;
 pub mod dem;
 pub mod etopo;
+pub mod forest;
 pub mod landcover;
 pub mod render;
 pub mod tiles;

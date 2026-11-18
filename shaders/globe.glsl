@@ -3,7 +3,7 @@
 #extension GL_EXT_buffer_reference2 : require
 #extension GL_EXT_scalar_block_layout : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
-#include "shared.glsl"
+#include "rt.glsl"
 
 struct GlobeGlobals {
     vec4 camRight;
@@ -11,20 +11,11 @@ struct GlobeGlobals {
     vec4 camFwd;  // w = tan(fov_y / 2)
     vec4 sun;     // xyz direction to the sun, w = illuminance scale
     vec4 planet;  // xyz planet centre relative to the camera, w = radius
-    vec4 params;  // x exposure, y frame, z debug view
+    vec4 params;  // x exposure, y frame, z debug view, w ground scans present (bit mask)
+    vec4 misc;    // x pixel angle (rad); trees (forest.rs): y every tree within, z SPLIT x finest tile edge, w range (horizon)
     uvec4 addr;   // xy shared index buffer address
 };
 
-struct GlobePayload {
-    vec3 n;         // shading normal (world)
-    float t;        // hit distance, < 0 on miss
-    float elev;     // elevation (m), negative = sea floor
-    float hasCover; // 1 where land cover data exists
-    vec2 uv;        // texture coordinates (m)
-    vec4 coverA;    // land cover fractions: tree, shrub, grass, crop
-    vec4 coverB;    // built, bare, snow / ice, water
-    vec2 coverC;    // wetland, moss / lichen
-};
 
 // ---- atmosphere (single scattering, Rayleigh + Mie, ray marched): works from the ground to orbit
 const float R_GROUND = 6371000.0;

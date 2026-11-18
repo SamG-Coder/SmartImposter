@@ -2,141 +2,14 @@
 #extension GL_GOOGLE_include_directive : require
 #include "globe.glsl"
 
+// The 1:1 globe: primary rays against the terrain tiles and the impostor trees (impostor.rint /
+// impostor.rchit, shared with the forest scene), sun shadows through both, ground-to-orbit
+// atmosphere, ocean / lake reflections.
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D outImg;
-layout(set = 0, binding = 2) uniform GG { GlobeGlobals gg; };
-layout(set = 0, binding = 4) uniform sampler2D elevTex; // ETOPO 2022 60", R16_SNORM metres / 32767
+layout(set = 0, binding = 30) uniform GG { GlobeGlobals gg; };
 
-// Elevation (m) at a direction from the planet centre, at a mip for the pixel footprint (m).
-const float TEXEL_M = 1853.0; // one arc-minute on the equator
-vec2 elevUV(vec3 up) {
-    float lat = asin(clamp(up.z, -1.0, 1.0));
-    float lon = atan(up.y, up.x);
-    return vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI);
-}
-float elevAt(vec2 uv, float lod) { return textureLod(elevTex, uv, lod).r * 32767.0; }
-
-// ---- ground: Quixel scans (catalog.rs GROUND_LAYERS) blended by land cover, hex-tiled
-layout(set = 0, binding = 5) uniform sampler2D groundTex[36];
-const float GT = 2.048; // metres per texture repeat (divides tiles.rs TEX_PERIOD)
-// The scans' mean albedos differ ~10x: bring them to plausible ground albedos (as tri.rchit).
-const float GAIN[12] = float[12](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0);
-
-struct Hex { vec2 uv[3]; mat2 rot[3]; vec3 w; };
-Hex hexTile(vec2 uv) {
-    Hex h;
-    vec2 st = uv * 1.6;
-    vec2 sk = vec2(st.x, -0.57735027 * st.x + 1.15470054 * st.y);
-    vec2 base = floor(sk);
-    vec3 t = vec3(fract(sk), 0.0);
-    t.z = 1.0 - t.x - t.y;
-    float s = step(0.0, -t.z), s2 = 2.0 * s - 1.0;
-    h.w = vec3(-t.z * s2, s - t.y * s2, s - t.x * s2);
-    vec2 v[3] = vec2[3](base + vec2(s, s), base + vec2(s, 1.0 - s), base + vec2(1.0 - s, s));
-    for (int i = 0; i < 3; ++i) {
-        uint r = hash2(uvec2(ivec2(v[i]) + 32768));
-        float ang = float(r & 0xFFFFu) * (6.2831853 / 65536.0);
-        vec2 off = vec2(float((r >> 16) & 0xFFu), float(r >> 24)) / 256.0;
-        float c = cos(ang), sn = sin(ang);
-        mat2 Rm = mat2(c, sn, -sn, c);
-        h.uv[i] = Rm * uv + off * 7.0;
-        h.rot[i] = transpose(Rm);
-    }
-    return h;
-}
-
-float fbmN(vec2 p, int octaves) {
-    float s = 0.0, a = 0.5, norm = 0.0;
-    for (int i = 0; i < octaves; ++i) {
-        s += a * vnoise(p);
-        norm += a;
-        p = p * 2.03 + vec2(7.3, 1.9);
-        a *= 0.5;
-    }
-    return s / norm;
-}
-
-// Ground albedo, ambient occlusion and normal from the land cover fractions.
-vec3 groundMaterial(GlobePayload h, vec3 up, inout vec3 n, float footprint, out float ao) {
-    float slope = 1.0 - max(dot(n, up), 0.0);
-    vec4 A = h.coverA, B = h.coverB;
-    vec2 C = h.coverC;
-    float tree = A.x, shrub = A.y, grass = A.z, crop = A.w, built = B.x, bare = B.y, snow = B.z, wet = C.x, moss = C.y;
-    vec2 q = h.uv;
-    float nA = fbmN(q * 0.05, 3), nB = fbmN(q * 0.008 + 11.0, 3);
-    // cliffs: rock wherever it is too steep for soil, whatever the land cover says
-    float cliff = smoothstep(0.38, 0.55, slope + (nA - 0.5) * 0.15);
-    float rockBare = bare * smoothstep(0.1, 0.3, slope + (nA - 0.5) * 0.2);
-    float high = smoothstep(1900.0, 2600.0, h.elev);
-    float w[12];
-    w[0] = tree * 0.75 + shrub * 0.3;                                             // forest floor
-    w[1] = tree * 0.25 + grass * (0.35 - 0.2 * high) + shrub * 0.3 + wet * 0.2;   // mossy grass
-    w[2] = grass * (0.65 - 0.3 * high) + crop * 0.45;                             // grass
-    w[3] = crop * 0.55 + shrub * 0.4 + grass * 0.5 * high;                        // dried grass
-    w[4] = (rockBare + cliff) * nB;                                               // rock (light)
-    w[5] = (rockBare + cliff) * (1.0 - nB);                                       // rock (dark)
-    w[6] = snow;                                                                  // snow / ice
-    w[7] = bare - rockBare + built * 0.8;                                         // gravel
-    w[8] = moss;                                                                  // lichen rock
-    w[9] = 0.0;
-    w[10] = 0.0;
-    w[11] = wet * 0.8;                                                            // wet grass
-    for (int l = 0; l < 12; ++l) if (l != 4 && l != 5 && l != 6) w[l] *= 1.0 - cliff;
-    // the three strongest layers
-    int L[3] = int[3](0, 0, 0);
-    float W[3] = float[3](-1.0, -1.0, -1.0);
-    for (int l = 0; l < 12; ++l) {
-        float v = w[l];
-        if (v > W[0]) { W[2] = W[1]; L[2] = L[1]; W[1] = W[0]; L[1] = L[0]; W[0] = v; L[0] = l; }
-        else if (v > W[1]) { W[2] = W[1]; L[2] = L[1]; W[1] = v; L[1] = l; }
-        else if (v > W[2]) { W[2] = v; L[2] = l; }
-    }
-    float sum = max(W[0], 0.0) + max(W[1], 0.0) + max(W[2], 0.0);
-    vec3 alb = vec3(0.0);
-    vec2 nxy = vec2(0.0);
-    ao = 0.0;
-    uint mask = uint(gg.params.w);
-    Hex hx = hexTile(q / GT);
-    bool near = footprint < 4.0;
-    for (int k = 0; k < 3; ++k) {
-        if (W[k] <= 0.0) continue;
-        float wk = W[k] / max(sum, 1e-4);
-        int l = L[k];
-        vec3 c;
-        vec2 nn = vec2(0.0);
-        float o = 1.0;
-        if ((mask & (1u << uint(l))) == 0u) {
-            c = l == 6 ? vec3(0.8) : (l == 4 || l == 5) ? vec3(0.15, 0.14, 0.12) : vec3(0.08, 0.09, 0.05);
-        } else {
-            float texel = GT / float(textureSize(groundTex[l * 3], 0).x);
-            float lod = max(log2(footprint / texel), 0.0);
-            if (near) {
-                c = vec3(0.0);
-                for (int i = 0; i < 3; ++i) {
-                    c += textureLod(groundTex[l * 3], hx.uv[i], lod).rgb * hx.w[i];
-                    nn += (hx.rot[i] * (textureLod(groundTex[l * 3 + 1], hx.uv[i], lod).rg * 2.0 - 1.0)) * hx.w[i];
-                }
-                o = textureLod(groundTex[l * 3 + 2], hx.uv[0], lod).r;
-            } else {
-                c = textureLod(groundTex[l * 3], q / GT, lod).rgb;
-            }
-            c *= GAIN[l];
-        }
-        alb += c * wk;
-        nxy += nn * wk;
-        ao += o * wk;
-    }
-    // large-scale variation so meadows and forests are not one flat colour from a distance
-    alb *= mix(0.8, 1.15, nB) * mix(0.9, 1.1, nA);
-    ao = mix(1.0, ao, 0.8);
-    vec3 T = normalize(cross(up, vec3(0.0, 0.0, 1.0)) + vec3(1e-4, 0.0, 0.0));
-    vec3 Bt = cross(n, T);
-    T = cross(Bt, n);
-    n = normalize(T * nxy.x + Bt * nxy.y + n * sqrt(max(1.0 - dot(nxy, nxy), 0.05)));
-    return alb;
-}
-
-layout(location = 0) rayPayloadEXT GlobePayload pl;
+layout(location = 0) rayPayloadEXT HitPayload pl;
 layout(location = 1) rayPayloadEXT uint vis;
 
 float traceShadow(vec3 o, vec3 d) {
@@ -144,23 +17,6 @@ float traceShadow(vec3 o, vec3 d) {
     traceRayEXT(tlas, gl_RayFlagsTerminateOnFirstHitEXT | gl_RayFlagsSkipClosestHitShaderEXT | gl_RayFlagsOpaqueEXT,
                 0xFF, 0, 0, 1, o, 0.0, d, 2.0e7, 1);
     return float(vis);
-}
-
-// Land colour until the land-cover data arrives (milestone 3: ESA WorldCover + RESOLVE biomes):
-// a neutral stand-in from latitude and elevation only, so the relief can be judged.
-vec3 landAlbedo(float lat, float elev, float slope) {
-    float a = abs(lat);
-    vec3 c = vec3(0.06, 0.08, 0.045);
-    c = mix(c, vec3(0.24, 0.20, 0.14), smoothstep(14.0, 22.0, a) * (1.0 - smoothstep(32.0, 40.0, a)));
-    c = mix(c, vec3(0.05, 0.065, 0.04), smoothstep(52.0, 58.0, a));
-    c = mix(c, vec3(0.12, 0.11, 0.09), smoothstep(64.0, 70.0, a));
-    c = mix(c, vec3(0.14, 0.13, 0.12), smoothstep(0.2, 0.45, slope));
-    // ice sheets (Antarctica, Greenland) and snow on the high mountains
-    float snowline = mix(5800.0, 600.0, smoothstep(30.0, 70.0, a));
-    float ice = max(smoothstep(snowline, snowline + 500.0, elev) * (1.0 - smoothstep(0.35, 0.6, slope)),
-                    smoothstep(62.0, 70.0, a) * smoothstep(800.0, 1500.0, elev));
-    ice = max(ice, smoothstep(-64.0, -66.0, lat) * step(1.0, elev));
-    return mix(c, vec3(0.78, 0.8, 0.84), ice);
 }
 
 void main() {
@@ -176,68 +32,45 @@ void main() {
     uint dbg = uint(gg.params.z);
 
     pl.t = -1.0;
+    pl.sunVis = 1.0;
+    pl.shadowMask = 0xFFu;
+    pl.trans = vec3(0.0);
+    pl.wdepth = 0.0;
     traceRayEXT(tlas, gl_RayFlagsOpaqueEXT, 0xFF, 0, 0, 0, vec3(0.0), 0.0, rd, 1.0e9, 0);
 
     vec3 col;
     if (pl.t < 0.0) {
         vec3 T;
         col = atmosphere(ro, rd, 1e30, L, sunI, T);
-        // sun disc (if the planet does not block it)
         if (dot(rd, L) > 0.99996 && raySphere(ro, rd, R_GROUND).x < 0.0) col += sunI * 2000.0 * T;
-        // stars-free black space beyond
     } else {
         vec3 p = rd * pl.t;
         vec3 q = p - pc;
         vec3 up = normalize(q);
-        float lat = degrees(asin(clamp(up.z, -1.0, 1.0)));
-        vec3 n = pl.n;
-        if (dot(n, up) < 0.0) n = -n;
-        bool cover = pl.hasCover > 0.5;
-        bool water = cover ? pl.coverB.w > 0.5 : pl.elev < 0.0;
-        bool lake = cover && water && pl.elev > 0.5;
-        // Where the tile mesh is coarser than the data (far away), coastline and relief come from
-        // the elevation grid per pixel instead (geometry cells ~ t / 160 m, see tiles.rs SPLIT_K).
-        float pixelAngle = 2.0 * gg.camFwd.w / size.y;
-        float footprint = pl.t * pixelAngle;
-        float cell = pl.t / 160.0;
-        float wTex = smoothstep(0.7, 2.0, cell / TEXEL_M);
-        if (wTex > 0.0) {
-            float coslat = max(sqrt(1.0 - up.z * up.z), 0.02);
-            float lod = max(log2(footprint / (TEXEL_M * coslat)), 0.0);
-            vec2 uv = elevUV(up);
-            vec2 texel = vec2(1.0 / 21600.0, 1.0 / 10800.0) * exp2(lod);
-            float h0 = elevAt(uv, lod);
-            float hE = elevAt(uv + vec2(texel.x, 0.0), lod), hW = elevAt(uv - vec2(texel.x, 0.0), lod);
-            float hN = elevAt(uv - vec2(0.0, texel.y), lod), hS = elevAt(uv + vec2(0.0, texel.y), lod);
-            vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), up));
-            vec3 north = cross(up, east);
-            float dx = 2.0 * texel.x * 2.0 * PI * R_GROUND * coslat;
-            float dy = 2.0 * texel.y * PI * R_GROUND;
-            vec3 nt = normalize(up - east * max(hE, 0.0) / dx + east * max(hW, 0.0) / dx - north * max(hN, 0.0) / dy + north * max(hS, 0.0) / dy);
-            n = normalize(mix(n, nt, wTex));
-            if (wTex > 0.5 && !cover) water = h0 < 0.0;
-            pl.elev = mix(pl.elev, h0, wTex);
-        }
-        float ao = 1.0;
-        vec3 alb;
-        if (water) {
-            n = up;
-            alb = lake ? vec3(0.012, 0.03, 0.032) : mix(vec3(0.02, 0.06, 0.07), vec3(0.004, 0.014, 0.03), smoothstep(10.0, 300.0, -pl.elev));
-        } else if (cover) {
-            alb = groundMaterial(pl, up, n, pl.t * 2.0 * gg.camFwd.w / size.y, ao);
-        } else {
-            alb = landAlbedo(lat, pl.elev, 1.0 - max(dot(n, up), 0.0));
-        }
-
+        bool imp = (pl.flags & FLAG_IMPOSTOR) != 0u;
+        bool leaf = (pl.flags & 0xFFu) == MAT_LEAF;
+        bool water = (pl.flags & FLAG_WATER) != 0u;
+        vec3 n = pl.n, ng = pl.ng;
+        if (dot(ng, rd) > 0.0) ng = -ng;
+        if (imp && dot(n, rd) > 0.0) n = -n;
+        float nLen = max(length(n), 1e-4);
+        vec3 nDir = n / nLen;
+        vec3 alb = pl.albedo;
         float ndl = dot(n, L);
-        float sh = ndl > 0.0 ? traceShadow(p + up * (1.0 + pl.t * 2e-5), L) : 0.0;
-        vec3 sunT = extinction(lightDepth(q, L));
-        vec3 Esun = sunI * sunT;
+        float side = dot(ng, L) >= 0.0 ? 1.0 : -1.0;
+        vec3 so = imp ? p + L * (0.05 + pl.t * 2e-4) : p + up * (0.3 + pl.t * 2e-5);
+        float sh = (ndl > 0.0 || leaf) ? traceShadow(so, L) * pl.sunVis : 0.0;
+        vec3 Esun = sunI * extinction(lightDepth(q, L));
         // sky light: the zenith sky radiance over the hemisphere (cheap stand-in for irradiance)
         vec3 Tz;
         vec3 skyZ = atmosphere(q, up, 1e30, L, sunI, Tz);
-        vec3 amb = skyZ * PI * (0.6 + 0.4 * dot(n, up));
-        col = alb / PI * Esun * max(ndl, 0.0) * sh + alb * amb * ao;
+        vec3 amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
+        col = alb / PI * Esun * max(ndl, 0.0) * sh + alb * amb * pl.ao;
+        if (leaf) {
+            // leaf transmission (as main.rgen): impostors spread it over the crown
+            float transW = imp ? 0.25 * (1.0 - dot(nDir, L)) : max(-ndl, 0.0);
+            col += pl.trans * 2.0 / PI * Esun * transW * sh;
+        }
         if (water) {
             vec3 R = reflect(rd, n);
             float cosT = max(dot(-rd, n), 0.0);
@@ -247,11 +80,8 @@ void main() {
             float glint = pow(max(dot(R, L), 0.0), 1500.0) * 400.0;
             col = mix(col, refl, F) + Esun * glint * F * sh;
         }
-        if (dbg == 1u) col = (n * 0.5 + 0.5) * 0.3;
-        if (dbg == 2u) col = vec3(fract(pl.elev / 500.0), clamp(pl.elev / 5000.0, 0.0, 1.0), float(water)) * 0.3;
-        if (dbg == 3u) col = (pl.coverA.x * vec3(0.0, 0.4, 0.0) + pl.coverA.z * vec3(0.5, 1.0, 0.2) + pl.coverA.w * vec3(1.0, 0.9, 0.3)
-                            + pl.coverB.x * vec3(1.0, 0.0, 0.0) + pl.coverB.y * vec3(0.6) + pl.coverB.z * vec3(1.0) + pl.coverB.w * vec3(0.0, 0.3, 1.0)
-                            + pl.coverA.y * vec3(0.6, 0.5, 0.0) + pl.coverC.x * vec3(0.0, 0.8, 0.8)) * 0.3;
+        if (dbg == 1u) col = (nDir * 0.5 + 0.5) * 0.3;
+        if (dbg >= 2u) col = alb * 0.3;
         // aerial perspective
         vec3 T;
         vec3 S = atmosphere(ro, rd, pl.t, L, sunI, T);
