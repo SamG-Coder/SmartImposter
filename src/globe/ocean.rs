@@ -467,20 +467,19 @@ fn pack_mips(l0: &[[f32; 4]]) -> Vec<u16> {
 /// The simulation on its own thread: the scene posts the sea state each frame and takes the
 /// newest finished frame when there is one (never waits).
 pub struct Ocean {
-    shared: Arc<(Mutex<(Option<SeaState>, Option<Frame>)>, Condvar)>,
+    shared: Arc<(Mutex<(Option<(SeaState, f32)>, Option<Frame>)>, Condvar)>,
 }
 
 impl Ocean {
     pub fn spawn() -> Self {
-        let shared: Arc<(Mutex<(Option<SeaState>, Option<Frame>)>, Condvar)> = Arc::new((Mutex::new((None, None)), Condvar::new()));
+        let shared: Arc<(Mutex<(Option<(SeaState, f32)>, Option<Frame>)>, Condvar)> = Arc::new((Mutex::new((None, None)), Condvar::new()));
         let s = shared.clone();
         std::thread::Builder::new()
             .name("ocean".into())
             .spawn(move || {
-                let start = std::time::Instant::now();
                 let mut sim = Sim::new();
                 loop {
-                    let st = {
+                    let (st, t) = {
                         let (lock, cv) = &*s;
                         let mut g = lock.lock().unwrap();
                         // wait for a sea state and for the last frame to be taken
@@ -489,7 +488,7 @@ impl Ocean {
                         }
                         g.0.unwrap()
                     };
-                    let frame = sim.step(st, start.elapsed().as_secs_f32());
+                    let frame = sim.step(st, t);
                     let (lock, _) = &*s;
                     lock.lock().unwrap().1 = Some(frame);
                 }
@@ -498,9 +497,10 @@ impl Ocean {
         Ocean { shared }
     }
 
-    pub fn post(&self, st: SeaState) {
+    /// The sea state and the animation time (s) for the next simulation step.
+    pub fn post(&self, st: SeaState, t: f32) {
         let (lock, cv) = &*self.shared;
-        lock.lock().unwrap().0 = Some(st);
+        lock.lock().unwrap().0 = Some((st, t));
         cv.notify_one();
     }
 

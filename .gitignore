@@ -17,3 +17,4 @@ __pycache__/
 
 # local build settings (e.g. DLSS_SDK path) - the NVIDIA DLSS SDK is not redistributed
 /.cargo/config.toml
+captures/

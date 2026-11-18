@@ -1,0 +1,64 @@
+# Showcase tour: about 4 min 45 s of footage, 15 shots (see src/tour.rs for the format).
+#   smart_imposter --globe --fullscreen --tour tours/showcase.txt
+# shot <seconds> <local solar hour> [cover=] [date=] | title | caption
+# key lat,lon,height above ground (m),heading,pitch
+
+shot 22 11.0 | The Earth | Ray traced at 1:1 scale
+key 30.0,5.0,12000000,0,-90
+key 44.0,9.0,1500000,0,-75
+
+shot 19 9.0 cover=0.3 | The Alps | Pennine Alps, Switzerland
+key 46.30,7.90,30000,215,-38
+key 46.10,7.82,7000,235,-18
+
+shot 20 18.6 | Lake Como | Lombardy, Italy
+key 46.12,9.27,420,200,-9
+key 46.03,9.25,320,195,-7
+
+shot 19 18.6 | Forest canopy | Lake Como shore
+key 45.990,9.262,30,250,-7
+key 45.991,9.255,22,265,-4
+
+shot 19 8.0 cover=0.3 | Himalaya | Mount Everest, Nepal
+key 27.55,86.80,8000,20,-4
+key 27.70,86.86,7500,15,-3
+
+shot 19 20.5 | Sognefjord | Vestland, Norway
+key 61.10,5.95,700,90,-6
+key 61.12,6.10,600,85,-5
+
+shot 19 21.0 | Boreal forest | Karelia, Finland
+key 62.00,29.90,1200,10,-22
+key 62.06,30.00,900,20,-16
+
+shot 19 23.0 cover=0.35 | Arctic tundra | North Slope, Alaska
+key 68.50,-150.10,400,0,-18
+key 68.58,-150.00,300,10,-12
+
+shot 19 16.0 cover=0.55 | North Atlantic | Open ocean, 45 N
+key 45.00,-30.00,12,60,-5
+key 45.00,-29.996,8,75,-4
+
+shot 19 17.0 cover=0.35 | Adriatic Sea | Rimini, Italy
+key 44.06,12.70,6,90,-5
+key 44.062,12.712,9,100,-6
+
+shot 19 9.5 | Amazon rainforest | Amazonas, Brazil
+key -4.00,-61.60,900,90,-28
+key -3.97,-61.45,700,85,-20
+
+shot 19 15.0 cover=0.6 | Stratocumulus deck | Off the coast of Peru
+key -18.00,-74.80,3000,270,-20
+key -18.00,-75.10,2600,265,-14
+
+shot 19 18.3 cover=0.25 | Sonoran Desert | Arizona, USA
+key 32.25,-111.06,600,60,-30
+key 32.27,-111.02,350,70,-18
+
+shot 19 16.0 cover=0.2 date=2026-09-21 | Outback | Northern Territory, Australia
+key -25.30,130.92,700,90,-18
+key -25.32,131.00,500,95,-12
+
+shot 22 18.5 | The Earth |
+key 44.0,9.0,600000,180,-60
+key 40.0,9.0,9000000,180,-88

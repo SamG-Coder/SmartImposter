@@ -150,7 +150,58 @@ impl BcAtlas {
         // BC3/BC5: 1 byte per texel; vis at quarter area; mips +1/3
         (s * s * 3 + s * s / 4) * 4 / 3
     }
+    fn destroy(&mut self, gpu: &Gpu) {
+        for img in [&mut self.albedo, &mut self.normal, &mut self.depth, &mut self.vis] {
+            gpu.destroy_image(img);
+        }
+    }
 }
+
+fn create_bc_atlas(gpu: &Gpu, name: &str, grid: u32, res: u32, mips: u32) -> Result<BcAtlas> {
+    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
+    let size = grid * res;
+    Ok(BcAtlas {
+        albedo: gpu.create_image(size, size, mips, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} albedo"))?,
+        normal: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} normal"))?,
+        depth: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} depth"))?,
+        vis: gpu.create_image(size / 2, size / 2, mips - 1, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} visibility"))?,
+        grid,
+        res,
+        mips,
+    })
+}
+
+/// A plant variant's impostor atlases (atlas.rs): the base one always on the GPU, the full one
+/// while the variant grows near the camera; the bake itself lives in the cache file.
+struct VariantAtlas {
+    name: String,
+    grid: u32,
+    /// the full atlas's frame resolution and levels
+    res: u32,
+    mips: u32,
+    /// levels the base atlas drops
+    skip: u32,
+    key: u64,
+    path: std::path::PathBuf,
+    base: BcAtlas,
+    full: Option<BcAtlas>,
+    loading: bool,
+    /// update_atlases check that last wanted the full atlas
+    wanted: u64,
+}
+
+impl VariantAtlas {
+    fn shown(&self) -> &BcAtlas {
+        self.full.as_ref().unwrap_or(&self.base)
+    }
+    fn full_bytes(&self) -> u64 {
+        let s = (self.grid * self.res) as u64;
+        (s * s * 3 + s * s / 4) * 4 / 3
+    }
+}
+
+/// Variants growing within this distance (m) of the camera are candidates for their full atlas.
+const ATLAS_RADIUS: f64 = 900.0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -306,6 +357,8 @@ pub struct Renderer {
     sharpen_set: vk::DescriptorSet,
     /// Contrast adaptive sharpening strength (0 = off .. 1).
     pub sharpness: f32,
+    /// output brightness for fades (0 black .. 1), applied in the resolve after DLSS / TAA
+    pub fade: f32,
     set_layout: vk::DescriptorSetLayout,
     pipe_layout: vk::PipelineLayout,
     main_set: vk::DescriptorSet,
@@ -326,7 +379,12 @@ pub struct Renderer {
     imp_blas: Vec<Accel>,
     imp_info: Buffer,
     imp_infos: Vec<ImpostorInfo>,
-    atlases: Vec<BcAtlas>,
+    /// per variant: base atlas always, full atlas near the camera (atlas.rs)
+    atlases: Vec<VariantAtlas>,
+    atlas_loader: crate::atlas::Loader,
+    /// GPU memory the full atlases may take (SI_IMPOSTOR_MB)
+    atlas_budget: u64,
+    atlas_frame: u64,
     sampler: vk::Sampler,
     pub catalog: Catalog,
     tlas: Tlas,
@@ -645,14 +703,13 @@ impl Renderer {
         let mut atlases = Vec::new();
         let mut atlas_bytes = 0u64;
         let mut raw_bytes = 0u64;
-        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
         // Memory budget for the atlases (SI_IMPOSTOR_MB, default 37% of the GPU's largest
         // device-local heap, room made by compressed textures and compacted BLASes): with many
         // species (the globe's biomes), every variant's texels grow by the same factor until they
         // fit, instead of running out of memory.
-        let imp_in = imp;
-        let mut imp = imp;
-        {
+        // GPU memory for the full atlases of the variants near the camera (SI_IMPOSTOR_MB, default
+        // 25% of the largest device-local heap); every variant keeps its base atlas besides
+        let atlas_budget = {
             let heap = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.pdev) };
             let vram = heap.memory_heaps[..heap.memory_heap_count as usize]
                 .iter()
@@ -660,36 +717,22 @@ impl Renderer {
                 .map(|h| h.size)
                 .max()
                 .unwrap_or(8 << 30);
-            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram * 37 / 100);
-            let planned = |imp: &ImpostorSettings| -> u64 {
-                pack.trees
-                    .iter()
-                    .enumerate()
-                    .map(|(v, t)| {
-                        let vi = &catalog.variants[v];
-                        let r = (t.bmax - t.bmin).length() * 0.5;
-                        let s = (imp.grid * imp.res_for(r / vi.texel_scale, vi.lod_scale)) as u64;
-                        (s * s * 3 + s * s / 4) * 4 / 3
-                    })
-                    .sum()
-            };
-            let full = planned(&imp);
-            for _ in 0..6 {
-                let p = planned(&imp);
-                if p <= budget {
-                    break;
-                }
-                imp.texel *= ((p as f64 / budget as f64).sqrt() as f32).max(1.05);
-            }
-            if imp.texel != imp_in.texel {
-                println!(
-                    "Impostor atlases: {:.2} GB at full resolution > budget {:.2} GB: texels x{:.2}",
-                    full as f64 / 1e9,
-                    budget as f64 / 1e9,
-                    imp.texel / imp_in.texel
-                );
-            }
-        }
+            std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 4)
+        };
+        // everything that changes a bake (atlas.rs cache key), shared by all variants
+        let bake_key = crate::atlas::Key::new()
+            .bytes(spv!("bake.rgen"))
+            .bytes(spv!("tri.rchit"))
+            .bytes(spv!("tri.rahit"))
+            .bytes(spv!("mip.comp"))
+            .bytes(spv!("bcenc.comp"))
+            .u64(imp.grid as u64)
+            .u64(imp.ss as u64)
+            .u64(imp.ao_rays as u64)
+            .u64(imp.ao_range.to_bits() as u64)
+            .u64(imp.vis_rays as u64)
+            .u64(has_tex as u64)
+            .get();
         let imp = imp;
         for (v, t) in pack.trees.iter().enumerate() {
             let vi = &catalog.variants[v];
@@ -730,30 +773,36 @@ impl Renderer {
                 "aabb",
             )?);
             let size = imp.grid * res;
-            let a = BcAtlas {
-                albedo: gpu.create_image(size, size, mips, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{} albedo", t.name))?,
-                normal: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{} normal", t.name))?,
-                depth: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{} depth", t.name))?,
-                vis: gpu.create_image(size / 2, size / 2, mips - 1, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{} visibility", t.name))?,
-                grid: imp.grid,
-                res,
-                mips,
-            };
-            atlas_bytes += a.bytes();
+            let skip = crate::atlas::skip_for(mips);
+            let base = create_bc_atlas(&gpu, &t.name, imp.grid, res >> skip, mips - skip)?;
+            // the shaders start on the base atlas (update_atlases swaps the full one in)
+            let info = imp_infos.last_mut().unwrap();
+            (info.res, info.mips) = (res >> skip, mips - skip);
+            let mesh_key = t.parts.iter().fold(crate::atlas::Key::new().u64(bake_key).bytes(t.name.as_bytes()).u64(t.parts.len() as u64), |k, p| {
+                let m = &pack.meshes[p.mesh as usize];
+                k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
+            });
+            let key = mesh_key.u64(res as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
+            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name), base, full: None, loading: false, wanted: 0 };
+            atlas_bytes += full.full_bytes();
             raw_bytes += (size as u64 * size as u64 * 16) * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
-            atlases.push(a);
+            atlases.push(full);
         }
         println!(
-            "Impostor atlases: {} variants, {:.2} GB BC-compressed (uncompressed would be {:.2} GB)",
+            "Impostor atlases: {} variants, {:.2} GB BC-compressed at full resolution (uncompressed {:.2} GB); full atlases near the camera within {:.2} GB",
             atlases.len(),
             atlas_bytes as f64 / 1e9,
-            raw_bytes as f64 / 1e9
+            raw_bytes as f64 / 1e9,
+            atlas_budget as f64 / 1e9
         );
         let imp_geoms: Vec<_> = aabbs.iter().map(|b| (accel::aabb_geometry(b.addr), 1)).collect();
         let imp_blas = accel::build_blases(&gpu, &imp_geoms)?;
-        let imp_info = gpu.upload_buffer(bytemuck::cast_slice(&imp_infos), vk::BufferUsageFlags::STORAGE_BUFFER, "impostor info")?;
+        // host-visible: update_atlases rewrites a variant's resolution when its atlas changes
+        let info_bytes: &[u8] = bytemuck::cast_slice(&imp_infos);
+        let mut imp_info = gpu.create_buffer(info_bytes.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "impostor info")?;
+        imp_info.mapped()[..info_bytes.len()].copy_from_slice(info_bytes);
         gpu.one_time(|cb| {
-            for a in &atlases {
+            for a in atlases.iter().map(|a| &a.base) {
                 for img in [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw] {
                     gpu.image_barrier(
                         cb,
@@ -1053,6 +1102,7 @@ impl Renderer {
             sharpen_pipe,
             sharpen_set,
             sharpness: 0.5,
+            fade: 1.0,
             set_layout,
             pipe_layout,
             main_set: sets[0],
@@ -1074,6 +1124,9 @@ impl Renderer {
             imp_info,
             imp_infos,
             atlases,
+            atlas_loader: crate::atlas::Loader::spawn(),
+            atlas_budget,
+            atlas_frame: 0,
             sampler,
             catalog,
             tlas,
@@ -1188,6 +1241,8 @@ impl Renderer {
         r.write_resolve_set();
         r.create_dlss_feature()?;
         r.bake_impostors()?;
+        // the atlases the bake installed (full ones outside the globe)
+        r.write_set(r.main_set, r.tlas.accel.raw, None);
         println!("Renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
         Ok(r)
     }
@@ -1395,7 +1450,7 @@ impl Renderer {
         let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
                 .map(|i| {
-                    let a = &self.atlases[i.min(self.atlases.len() - 1)];
+                    let a = self.atlases[i.min(self.atlases.len() - 1)].shown();
                     vk::DescriptorImageInfo::default()
                         .sampler(self.sampler)
                         .image_view(pick(a))
@@ -1453,8 +1508,20 @@ impl Renderer {
     fn bake_impostors(&mut self) -> Result<()> {
         let t_all = Instant::now();
         let imp = self.imp;
-        let max_size = self.atlases.iter().map(|a| a.grid * a.res).max().unwrap_or(32);
-        let smips = self.atlases.iter().map(|a| a.mips).max().unwrap_or(1);
+        // only what the cache (atlas.rs) does not hold yet, or everything with SI_REBAKE
+        let rebake = std::env::var("SI_REBAKE").is_ok();
+        let missing: Vec<usize> = (0..self.atlases.len())
+            .filter(|&v| {
+                let a = &self.atlases[v];
+                rebake || !crate::atlas::valid(&a.path, a.key, a.grid, a.res, a.mips)
+            })
+            .collect();
+        if missing.is_empty() {
+            println!("Impostor atlases: all {} in the cache ({})", self.atlases.len(), crate::atlas::DIR);
+            return self.load_base_atlases(t_all);
+        }
+        let max_size = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res).max().unwrap_or(32);
+        let smips = missing.iter().map(|&v| self.atlases[v].mips).max().unwrap_or(1);
         let st = vk::ImageUsageFlags::STORAGE;
         let mut scratch = [
             self.gpu.create_image(max_size, max_size, smips, vk::Format::R8G8B8A8_UNORM, st, "bake albedo")?,
@@ -1483,6 +1550,7 @@ impl Renderer {
             MemoryLocation::GpuOnly,
             "bc blocks",
         )?;
+        let mut enc_host = self.gpu.create_buffer(enc_size, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "bc blocks readback")?;
 
         // Transient descriptor sets: mip level L-1 -> L, and encoder inputs at level L.
         let d = self.gpu.device.clone();
@@ -1529,7 +1597,7 @@ impl Renderer {
         let bake_views = [sa.mip_views[0], sb.mip_views[0], sc.mip_views[0]];
 
         let mut total_tris = 0u64;
-        for v in 0..self.atlases.len() {
+        for &v in &missing {
             let t0 = Instant::now();
             let (res, grid, mips) = (self.atlases[v].res, self.atlases[v].grid, self.atlases[v].mips);
             let tree = &self.pack.trees[v];
@@ -1590,7 +1658,9 @@ impl Renderer {
             }
 
             let size = grid * res;
-            let a = &self.atlases[v];
+            let regions = crate::atlas::layout(grid, res, mips);
+            let stream = crate::atlas::stream_bytes(grid, res, mips);
+            assert!(stream <= enc_size, "bc block buffer too small");
             self.gpu.one_time(|cb| unsafe {
                 let rw = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
                 let cs = vk::PipelineStageFlags2::COMPUTE_SHADER;
@@ -1603,76 +1673,22 @@ impl Renderer {
                     d.cmd_dispatch(cb, s.div_ceil(8), s.div_ceil(8), 1);
                     self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, cs, rw);
                 }
-                // BC encode every level: (mode, scratch level, target image, target level)
-                let mut jobs = Vec::new();
-                for level in 0..mips {
-                    for (mode, img) in [(0u32, &a.albedo), (1, &a.normal), (2, &a.depth)] {
-                        jobs.push((mode, level, img, level));
-                    }
-                }
-                for level in 1..mips {
-                    jobs.push((3u32, level, &a.vis, level - 1)); // half resolution: from scratch level+1
-                }
+                // BC encode every region of the stream (atlas.rs layout): mode = image; the
+                // visibility levels read the scratch level above their own (half resolution)
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_pipe);
-                let mut offset = 0u32; // in blocks
-                let mut copies = Vec::new();
-                for &(mode, level, img, dst_level) in &jobs {
-                    let s = size >> level;
-                    let bx = s / 4;
-                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_layout, 0, &[enc_sets[level as usize]], &[]);
-                    let pc = [mode, bx, bx, offset];
+                for r in &regions {
+                    let scratch_level = if r.img == 3 { r.level + 1 } else { r.level };
+                    let bx = r.size / 4;
+                    d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_layout, 0, &[enc_sets[scratch_level as usize]], &[]);
+                    let pc = [r.img as u32, bx, bx, (r.offset / 16) as u32];
                     d.cmd_push_constants(cb, self.bcenc_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&pc));
                     d.cmd_dispatch(cb, bx.div_ceil(8), bx.div_ceil(8), 1);
-                    copies.push((
-                        img.raw,
-                        vk::BufferImageCopy {
-                            buffer_offset: offset as u64 * 16,
-                            buffer_row_length: 0,
-                            buffer_image_height: 0,
-                            image_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: dst_level,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            image_offset: vk::Offset3D::default(),
-                            image_extent: vk::Extent3D { width: s, height: s, depth: 1 },
-                        },
-                    ));
-                    offset += bx * bx;
                 }
-                assert!(offset as u64 * 16 <= enc_size, "bc block buffer too small");
                 self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
-                let targets = [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw];
-                for img in targets {
-                    self.gpu.image_barrier(
-                        cb,
-                        img,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::PipelineStageFlags2::ALL_COMMANDS,
-                        vk::AccessFlags2::NONE,
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_WRITE,
-                    );
-                }
-                for (img, region) in &copies {
-                    d.cmd_copy_buffer_to_image(cb, enc.raw, *img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[*region]);
-                }
-
-                for img in targets {
-                    self.gpu.image_barrier(
-                        cb,
-                        img,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        vk::PipelineStageFlags2::TRANSFER,
-                        vk::AccessFlags2::TRANSFER_WRITE,
-                        vk::PipelineStageFlags2::ALL_COMMANDS,
-                        vk::AccessFlags2::SHADER_READ,
-                    );
-                }
+                d.cmd_copy_buffer(cb, enc.raw, enc_host.raw, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: stream }]);
             })?;
+            let a = &self.atlases[v];
+            crate::atlas::write(&a.path, a.key, grid, res, mips, &enc_host.mapped()[..stream as usize])?;
             if v == 0 {
                 if let Some(prefix) = self.dump_prefix.clone() {
                     self.dump_scratch(&scratch[0], size, &prefix)?;
@@ -1688,7 +1704,7 @@ impl Renderer {
                 tris as f64 / 1e6,
                 res,
                 size,
-                a.bytes() as f64 / 1e6,
+                stream as f64 / 1e6,
                 t0.elapsed().as_secs_f32()
             );
         }
@@ -1700,13 +1716,193 @@ impl Renderer {
             self.gpu.destroy_image(s);
         }
         self.gpu.destroy_buffer(&mut enc);
+        self.gpu.destroy_buffer(&mut enc_host);
         println!(
-            "Baked {} impostors ({:.0}M source triangles) in {:.1}s",
-            self.atlases.len(),
+            "Baked {} impostors ({:.0}M source triangles) into {} in {:.1}s",
+            missing.len(),
             total_tris as f64 / 1e6,
+            crate::atlas::DIR,
             t_all.elapsed().as_secs_f32()
         );
+        self.load_base_atlases(t_all)
+    }
+
+    /// Every variant's base atlas from the cache; outside the globe (one small forest, every
+    /// variant in view) the full atlases too.
+    fn load_base_atlases(&mut self, t_all: Instant) -> Result<()> {
+        let mut bytes = 0u64;
+        for v in 0..self.atlases.len() {
+            let a = &self.atlases[v];
+            let regions: Vec<_> = crate::atlas::layout(a.grid, a.res, a.mips).into_iter().filter(|r| r.level >= a.skip).collect();
+            let data = crate::atlas::read_regions(&a.path, &regions)?;
+            self.upload_atlas(&self.atlases[v].base, &regions, &data, self.atlases[v].skip)?;
+            bytes += self.atlases[v].base.bytes();
+        }
+        println!(
+            "Impostor base atlases: {:.2} GB on the GPU for {} variants (full atlases stream in near the camera)",
+            bytes as f64 / 1e9,
+            self.atlases.len()
+        );
+        if self.globe.is_none() {
+            for v in 0..self.atlases.len() {
+                let a = &self.atlases[v];
+                let stream = crate::atlas::read_regions(&a.path, &crate::atlas::layout(a.grid, a.res, a.mips))?;
+                self.install_full(v, &stream)?;
+            }
+        }
+        println!("Impostors ready in {:.1}s", t_all.elapsed().as_secs_f32());
         Ok(())
+    }
+
+    /// BC blocks (concatenated `regions` of an atlas.rs stream) into an atlas whose level 0 is
+    /// the stream's level `skip`.
+    fn upload_atlas(&self, a: &BcAtlas, regions: &[crate::atlas::Region], data: &[u8], skip: u32) -> Result<()> {
+        let mut staging = self.gpu.create_buffer(data.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas staging")?;
+        staging.mapped()[..data.len()].copy_from_slice(data);
+        let imgs = [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw];
+        self.gpu.one_time(|cb| unsafe {
+            for img in imgs {
+                self.gpu.image_barrier(
+                    cb,
+                    img,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::NONE,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                );
+            }
+            let mut at = 0u64;
+            for r in regions {
+                let region = vk::BufferImageCopy {
+                    buffer_offset: at,
+                    image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: r.level - skip, base_array_layer: 0, layer_count: 1 },
+                    image_extent: vk::Extent3D { width: r.size, height: r.size, depth: 1 },
+                    ..Default::default()
+                };
+                self.gpu.device.cmd_copy_buffer_to_image(cb, staging.raw, imgs[r.img], vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                at += r.bytes;
+            }
+            for img in imgs {
+                self.gpu.image_barrier(
+                    cb,
+                    img,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::PipelineStageFlags2::TRANSFER,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::PipelineStageFlags2::ALL_COMMANDS,
+                    vk::AccessFlags2::SHADER_READ,
+                );
+            }
+        })?;
+        self.gpu.destroy_buffer(&mut staging);
+        Ok(())
+    }
+
+    /// A variant's full atlas from its whole cache stream, and the info the shaders read.
+    fn install_full(&mut self, v: usize, stream: &[u8]) -> Result<()> {
+        let (grid, res, mips) = (self.atlases[v].grid, self.atlases[v].res, self.atlases[v].mips);
+        let full = create_bc_atlas(&self.gpu, &format!("{} full", self.atlases[v].name), grid, res, mips)?;
+        self.upload_atlas(&full, &crate::atlas::layout(grid, res, mips), stream, 0)?;
+        if let Some(mut old) = self.atlases[v].full.replace(full) {
+            old.destroy(&self.gpu);
+        }
+        self.set_atlas_info(v);
+        Ok(())
+    }
+
+    /// The resolution and levels of the atlas a variant shows now, into the impostor info.
+    fn set_atlas_info(&mut self, v: usize) {
+        let a = self.atlases[v].shown();
+        let (res, mips) = (a.res, a.mips);
+        self.imp_infos[v].res = res;
+        self.imp_infos[v].mips = mips;
+        let n = std::mem::size_of::<ImpostorInfo>();
+        self.imp_info.mapped()[v * n..(v + 1) * n].copy_from_slice(bytemuck::bytes_of(&self.imp_infos[v]));
+    }
+
+    /// After the fence (no frame in flight): full atlases for the variants growing near the
+    /// camera, base atlases back for the ones left behind, within the full-atlas budget. `pixel`:
+    /// the angle of one display pixel (radians).
+    fn update_atlases(&mut self, pixel: f32) -> Result<()> {
+        self.atlas_frame += 1;
+        let mut dirty = false;
+        for _ in 0..2 {
+            match self.atlas_loader.rx.try_recv() {
+                Ok((v, Ok(stream))) => {
+                    self.atlases[v].loading = false;
+                    self.install_full(v, &stream)?;
+                    dirty = true;
+                }
+                Ok((v, Err(e))) => {
+                    self.atlases[v].loading = false;
+                    eprintln!("impostor atlas {}: {e:#}", self.atlases[v].name);
+                }
+                Err(_) => break,
+            }
+        }
+        if self.atlas_frame % 10 == 0 {
+            if let (Some(scene), Some((ecef, _, _))) = (&self.globe, self.globe_view) {
+                let n = self.atlases.len();
+                let mut dist = vec![f32::INFINITY; n];
+                scene.variants_near(ecef, ATLAS_RADIUS, &mut dist);
+                // a variant needs its full atlas while the base atlas's level 0 would be sampled:
+                // its texels larger than a pixel there
+                let need: Vec<f32> = (0..n)
+                    .map(|v| {
+                        let a = &self.atlases[v];
+                        let texel = 2.0 * self.imp_infos[v].center_radius[3] / a.res as f32;
+                        (texel * (1u32 << a.skip) as f32 / pixel.max(1e-5)).clamp(30.0, ATLAS_RADIUS as f32)
+                    })
+                    .collect();
+                // nearest (relative to need) first, within the budget; a full atlas stays while
+                // within 1.5x its distance (no flicker at the edge)
+                let mut order: Vec<usize> = (0..n).filter(|&v| dist[v] < need[v] * if self.atlases[v].full.is_some() { 1.5 } else { 1.0 }).collect();
+                order.sort_by(|&a, &b| (dist[a] / need[a]).partial_cmp(&(dist[b] / need[b])).unwrap());
+                let mut used = 0u64;
+                for v in order {
+                    let bytes = self.atlases[v].full_bytes();
+                    if used + bytes > self.atlas_budget {
+                        continue;
+                    }
+                    used += bytes;
+                    let a = &mut self.atlases[v];
+                    a.wanted = self.atlas_frame;
+                    if a.full.is_none() && !a.loading {
+                        a.loading = true;
+                        self.atlas_loader.request(v, a.path.clone());
+                    }
+                }
+                for v in 0..n {
+                    // not wanted for a while (10 frames per check): back to the base atlas
+                    if self.atlases[v].full.is_some() && self.atlases[v].wanted + 30 < self.atlas_frame {
+                        if let Some(mut f) = self.atlases[v].full.take() {
+                            f.destroy(&self.gpu);
+                        }
+                        self.set_atlas_info(v);
+                        dirty = true;
+                    }
+                }
+            }
+        }
+        if dirty {
+            self.write_set(self.main_set, self.tlas.accel.raw, None);
+        }
+        Ok(())
+    }
+
+    /// Full atlases on their way from the cache (the tour waits for them before a shot).
+    pub fn atlases_pending(&self) -> bool {
+        self.atlases.iter().any(|a| a.loading)
+    }
+
+    /// GPU memory of the impostor atlases: (base, full) bytes and how many variants are full.
+    pub fn atlas_memory(&self) -> (u64, u64, usize) {
+        let base = self.atlases.iter().map(|a| a.base.bytes()).sum();
+        let full: Vec<_> = self.atlases.iter().filter_map(|a| a.full.as_ref()).collect();
+        (base, full.iter().map(|a| a.bytes()).sum(), full.len())
     }
 
     /// Debug: write the albedo of the first baked variant (uncompressed scratch) as a PNG.
@@ -2181,6 +2377,10 @@ impl Renderer {
             self.gpu.destroy_buffer(&mut old_info);
             self.write_set(self.main_set, self.tlas.accel.raw, None);
         }
+        if self.globe.is_some() {
+            let (_, h) = self.extent();
+            self.update_atlases(2.0 * globals.cam_up[3] / h as f32)?;
+        }
         if self.queries_pending {
             // Previous frame's GPU timestamps (its fence has signalled).
             let mut ts = [0u64; 5];
@@ -2326,7 +2526,7 @@ impl Renderer {
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                 );
-                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), globals.params[2].to_bits(), (globals.iparams[1] == 0) as u32];
+                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), (globals.params[2] * self.fade).to_bits(), (globals.iparams[1] == 0) as u32];
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
                 d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.dlss_resolve_set], &[]);
                 d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
@@ -2360,7 +2560,7 @@ impl Renderer {
             let push: [u32; 4] = [
                 (rw as f32 / w as f32).to_bits(),
                 1.0f32.to_bits(), // history is already an average
-                globals.params[2].to_bits(),
+                (globals.params[2] * self.fade).to_bits(),
                 (globals.iparams[1] == 0) as u32,
             ];
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);

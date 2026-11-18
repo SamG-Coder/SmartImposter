@@ -554,9 +554,19 @@ GPU memory is kept in check without losing detail: textures are block-compressed
 and cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
 >= 35 dB for almost all of them, a quarter of RGBA8 or less; static and streamed BLASes are
 compacted (the tree meshes 1.9 -> 0.7 GB); tree AABBs are build input only; plant records carry
-no padding. Impostor atlases share a budget (`SI_IMPOSTOR_MB`, default 30% of VRAM): with many
-species their texels grow uniformly instead of running out of memory. `SI_MEM=1` prints the GPU
-memory by allocation with the benchmark output.
+no padding. Impostor atlases are baked once into `assets/cache/impostors` (BC blocks per variant,
+re-baked when the asset, the settings or a bake shader changes; `SI_REBAKE=1` forces it; 6.8 GB
+on disk). On the GPU every variant keeps only a base atlas (its levels from 1/4 resolution
+down, 0.46 GB for all 207), and the variants growing near the camera stream their full atlas in
+on a loader thread (`atlas.rs`, `Renderer::update_atlases`): a variant goes full while the base
+atlas's texels would be larger than a pixel on its nearest plant, nearest first within
+`SI_IMPOSTOR_MB` (default 25% of VRAM), and drops back once the camera has moved on. Far impostors
+sample the low levels either way, so nothing changes on screen, and the atlases no longer need
+shrinking to fit: a typical view holds 2-3.7 GB of full atlases where all of them took 6 GB at
+reduced resolution. Terrain tiles nothing has drawn for 4 s are evicted and empty vertex pool and
+BLAS heap chunks are given back, so memory stays flat when the camera jumps across the planet
+(`--tour`). `SI_MEM=1` prints the GPU memory by allocation with the benchmark output (and after
+each tour shot).
 
 **Still to do** (see the plan): the glTF 3D plants (palms, cacti, Xanadu, marram and ribbon
 grass, poppies, dandelions) need an importer; rivers from HydroRIVERS (the 10 m land cover has the

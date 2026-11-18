@@ -60,7 +60,7 @@ float cremap(float v, float lo, float hi, float nlo, float nhi) { return nlo + (
 
 // Wind (km of drift) and the time axis of the evolving noise: the layers drift with the westerly
 // / trade winds of their latitude (slower aloft for the low layer), and shapes change over minutes.
-float cloudTime() { return g.params.x; }
+float cloudTime() { return g.cloud.w; } // seconds of animation (main.rs State.clock)
 vec3 cloudDrift(vec3 e, float speed) {
     vec3 u = normalize(e);
     vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), u) + vec3(1e-5, 0.0, 0.0));
