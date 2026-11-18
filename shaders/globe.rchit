@@ -141,24 +141,41 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     float ptint = 1.0, pw = 0.0; // crop parcels: brightness of this parcel, its weight
     float slope = 1.0 - max(dot(n, up), 0.0);
     vec2 q = uvm;
+    float desert = biome == 13 ? 1.0 : 0.0;
+    float hot = (biome == 1 || biome == 2 || biome == 7) ? 1.0 : 0.0;
+    float med = biome == 12 ? 1.0 : 0.0;
+    float arctic = biome == 11 ? 1.0 : 0.0;
+    float dryLand = max(max(desert, med), biome == 7 || biome == 8 ? 0.7 : 0.0);
     float nA = fbmN(q * 0.05, 3), nB = fbmN(q * 0.008 + 11.0, 3);
     // organic class edges: each class's fraction gets its own Earth-fixed noise (clumps of ~20 m
     // on outlines of ~150 m), sharpened, then renormalised
     float sharp = clamp(footprint * 0.02, 0.12, 0.5);
     float tree = A.x, shrub = A.y, grass = A.z, crop = A.w, built = B.x, bare = B.y, snow = B.z, wet = C.x, moss = C.y;
     {
-        float total = tree + shrub + grass + crop + bare + wet + moss;
+        // every class (built and crop too): a class left out keeps its smooth ramp while the others
+        // sharpen, and shows as a thin band of its own along every edge
+        float total = tree + shrub + grass + crop + built + bare + wet + moss;
         float nT = fbmN(q * 0.0065 + 3.1, 3) * 0.6 + fbmN(q * 0.045 + 8.3, 2) * 0.4;
         float nS = fbmN(q * 0.008 + 17.0, 3) * 0.6 + fbmN(q * 0.06 + 2.0, 2) * 0.4;
         float nG = fbmN(q * 0.007 + 23.0, 3) * 0.6 + fbmN(q * 0.05 + 6.0, 2) * 0.4;
         float nW = fbmN(q * 0.01 + 31.0, 3) * 0.6 + fbmN(q * 0.08 + 4.0, 2) * 0.4;
+        float nU = fbmN(q * 0.009 + 43.0, 3) * 0.6 + fbmN(q * 0.07 + 1.0, 2) * 0.4;
         tree = organic(tree, nT, sharp);
         shrub = organic(shrub, nS, sharp);
         grass = organic(grass, nG, sharp);
+        crop = organic(crop, 1.0 - nT, sharp);
+        built = organic(built, nU, sharp);
         bare = organic(bare, 1.0 - nG, sharp);
         wet = organic(wet, nW, sharp);
-        float k = total / max(tree + shrub + grass + crop + bare + wet + moss, 1e-3);
-        tree *= k; shrub *= k; grass *= k; bare *= k; wet *= k;
+        moss = organic(moss, 1.0 - nW, sharp);
+        float sum = tree + shrub + grass + crop + built + bare + wet + moss;
+        if (sum < 0.05) {
+            // every class sharpened away here: keep the smooth fractions
+            tree = A.x; shrub = A.y; grass = A.z; crop = A.w; built = B.x; bare = B.y; wet = C.x; moss = C.y;
+            sum = total;
+        }
+        float k = total / max(sum, 1e-3);
+        tree *= k; shrub *= k; grass *= k; crop *= k; built *= k; bare *= k; wet *= k; moss *= k;
     }
     // cliffs: rock wherever it is too steep for soil, whatever the land cover says
     float cliff = smoothstep(0.38, 0.55, slope + (nA - 0.5) * 0.15);
@@ -174,13 +191,15 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[5] = (rockBare + cliff) * (1.0 - nB);                                       // rock (dark)
     w[6] = snow;                                                                  // snow / ice
     // flat bare ground in the mountains is scree: rock debris and grey gravel
-    w[4] += (bare - rockBare) * 0.5 * nB;
-    w[5] += (bare - rockBare) * 0.5 * (1.0 - nB);
-    // built-up land: a mosaic of paved (dark), gravel and gardens rather than one grey
+    // (only up in the mountains: lowland bare ground is the biome's soil, sand or gravel below)
+    float scree = 0.5 * max(smoothstep(1400.0, 2400.0, elev), smoothstep(0.08, 0.2, slope)) * (1.0 - 0.6 * desert);
+    w[4] += (bare - rockBare) * scree * nB;
+    w[5] += (bare - rockBare) * scree * (1.0 - nB);
+    // built-up land (no buildings yet): the local soil with gravel, and gardens where it is not dry
+    // land, in low contrast; never dark blotches
     float nb = fbmN(q * 0.035 + 61.0, 3);
-    w[7] = (bare - rockBare) * 0.5;                                               // gravel
-    w[5] += built * 0.35 * smoothstep(0.45, 0.7, nb);
-    w[2] += built * 0.35 * smoothstep(0.5, 0.3, nb);
+    w[7] = (bare - rockBare) * (1.0 - scree) + built * 0.55 * (1.0 - 0.5 * dryLand);  // gravel
+    w[2] += built * 0.3 * (1.0 - dryLand) * smoothstep(0.55, 0.35, nb);
     w[8] = moss;                                                                  // lichen rock
     w[9] = 0.0;
     w[10] = 0.0;
@@ -240,13 +259,9 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[1] *= keep; w[2] *= keep; w[3] *= keep;
     // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
     // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
-    float bareFlat = w[7];
+    float bareFlat = w[7] + built * 0.45 * dryLand; // dry towns: on the local soil
     // bare ground at sea level is a beach: sand, whatever the biome
     if (sea && bed == 0.0) { w[12] += bareFlat * 0.85; w[7] = bareFlat * 0.15; bareFlat = 0.0; }
-    float desert = biome == 13 ? 1.0 : 0.0;
-    float hot = (biome == 1 || biome == 2 || biome == 7) ? 1.0 : 0.0;
-    float med = biome == 12 ? 1.0 : 0.0;
-    float arctic = biome == 11 ? 1.0 : 0.0;
     w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
     w[14] = bareFlat * (desert * (0.45 - 0.3 * nB) + hot * 0.4 + med * 0.8);
     w[15] += bareFlat * hot * 0.5;

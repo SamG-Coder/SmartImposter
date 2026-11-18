@@ -13,6 +13,8 @@ pub enum Kind {
     Plant,
     /// Megascans grass patches (alpha-tested cards, tools/grass_to_mtree.py)
     Grass,
+    /// Opaque scans without foliage: rocks, logs, snags, cacti (tools/fab_to_mtree.py solid)
+    Rock,
 }
 
 pub struct Species {
@@ -128,6 +130,7 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
             "shrub" => Kind::Shrub,
             "plant" => Kind::Plant,
             "grass" => Kind::Grass,
+            "rock" => Kind::Rock,
             _ => Kind::Tree,
         };
         let alpha = j["alpha"].as_bool().unwrap_or(false);
@@ -141,6 +144,11 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
             }
             let height = t.bmax.y - t.bmin.y;
             let (mut lod_scale, cull) = lod_for(height);
+            if kind == Kind::Rock {
+                // rocks and logs lie flat: their size, not their height, sets the impostor detail
+                let size = (t.bmax - t.bmin).max_element();
+                lod_scale = lod_for(size).0;
+            }
             let texel_scale = if kind == Kind::Grass { 1.6 } else { 1.0 };
             if kind == Kind::Grass {
                 // Blades are thinner than an atlas texel: keep patches as real cards to ~20 m,

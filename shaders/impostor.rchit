@@ -18,13 +18,16 @@ void main() {
     vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (plantMatrix(pr) * octDecode(unpackSnorm2x16(hit.normal))));
     // Grass and ferns have no bark (bmin.w = 1): pale / dry blades must not be classified as bark.
     // Otherwise: bark is grey-brown (g/r ~ 0.78); every leaf variant has g/r > 1.
-    bool foliageOnly = imps[vid].bmin.w > 0.5;
-    float leafiness = foliageOnly ? 1.0 : smoothstep(0.85, 1.0, alb.g / max(alb.r, 1e-4));
+    // Rocks, logs and cacti (bmin.w = 2) are solid: never foliage, however green.
+    bool solid = imps[vid].bmin.w > 1.5;
+    bool foliageOnly = imps[vid].bmin.w > 0.5 && !solid;
+    float leafiness = solid ? 0.0 : foliageOnly ? 1.0 : smoothstep(0.85, 1.0, alb.g / max(alb.r, 1e-4));
 
     // Baked visibility: x = a, y = length of the averaged normal, z = b.y (see bake.rgen).
     vec4 v = unpackUnorm4x8(hit.vis);
 
     pl.albedo = alb * treeTint(plantSeed(pr), leafiness);
+    pl.albedo = mix(pl.albedo, dryTint(pl.albedo, plantDry(pr)), leafiness);
     pl.t = gl_HitTEXT;
     // Normal spread (length of the averaged baked normal, bake.rgen). Trees: the normal is
     // shortened to it, so main.rgen's Lambert term gives the mean diffuse over the leaves while

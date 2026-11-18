@@ -45,6 +45,10 @@ pub struct Species {
     pub ferns: Vec<usize>,
     pub heath: Vec<usize>,
     pub shrubs: Vec<usize>,
+    /// dry land (desert shrubs, yuccas, cacti: on bare ground too), rocks, deadwood (logs, snags)
+    pub dry: Vec<usize>,
+    pub rocks: Vec<usize>,
+    pub deadwood: Vec<usize>,
     /// per variant: the biomes it grows in (bit = biomes.rs number; bit 0 = no biome data)
     pub biomes: Vec<u16>,
 }
@@ -55,7 +59,35 @@ pub struct Species {
 pub fn understory_biomes(name: &str) -> u16 {
     let bits = |b: &[u8]| b.iter().fold(1u16, |m, x| m | 1 << x);
     let n = name.to_ascii_lowercase();
-    if n.contains("greasewood") {
+    if n.contains("cact") {
+        bits(&[13])
+    } else if n.contains("yucca") {
+        bits(&[8, 12, 13])
+    } else if n.contains("wheat") {
+        bits(&[4, 5, 7, 8, 12])
+    } else if n.contains("desert_rock") {
+        bits(&[7, 12, 13])
+    } else if n.contains("dead_shrub") {
+        bits(&[7, 8, 12, 13])
+    } else if n.contains("palm") || n.contains("xanadu") {
+        bits(&[1, 2, 3, 7, 14])
+    } else if n.contains("leather_fern") {
+        bits(&[1, 2, 3, 4, 14])
+    } else if n.contains("tundra_grass") {
+        bits(&[6, 10, 11])
+    } else if n.contains("ribbon") || n.contains("poppy") || n.contains("dandelion") {
+        bits(&[4, 5, 8, 12])
+    } else if n.contains("marram") {
+        bits(&[12])
+    } else if n.contains("reed") {
+        bits(&[1, 2, 3, 4, 7, 8, 9, 12, 14])
+    } else if n.contains("boulder") {
+        bits(&[4, 5, 6, 10, 11])
+    } else if n.contains("logs") {
+        bits(&[4, 5, 6, 10])
+    } else if n.contains("snag") {
+        bits(&[5, 6, 10, 11])
+    } else if n.contains("greasewood") {
         bits(&[7, 8, 12, 13])
     } else if n.contains("bilberry") || n.contains("lingonberry") {
         bits(&[4, 5, 6, 10, 11])
@@ -73,6 +105,18 @@ pub fn understory_biomes(name: &str) -> u16 {
         bits(&[7, 8, 10, 12, 13])
     } else {
         u16::MAX
+    }
+}
+
+/// How dry a biome's plants look (0..15; rt.glsl plantDry): desert scrub is dusty grey-olive,
+/// Mediterranean, savanna and steppe plants in between, moist biomes keep their colour.
+pub fn dryness(biome: u8) -> u32 {
+    match biome {
+        13 => 15,
+        7 | 12 => 10,
+        8 => 7,
+        2 => 5,
+        _ => 0,
     }
 }
 
@@ -119,8 +163,8 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
     let (u0, v0, s) = id.uv();
     let edge = id.edge();
     let mut rng = Rng(hash(0xA5A5 ^ ((id.face as u64) << 56) ^ ((id.x as u64) << 24) ^ id.y as u64));
-    // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass
-    for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2)] {
+    // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass, 3 rocks and deadwood
+    for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2), (6.0, 3)] {
         let n = (edge / spacing).ceil() as usize;
         for j in 0..n {
             for i in 0..n {
@@ -130,7 +174,25 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let (lat, lon) = lat_lon(d);
                 let Some(g) = terrain.cover.class_group(lat, lon) else { continue };
                 use super::landcover as lc;
+                let biome = terrain.biome(lat, lon);
+                // deserts and dry scrub: dry grass only, and far fewer plants (mostly bare ground)
+                let arid = matches!(biome, 13);
+                let dryish = matches!(biome, 7 | 12);
                 let (p, list): (f64, &Vec<usize>) = match (layer, g) {
+                    (2, lc::GRASS) | (2, lc::SHRUB) | (2, lc::BARE) if arid => (0.12, &sp.dry_grass),
+                    (2, lc::GRASS) | (2, lc::SHRUB) if dryish => (if g == lc::GRASS { 0.8 } else { 0.4 }, &sp.dry_grass),
+                    (0, lc::SHRUB) if arid => (0.22, if r_pick < 0.5 && !sp.dry.is_empty() { &sp.dry } else { &sp.shrubs }),
+                    (0, lc::BARE) if arid => (0.06, &sp.dry),
+                    // rocks on bare ground and tundra, deadwood on the forest floor
+                    (3, lc::BARE) => (0.22, &sp.rocks),
+                    (3, lc::MOSS) => (0.25, &sp.rocks),
+                    (3, lc::SHRUB) => (0.07, if r_pick < 0.3 { &sp.deadwood } else { &sp.rocks }),
+                    (3, lc::GRASS) => (0.025, &sp.rocks),
+                    (3, lc::TREE) => (0.12, if r_pick < 0.75 { &sp.deadwood } else { &sp.rocks }),
+                    // dry land plants: cacti, yuccas, dead shrubs (the biome masks keep them in the
+                    // deserts and dry scrub)
+                    (0, lc::BARE) => (0.12, &sp.dry),
+                    (0, lc::SHRUB) if r_pick < 0.35 && !sp.dry.is_empty() => (0.55, &sp.dry),
                     (2, lc::GRASS) => (0.9, &sp.grass),
                     (2, lc::CROP) => (0.8, &sp.dry_grass),
                     (2, lc::WETLAND) => (0.85, &sp.wet_grass),
@@ -144,25 +206,42 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                     (0, lc::GRASS) | (0, lc::MOSS) => (0.05, &sp.heath),
                     _ => continue,
                 };
-                let list = if list.is_empty() { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
+                let list = if list.is_empty() && layer < 3 && !(layer == 0 && g == lc::BARE) { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
                 if list.is_empty() || r_keep > p {
                     continue;
                 }
                 // only what belongs in this biome
-                let bit = 1u16 << terrain.biome(lat, lon).min(15);
+                let bit = 1u16 << biome.min(15);
                 let ok: Vec<usize> = list.iter().copied().filter(|v| sp.biomes.get(*v).is_none_or(|m| m & bit != 0)).collect();
                 if ok.is_empty() {
                     continue;
                 }
                 let vid = ok[((r_pick * 7.31).fract() * ok.len() as f64) as usize % ok.len()];
                 let info = &sp.infos[vid];
+                // rocks and logs: big ones are rarer (one 20 m ledge per many boulders), and the
+                // big ledges are outcrops: only where the ground slopes
+                if layer == 3 {
+                    let foot = ((info.bmax[0] - info.bmin[0]) * (info.bmax[2] - info.bmin[2])).max(0.01) as f64;
+                    if rng.f() > (6.0 / foot).min(1.0) {
+                        continue;
+                    }
+                    if foot > 20.0 {
+                        let m = 4.0 / 111_320.0;
+                        let c = lat.to_radians().cos().max(0.05);
+                        let sx = (terrain.height(lat, lon + m / c) - terrain.height(lat, lon - m / c)) as f64 / 8.0;
+                        let sz = (terrain.height(lat + m, lon) - terrain.height(lat - m, lon)) as f64 / 8.0;
+                        if sx.hypot(sz) < 0.2 {
+                            continue;
+                        }
+                    }
+                }
                 let h = terrain.height(lat, lon).max(0.0) as f64;
                 let up = d;
                 let east = DVec3::Z.cross(up).normalize();
                 let north = up.cross(east);
-                // grass patches lie on the slope (flat discs a few metres across)
+                // grass patches, rocks and logs lie on the slope
                 let mut y = up;
-                if layer == 2 {
+                if layer >= 2 {
                     let m = 1.0 / 111_320.0;
                     let dx = (terrain.height(lat, lon + 1.5 * m / lat.to_radians().cos()) - terrain.height(lat, lon - 1.5 * m / lat.to_radians().cos())) as f64 / 3.0;
                     let dz = (terrain.height(lat + 1.5 * m, lon) - terrain.height(lat - 1.5 * m, lon)) as f64 / 3.0;
@@ -174,16 +253,20 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let z = x.cross(y);
                 let sc = 0.7 + 0.6 * r_size;
                 let (x, y, z) = (x * sc, y * sc, z * sc);
-                let t = d * (R_EARTH + h - 0.03) - center;
+                // rocks sink into the ground a little (their lowest point is the base)
+                let sink = if layer == 3 { 0.03 + 0.12 * (info.bmax[1] - info.bmin[1]) as f64 * sc } else { 0.03 };
+                let t = d * (R_EARTH + h - sink) - center;
                 let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
                 let seed = 1 + (rng.f() * 8190.0) as u32;
+                // rocks keep their colour
+                let dry = if layer == 3 { 0 } else { dryness(biome) };
                 let mut rec = [0u32; REC_WORDS];
                 for (ri, row) in rows.iter().enumerate() {
                     for (ci, v) in row.iter().enumerate() {
                         rec[ri * 4 + ci] = (*v as f32).to_bits();
                     }
                 }
-                rec[12] = vid as u32 | seed << 8;
+                rec[12] = vid as u32 | seed << 8 | dry << 21;
                 let (bmin, bmax) = (info.bmin, info.bmax);
                 let mut lo = [f32::MAX; 3];
                 let mut hi = [f32::MIN; 3];
@@ -463,7 +546,7 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
                     rec[ri * 4 + ci] = (*v as f32).to_bits();
                 }
             }
-            rec[12] = vid as u32 | seed << 8;
+            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21;
             // tile-local bounds of the transformed box
             let (bmin, bmax) = (info.bmin, info.bmax);
             let mut lo = [f32::MAX; 3];

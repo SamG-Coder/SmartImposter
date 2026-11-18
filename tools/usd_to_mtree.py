@@ -20,7 +20,10 @@ import sys
 import time
 
 import numpy as np
-from pxr import Gf, Usd, UsdGeom
+try:
+    from pxr import Gf, Usd, UsdGeom
+except ImportError:  # only the USD reader needs it (the glTF converters import the helpers)
+    Gf = Usd = UsdGeom = None
 
 MAT_BARK, MAT_LEAF = 0, 1
 

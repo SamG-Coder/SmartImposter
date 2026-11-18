@@ -40,6 +40,8 @@ mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xy
 vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
 uint plantVariant(PlantRec p) { return p.data & 0xFFu; }
 uint plantSeed(PlantRec p) { return (p.data >> 8) & 0x1FFFu; }
+// How dry the plant's biome is, 0..1 (forest.rs dryness): dusty, sun-bleached foliage.
+float plantDry(PlantRec p) { return float((p.data >> 21) & 15u) / 15.0; }
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
 struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)
@@ -64,9 +66,10 @@ struct SpeciesInfo { vec4 leafTint; vec4 barkTint; vec4 transTint; };
 // Per TLAS instance (indexed by gl_InstanceID): the tree it belongs to, for LOD cross-fades.
 struct InstInfo {
     vec3 center;  // tree bounding-sphere centre (world)
-    uint data;    // tree index (24 bits) | has-mesh flag (bit 24) | variant (bits 25..31)
+    uint data;    // tree index (24 bits) | variant (bits 24..31)
+    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness
 };
-uint instVariant(uint data) { return data >> 25; }
+uint instVariant(uint data) { return data >> 24; }
 
 // Cross-fade weights. Inside a band, every ray picks one representation per tree with this
 // probability, using the same random number in the mesh any-hit and the impostor intersection

@@ -20,9 +20,9 @@ macro_rules! spv {
 }
 
 /// Atlas slots (one per plant variant) bound as sampler arrays. Must match shared.glsl.
-pub const MAX_VARIANTS: usize = 128;
+pub const MAX_VARIANTS: usize = 256; // PlantRec keeps the variant in 8 bits (rt.glsl plantVariant)
 /// Texture sets (4 textures each) bound as a sampler array. Must match shared.glsl.
-pub const MAX_SPECIES: usize = 32;
+pub const MAX_SPECIES: usize = 64;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
@@ -75,11 +75,12 @@ struct Targets {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct InstInfo {
     center: [f32; 3],
-    data: u32, // tree index | flags << 24 (bit 0: tree also has mesh instances)
+    data: u32, // tree index (24 bits) | variant << 24 (8 bits)
+    flags: u32, // bit 0: the tree also has mesh instances (tri.rahit dissolves them)
 }
 
-const INST_HAS_MESH: u32 = 1 << 24;
-const INST_VARIANT_SHIFT: u32 = 25;
+const INST_HAS_MESH: u32 = 1;
+const INST_VARIANT_SHIFT: u32 = 24;
 
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -626,7 +627,7 @@ impl Renderer {
         let mut atlas_bytes = 0u64;
         let mut raw_bytes = 0u64;
         let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 30% of the GPU's largest
+        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 37% of the GPU's largest
         // device-local heap, room made by compressed textures and compacted BLASes): with many
         // species (the globe's biomes), every variant's texels grow by the same factor until they
         // fit, instead of running out of memory.
@@ -640,7 +641,7 @@ impl Renderer {
                 .map(|h| h.size)
                 .max()
                 .unwrap_or(8 << 30);
-            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram * 3 / 10);
+            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram * 37 / 100);
             let planned = |imp: &ImpostorSettings| -> u64 {
                 pack.trees
                     .iter()
@@ -683,8 +684,18 @@ impl Renderer {
             let mips = atlas_mips(res);
             imp_infos.push(ImpostorInfo {
                 center_radius: [c.x, c.y, c.z, r],
-                // w: 1 = foliage only (grass, ferns: no bark, so never classify texels as bark by colour)
-                bmin: [lo.x, lo.y, lo.z, matches!(vi.kind, crate::catalog::Kind::Grass | crate::catalog::Kind::Plant) as u32 as f32],
+                // w: 1 = foliage only (grass, ferns: no bark, so never classify texels as bark by
+                // colour); 2 = solid (rocks, logs, cacti: never foliage, however green)
+                bmin: [
+                    lo.x,
+                    lo.y,
+                    lo.z,
+                    match vi.kind {
+                        crate::catalog::Kind::Grass | crate::catalog::Kind::Plant => 1.0,
+                        crate::catalog::Kind::Rock => 2.0,
+                        _ => 0.0,
+                    },
+                ],
                 bmax: [hi.x, hi.y, hi.z, 0.0],
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
@@ -1104,12 +1115,21 @@ impl Renderer {
                     let v: Vec<usize> = s.variants.clone().collect();
                     let n = s.name.to_ascii_lowercase();
                     match s.kind {
-                        crate::catalog::Kind::Grass if n.contains("dry") => sp.dry_grass.extend(v),
-                        crate::catalog::Kind::Grass if n.contains("cotton") => sp.wet_grass.extend(v),
+                        crate::catalog::Kind::Grass if n.contains("dry") || n.contains("wheat") || n.contains("marram") => sp.dry_grass.extend(v),
+                        crate::catalog::Kind::Grass if n.contains("cotton") || n.contains("reed") => sp.wet_grass.extend(v),
                         crate::catalog::Kind::Grass => sp.grass.extend(v),
                         crate::catalog::Kind::Plant => sp.ferns.extend(v),
                         crate::catalog::Kind::Shrub if n.contains("heather") => sp.heath.extend(v),
+                        // dry land: desert shrubs, yuccas, dead shrubs (bare ground too)
+                        crate::catalog::Kind::Shrub if n.contains("yucca") || n.contains("dead_shrub") => sp.dry.extend(v),
+                        crate::catalog::Kind::Shrub if n.contains("greasewood") => {
+                            sp.dry.extend(v.iter().copied());
+                            sp.shrubs.extend(v)
+                        }
                         crate::catalog::Kind::Shrub => sp.shrubs.extend(v),
+                        crate::catalog::Kind::Rock if n.contains("cact") => sp.dry.extend(v),
+                        crate::catalog::Kind::Rock if n.contains("log") || n.contains("snag") => sp.deadwood.extend(v),
+                        crate::catalog::Kind::Rock => sp.rocks.extend(v),
                         _ => {}
                     }
                 }
@@ -1210,7 +1230,7 @@ impl Renderer {
         let terrain_id = pack.meshes.len();
         let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
         let mut insts = vec![accel::make_instance(&glam::Affine3A::IDENTITY, terrain_id as u32, 1, 0, mesh_flags, terrain_blas)];
-        let mut inst_data = vec![InstInfo { center: [0.0, -1e9, 0.0], data: 0 }];
+        let mut inst_data = vec![InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 }];
         for (ci, &(first, _)) in ranges.iter().enumerate() {
             // mask bit 1: impostors; hit record 1: impostor intersection + closest hit
             insts.push(accel::make_instance(
@@ -1221,7 +1241,7 @@ impl Renderer {
                 vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE,
                 blas[ci].addr,
             ));
-            inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
+            inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
         }
         let max_ls = catalog.variants.iter().map(|v| v.lod_scale).fold(0.0f32, f32::max);
         println!("Impostor clusters: {} plants in {} cluster BLASes ({:.2}s)", n, ranges.len(), t0.elapsed().as_secs_f32());
@@ -1777,7 +1797,7 @@ impl Renderer {
                     let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                     let m = t.xform * p.xform;
                     self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
-                    self.inst_data.push(InstInfo { center, data: tree | band });
+                    self.inst_data.push(InstInfo { center, data: tree, flags: band });
                 }
             }
             if self.insts.len() > self.tlas.capacity as usize {
@@ -2062,7 +2082,7 @@ impl Renderer {
             let p = scene.prepare(ecef, rot, &mut self.insts);
             self.lod_frame = self.lod_frame.wrapping_add(1);
             self.inst_data.clear();
-            self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
+            self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
             // Mesh LOD as in the forest scene: trees near the camera get their mesh parts as
             // instances (dissolving against the impostor inside the band).
             let mut states = std::collections::HashMap::new();
@@ -2090,12 +2110,13 @@ impl Renderer {
                     let state = if d < a { 2u32 } else if d < b { 1 } else { return };
                     states.insert(rec, state);
                     let seed = ((r[12] >> 8) & 0x1FFF) << 11;
-                    let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT) | if state == 1 { INST_HAS_MESH } else { 0 };
+                    let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT);
+                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1;
                     for p in &pack.trees[v].parts {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                         insts.push(accel::make_instance(&(plant * p.xform), p.mesh | seed, 1, sbt, flags, blas[p.mesh as usize].addr));
-                        inst_data.push(InstInfo { center: center.to_array(), data });
+                        inst_data.push(InstInfo { center: center.to_array(), data, flags: iflags });
                     }
                 });
             }
@@ -2106,6 +2127,17 @@ impl Renderer {
         let t_wait = Instant::now();
         unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
         self.profile.cpu_wait += t_wait.elapsed().as_secs_f64() * 1000.0;
+        if self.globe.is_some() && self.insts.len() > self.tlas.capacity as usize {
+            // dense understory, rocks and near tree meshes can outgrow the first estimate
+            let cap = (self.insts.len() as f32 * 1.5) as u32;
+            println!("Growing TLAS capacity to {cap} instances");
+            unsafe { self.gpu.device.device_wait_idle()? };
+            let mut old = std::mem::replace(&mut self.tlas, Tlas::new(&self.gpu, cap)?);
+            old.destroy(&self.gpu);
+            let mut old_info = std::mem::replace(&mut self.inst_info, Self::create_inst_info(&self.gpu, cap)?);
+            self.gpu.destroy_buffer(&mut old_info);
+            self.write_set(self.main_set, self.tlas.accel.raw, None);
+        }
         if self.queries_pending {
             // Previous frame's GPU timestamps (its fence has signalled).
             let mut ts = [0u64; 5];

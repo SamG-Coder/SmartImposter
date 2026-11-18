@@ -11,8 +11,8 @@
 #define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
 #define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
-#define MAX_VARIANTS 128 // atlas slots (one per plant variant)
-#define MAX_SPECIES 32
+#define MAX_VARIANTS 256 // atlas slots (one per plant variant)
+#define MAX_SPECIES 64
 #define MAX_GROUND_TEX 80 // 3 per ground layer (26 layers); the last two slots are the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
 #define NEAR_HALF 2048.0
@@ -102,6 +102,14 @@ void frameBasis(vec3 f, out vec3 r, out vec3 u) {
 vec3 frameDir(vec2 cell, float N) { return hemiOctDecode(cell / (N - 1.0)); }
 
 // ---------------------------------------------------------------- materials
+// Foliage in dry biomes (dry 0..1): towards a dusty grey-olive of the same brightness, a little
+// paler (waxy, dust-covered leaves of desert and Mediterranean scrub).
+vec3 dryTint(vec3 alb, float dry) {
+    float l = dot(alb, vec3(0.30, 0.59, 0.11));
+    vec3 dusty = l * vec3(1.06, 1.0, 0.80) * 1.12;
+    return mix(alb, dusty, 0.62 * dry);
+}
+
 vec3 treeTint(uint seed, float leafiness) {
     if (seed == 0u) return vec3(1.0);
     uint s = pcg(seed * 7919u);

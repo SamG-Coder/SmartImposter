@@ -1,5 +1,70 @@
 # Quixel assets to download for the whole Earth
 
+## Still needed: direct links (checked on Fab, all Quixel Megascans, $0)
+
+**Palms and tropical plants** (the tropics currently use temperate trees)
+- [ ] [Tropical Palm](https://www.fab.com/listings/a14792bb-cc06-4bfc-b657-ea85cca903d7)
+- [ ] [Alexandra Palm](https://www.fab.com/listings/de222652-2e7f-45e0-9710-0bbed55a753e)
+- [ ] [Chinese Fan Palm](https://www.fab.com/listings/baaece72-6e2b-4fef-a8b9-de5c0f244a43)
+- [ ] [Broadleaf Lady Palm](https://www.fab.com/listings/65df339a-ec8a-4a55-86c4-69b2d4517e8d)
+- [ ] [Cat Palm](https://www.fab.com/listings/f116ca04-cb6c-43c9-a74a-0b505d71ccd2)
+- [ ] [Zamia Palm](https://www.fab.com/listings/44bd49cb-d05e-4788-8eb1-46655de9962a)
+- [ ] [Banana](https://www.fab.com/listings/12ac1559-ddce-40e2-8e16-fd39b88e61b3)
+- [ ] [Xanadu](https://www.fab.com/listings/088ff3a1-c25e-46a3-8d16-b1260c468212)
+- [ ] [Leather Fern](https://www.fab.com/listings/9b548af1-d8f2-4287-877a-b2d9195b4140)
+
+**Trees missing from the biome tables**
+- [ ] [European Hornbeam](https://www.fab.com/listings/c6f917b6-ffcb-4b86-9d9f-5274ba7f6a8e)
+
+**Deserts and dry land**
+- [ ] [Desert American Plant Branch Cactus Large 01](https://www.fab.com/listings/a204bca4-ae1d-443d-bbd2-b578c6cb3f25)
+- [ ] [Desert American Plant Branch Cactus Large 02](https://www.fab.com/listings/aaa0d01a-647a-42db-93d9-cbedbef68760)
+- [ ] [Desert American Plant Branch Cactus Large 03](https://www.fab.com/listings/03a1200b-a286-4907-8d2a-111beabb1db9)
+- [ ] [Desert American Plant Cluster Cactus Medium 01](https://www.fab.com/listings/af10525e-87eb-44a9-ad59-66687f550174)
+- [ ] [Desert American Plant Cluster Cactus Medium 02](https://www.fab.com/listings/ed48cf9e-eb8c-4ad6-85e6-67902c102745)
+- [ ] [Desert American Plant Cactus Medium 01](https://www.fab.com/listings/ac062333-539b-4a4d-beb2-0e642fffb3c0)
+- [ ] [Desert American Plant Cactus Medium 02](https://www.fab.com/listings/cca15954-c411-4814-9555-5f5dd391b64f)
+- [ ] [Desert American Plant Cactus Medium 03](https://www.fab.com/listings/0091b5e0-9acc-4c47-8aff-1275feeb245f)
+- [ ] [Desert American Plant Cactus Small 01](https://www.fab.com/listings/2171dae9-c450-4192-b4e3-0f5306bdf906)
+- [ ] [Desert American Plant Cactus Small 02](https://www.fab.com/listings/18243665-d141-4b10-9497-1b8948cb9688)
+- [ ] [Desert American Plant Cactus Small 03](https://www.fab.com/listings/200347fe-a00c-44cf-ba46-8bad7850f478)
+- [ ] [Spineless Yucca](https://www.fab.com/listings/9edae3d8-38c4-416d-a4b3-0fe62e61c676)
+- [ ] [Dead Shrubs](https://www.fab.com/listings/d8fbec55-5d03-41ba-bce3-1c7ee42512a4)
+- [ ] [Desert Western Ledge Rock Small 07](https://www.fab.com/listings/9643956b-9e34-46d9-9ae3-00c22405ee16)
+- [ ] [Desert Western Ledge Rock Large 03](https://www.fab.com/listings/f48aaa81-fc28-47c2-94fe-227cada28897)
+- [ ] [Desert Western Ledge Rock XL 01](https://www.fab.com/listings/87b2dbbc-4e89-4dce-9726-71c2e2833c8e)
+
+**Grasses and flowers**
+- [ ] [Wheat Grass](https://www.fab.com/listings/9070350f-dea8-40ec-ba57-0777a2c1fb24)
+- [ ] [Tundra Grass](https://www.fab.com/listings/3d87458a-9492-4098-94e9-e45cc593f00f)
+- [ ] [Ribbon Grass](https://www.fab.com/listings/6b7af6c8-e24b-4beb-a943-4ddb35d2db87)
+- [ ] [Marram Grass](https://www.fab.com/listings/963ec97c-0674-422f-b003-a9b4f30c6319)
+- [ ] [Field Poppy](https://www.fab.com/listings/66cb2706-bc30-4f26-92ec-cad48723bd4a)
+- [ ] [Leafy Dandelions](https://www.fab.com/listings/20172125-045a-40e0-9c7d-01908cf87aeb)
+- [ ] [Lingonberry](https://www.fab.com/listings/a9f7d56d-6d4c-4ae9-8b9b-f88f7e0a80fa) (re-download: the last export had no variants)
+
+**Lakes and wetlands**
+- [ ] [Giant Reed](https://www.fab.com/listings/7df9d5b8-6567-4a4d-9b37-53d63e7e6cd8)
+- [ ] [Carolana Water Lily](https://www.fab.com/listings/8eed0e35-6320-4611-a9a3-d28bd78550eb)
+- [ ] [Rembrandt Water Lily](https://www.fab.com/listings/96391dd8-2556-47cf-a3ff-de5634adf19d)
+- [ ] [Water Cabbage](https://www.fab.com/listings/ce533acc-79b6-4f6c-9484-795b6812530c)
+
+**Rocks and deadwood**
+- [ ] [Tundra Mossy Boulder (1)](https://www.fab.com/listings/70ea727a-4f22-478c-99f7-8ef23b9a0919)
+- [ ] [Tundra Mossy Boulder (2)](https://www.fab.com/listings/23cfedaf-dbfd-4402-a64d-095021355728)
+- [ ] [Tundra Mossy Boulder (3)](https://www.fab.com/listings/0afd26b9-68c3-4ea9-9032-cc7813e36a3f)
+- [ ] [Fallen Log](https://www.fab.com/listings/8c058dd2-d70a-4f3d-b797-bf4e80730ad5)
+- [ ] [Mossy Log](https://www.fab.com/listings/3c04459d-c231-4095-be6a-f5ad4e8e922d)
+- [ ] [Mossy Birch Log](https://www.fab.com/listings/2a94dc89-d1fd-4941-b90a-399f1539a830)
+- [ ] [Fallen Pine Tree](https://www.fab.com/listings/39ae2493-34bc-4430-8b21-96ea79325a34)
+- [ ] [Dead Pine Tree Trunk](https://www.fab.com/listings/1de78d03-39a2-4480-866f-1667111e5182)
+
+Not on Fab as free Quixel 3D models (only leaf/atlas textures, or not at all): Desert Acacia, Ginkgo,
+Yoshino Cherry, Utah Juniper, Common Bulrush, Common Reed, baobab, eucalyptus, olive, mangrove,
+and the Beech / Aspen / Spruce / Baltic Pine saplings. The biome tables keep their stand-ins.
+
+The search lists below are the original plan, kept for reference.
+
 Free Quixel (Megascans / Megaplants) only. Each name links to a Fab search. On Fab: **Add to My Library** (free), then download it the same way as the assets already in the project:
 
 - **Megaplants (trees):** through the Fab plugin in Unreal. `tools/ue_export_megaplants.py` exports them.

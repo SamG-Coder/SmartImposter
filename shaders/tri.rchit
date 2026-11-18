@@ -15,6 +15,7 @@ layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[];
 // (BC5), translucency (BC4); bark colour (BC7), normal x / y (BC5), occlusion (BC4).
 layout(set = 0, binding = 13) uniform sampler2D matTex[6 * MAX_SPECIES];
 layout(set = 0, binding = 15, scalar) readonly buffer Species { SpeciesInfo species[]; };
+layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
 
 // Unreal material tints are around 0.5 = neutral; applied at reduced strength.
 vec3 ueTint(vec3 t) { return mix(vec3(1.0), clamp(t * 2.0, 0.0, 2.0), 0.6); }
@@ -373,6 +374,7 @@ void main() {
             float h1 = float(lr & 0xFFFFu) / 65535.0, h2 = float(lr >> 16) / 65535.0;
             vec3 hue = mix(vec3(1.06, 1.0, 0.88), vec3(0.94, 1.0, 1.08), h1) * mix(0.88, 1.12, h2);
             albedo = ca.rgb * ueTint(spc.leafTint.rgb) * spc.leafTint.w * hue * treeTint(seed, 1.0);
+            albedo = dryTint(albedo, float((insts[gl_InstanceID].flags >> 1) & 15u) / 15.0);
             if (underside) albedo *= vec3(1.18, 1.15, 1.25); // paler underside
             // Transmission like Unreal's two-sided foliage: albedo x translucency tint x mask.
             trans = albedo * spc.transTint.rgb * (nrmTex.b * spc.transTint.w);
