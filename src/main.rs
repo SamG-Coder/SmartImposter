@@ -6,6 +6,7 @@
 
 mod accel;
 mod atlas;
+mod biome;
 mod asset;
 mod bc7;
 mod catalog;
@@ -72,6 +73,11 @@ struct Args {
     gallery: bool,
     /// `--tour file`: a scripted globe camera tour for recording (tour.rs)
     tour: Option<String>,
+    /// `--biome name`: what grows on the generated terrain (biome.rs)
+    biome: Option<String>,
+    /// --sun / --haze given on the command line (else the biome's defaults)
+    sun_given: bool,
+    haze_given: bool,
     /// `--tour-pace ms`: shortest time each tour frame stays on screen. The tour advances a fixed
     /// 1/60 s per frame, so with a pace above 16.7 ms it plays slower than real time and every
     /// frame is captured by a 60 fps recorder at least once (tools/tour_post.py drops the repeats).
@@ -125,6 +131,9 @@ fn parse_args() -> Args {
         vsync: false,
         gallery: false,
         tour: None,
+        biome: None,
+        sun_given: false,
+        haze_given: false,
         tour_pace: 1000.0 / 60.0,
         bench_move: 0.0,
         fly: false,
@@ -191,6 +200,7 @@ fn parse_args() -> Args {
             "--time" => a.time = Some(next),
             "--time-rate" => a.time_rate = next.parse().ok(),
             "--sun" => {
+                a.sun_given = true;
                 let v = floats(&next);
                 if v.len() == 2 {
                     a.sun = [v[0], v[1]];
@@ -205,7 +215,11 @@ fn parse_args() -> Args {
             "--lod2-band" => a.lod2_band = next.parse().unwrap_or(24.0),
             "--spacing" => a.spacing = next.parse().unwrap_or(7.0),
             "--radius" => a.radius = next.parse().unwrap_or(8000.0),
-            "--haze" => a.haze = next.parse().unwrap_or(1.0),
+            "--haze" => {
+                a.haze = next.parse().unwrap_or(1.0);
+                a.haze_given = true;
+            }
+            "--biome" => a.biome = Some(next),
             "--dump-atlas" => a.dump_atlas = Some(next),
             "--bench-move" => a.bench_move = next.parse().unwrap_or(0.3),
             "--fly-speed" => a.fly_speed = next.parse().unwrap_or(13.0),
@@ -432,6 +446,15 @@ impl App {
             world::set_site(terrain, lat, lon);
             println!("Site: {lat:.5}, {lon:.5}");
         }
+        // --biome: what grows on the generated terrain, its ground and light (biome.rs)
+        if let Some(name) = &a.biome {
+            match biome::find(name) {
+                Some(p) => biome::set(p),
+                None => anyhow::bail!("unknown --biome {name} (one of: {})", biome::names()),
+            }
+        }
+        let bp = biome::current();
+        let (sun0, haze0) = (if a.sun_given { a.sun } else { bp.sun }, if a.haze_given { a.haze } else { bp.haze });
         let world = if a.globe {
             world::World::empty()
         } else if a.gallery {
@@ -491,9 +514,9 @@ impl App {
             lod2: a.lod2,
             debug: a.debug,
             ao_rays: a.ao_rays,
-            sun_az: a.sun[0],
-            sun_el: a.sun[1],
-            exposure: 2.2,
+            sun_az: sun0[0],
+            sun_el: sun0[1],
+            exposure: 2.2 * bp.exposure,
             smooth_thin: a.smooth_thin,
             clouds: a.clouds,
             fps_time: Instant::now(),
@@ -513,7 +536,7 @@ impl App {
             base_speed: 10.0,
             cinematic: false,
             dlss_last: a.dlss.unwrap_or(1),
-            haze: a.haze,
+            haze: haze0,
             geo,
             settle: 0,
             tour: None,
@@ -916,7 +939,7 @@ impl App {
             prev_right: prev[1],
             prev_up: prev[2],
             prev_fwd: prev[3],
-            extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (s.clock % 3600.0) as f32],
+            extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(biome::current().alt_shift), (s.clock % 3600.0) as f32],
             planet,
             moon,
             sun_true,
@@ -924,6 +947,7 @@ impl App {
             // z: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
             ocean: [[0.0; 4]; 3],
             cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
+            biome: biome::current().ground_packed(),
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
