@@ -47,6 +47,7 @@ the same ray tracing pipeline, in about 2 seconds at startup.
   8. [Materials](#8-materials)
   9. [Frame: DLSS Ray Reconstruction](#9-frame-dlss-ray-reconstruction-or-taa)
   10. [Performance work](#10-performance-work)
+- [The Earth: a 1:1 globe and real places](#the-earth-a-11-globe-and-real-places)
 - [Getting started](#getting-started)
 - [Tools](#tools) · [Code layout](#code-layout) · [Limitations](#limitations) · [License](#license)
 
@@ -276,15 +277,34 @@ rebuilds the instance list only when a plant changes state; the shaders compute 
 exact distance every frame, so the transition is continuous. An 8M-instance budget keeps very
 long mesh distances from exhausting GPU memory.
 
-### 7. Forest layout and ground
+### 7. Terrain, rivers, forest growth and ground
 
-`world.rs` scatters four jittered-grid layers: canopy trees every 7 m, shrubs every 3.4 m, ferns
-every 2.1 m and grass patches every 2.3 m. Each layer reads biome fields: canopy density, moisture
-(low ground and wet patches), forest edges, dryness, beech stands and aspen groves. Variants are
-picked by weight, and each plant gets its own scale and rotation.
+**Terrain from erosion.** `erosion.rs` lifts a 144 km landscape by a tectonic uplift field and cuts
+it down with rivers, using the stream-power law solved implicitly (Braun & Willett 2013; Cordonnier
+et al. 2016). Every iteration a priority-flood pass (Barnes et al. 2014) routes all water to the sea,
+and the drainage area is accumulated. Branching valleys, ridges and basins come out of the
+simulation; the result is cached in `assets/cache`. Rivers are the cells draining more than 12 km²,
+traced into smoothed, meandering polylines with widths from their catchment and a water level that
+only falls downstream. Floodplains, banks and a riverbed are cut along them. The mesh is 3 m near
+the start, grows to 200 m cells out to ±60 km, and carries the Earth's curvature.
 
-The ground blends four scanned surfaces (forest floor, mossy grass, uncut grass, dried grass) found
-in the Fab library cache:
+**Forest growth as succession.** Trees are grown, not scattered:
+
+- founder pairs on a 60 m lattice where the site allows forest, then 10 generations (~150 years)
+  of seed dispersal;
+- pioneers (aspen in root-sucker groves, poplar and alder in thickets) colonise open ground and
+  gaps; shade-tolerant beech establishes under them and overtops them;
+- every species has a lifespan and an age of first seeding; windthrow gaps of all sizes reset
+  patches early on;
+- a seedling fails under a crown two generations older within 5.5 m (light competition).
+
+The result is a mosaic of stand ages and species, with alder and poplar along the rivers and
+meadows on the valley floors (~6M trees in an 8 km radius). Shrubs, ferns and grass are scattered
+on jittered grids from the simulated canopy cover.
+
+The ground blends twelve scanned surfaces found in the Fab library cache: forest floor, mossy
+grass, uncut grass, dried grass, two rock cliffs, snow, gravel, lichen rock, riverbed, pebbles and
+wet grass:
 
 - **Biome mask:** a 1024² mask is built at startup from the actual tree crowns (canopy cover),
   moisture, dryness and understory density. Leaf litter goes under closed canopy, moss on wet
@@ -296,6 +316,13 @@ in the Fab library cache:
   and 80 m, and open ground varies in brightness and hue over tens of metres.
 - **Height-based blending** (grass blades over litter), and a per-layer gain: the scans' mean
   albedos differ about 10x.
+- **Landform-driven layers:** leaf litter only under the simulated crowns; dry grass on convex,
+  sun-facing ground and lush grass in hollows; rock where it is too steep for soil (triplanar, with
+  strata), scree and snow by altitude zone; pebble bars, mud and wet grass along the water.
+- **Water:** rivers and lakes have a bed below the water surface. The ray-gen shades the surface
+  over the bed: absorption with depth (Beer-Lambert) and in-scattering, sunlight attenuated down to
+  the bed, flowing ripples, foam where it is shallow, a ray-traced reflection by Fresnel, the sun
+  glint, and wet banks.
 
 ![Ground: plain tiling vs hex-tile stochastic texturing](docs/images/ground_tiling.jpg)
 
@@ -365,6 +392,44 @@ Tried and dropped:
 
 The remaining cost is primary rays through dense grass (any-hit invocations) and the fixed DLSS-RR
 cost at DLAA; DLSS-RR Quality halves the frame time for a slightly softer image.
+
+## The Earth: a 1:1 globe and real places
+
+The plan for the whole planet at true scale is in [docs/EARTH_PLAN.md](docs/EARTH_PLAN.md). Built
+so far:
+
+- **`--globe`: the planet at 1:1.** A cube-sphere quadtree of terrain tiles from orbit down to ~5 m
+  cells, each tile its own BLAS built on worker threads and streamed in as you fly. Positions are
+  float64 on the CPU and camera-relative float32 on the GPU, so it holds still from orbit to
+  standing height. A single-scattering atmosphere (Rayleigh + Mie) works from the ground to space.
+  - Elevation: NOAA ETOPO 2022 (60″, global, land and seafloor), Copernicus GLO-30 (30 m) where its
+    tiles are present, blended at the edges. The whole ETOPO grid also lives on the GPU for
+    per-pixel coastlines and relief far away.
+  - Land cover: ESA WorldCover 2021 (10 m) where present, as fractions per terrain vertex. They pick
+    the Quixel ground scans (forest floor, grass, rock on cliffs, glaciers, gravel, wetland) and mark
+    lakes and rivers.
+- **`--site lat,lon`: a real place in the forest renderer.** The local tangent plane at that point
+  (with the Earth's curvature), heights from GLO-30 / ETOPO, lakes and rivers from WorldCover,
+  streams from a priority-flood drainage of the real 30 m heights, and the forest grown only where
+  WorldCover has tree cover. Altitude zones shift with latitude.
+- **Enter** on the globe lands at the place below (site mode). **M** in site mode returns to the
+  globe above the same spot.
+
+**Data (free, not included).** Put the files under `assets/earth/`:
+
+| Folder | Dataset | Files |
+|---|---|---|
+| `etopo/` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model), 60″ ice surface GeoTIFF (466 MB) | `ETOPO_2022_v1_60s_N90W180_surface.tif` |
+| `glo30/` | [Copernicus DEM GLO-30](https://registry.opendata.aws/copernicus-dem/) 1° tiles (~42 MB each, up to 50° latitude for now) | `Copernicus_DSM_COG_10_N46_00_E008_00_DEM.tif`, ... |
+| `worldcover/` | [ESA WorldCover 2021 v200](https://zenodo.org/records/7254221) 3° tiles (~107 MB each) | `ESA_WorldCover_10m_2021_v200_N45E006_Map.tif`, ... |
+
+Each is decoded once and cached next to the source. The globe runs with ETOPO alone; the 30 m
+elevation and land cover only exist where you downloaded tiles (the Alps, 45–47° N, 6–11° E, in
+development).
+
+**Still to do** (see the plan): trees on the globe itself (per-tile growth with hierarchical
+canopy LOD baked from the real trees), the plant library per biome (free Quixel species, see the
+plan's asset list), ocean waves, clouds and seasons.
 
 ## Getting started
 
@@ -454,7 +519,9 @@ cargo run --release
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
 | `--gallery` | every variant on flat ground, one row per species |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
-| `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse |
+| `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
+| `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
+| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--sun lat,lon] [--exposure 0.4]` | the 1:1 globe; `--views` takes the same five numbers per view |
 
 | Environment | Meaning |
 |---|---|
@@ -487,7 +554,8 @@ cargo run --release
 | Arrow keys | sun azimuth / elevation |
 | `-` `=` | exposure |
 | O | AO rays per pixel |
-| P | print the camera as `--cam` |
+| P | print the camera as `--cam` (globe: as `--at`) |
+| M (site mode) / Enter (globe) | switch between the forest scene of a real place and the globe |
 | F11 / F12 | fullscreen / screenshot |
 
 ## Tools
@@ -516,14 +584,17 @@ src/
   accel.rs     BLAS / TLAS building, instance records
   asset.rs     .mtree loader
   textures.rs  parallel PNG decode, per-species normalisation, GPU mip generation
-  world.rs     procedural terrain, biome scatter, ground mask
+  world.rs     terrain (eroded or a real site), forest succession, biome scatter, ground masks
+  erosion.rs   uplift + stream-power erosion, priority flood, drainage, river polylines
+  globe/       the 1:1 Earth: app (camera, controls), render (tile BLAS streaming, pipeline),
+               tiles (cube-sphere quadtree, tile meshes), etopo / dem / landcover (data readers)
   flypath.rs   arc-length parameterised Catmull-Rom showcase path
 native/
   dlss_shim.cpp  thin C ABI over the NGX Vulkan Ray Reconstruction API
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  (+ rt.glsl, globals.glsl, shared.glsl)
+  globe.rgen  globe.rchit  globe.rmiss  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl)
 ```
 
 ## Limitations
@@ -536,6 +607,9 @@ shaders/
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
+- **Globe:** no trees on the globe yet (land cover only), Copernicus tiles above 50° latitude
+  (narrower tiles) are skipped, the ground colour without land cover data is a latitude stand-in,
+  and the ocean has no waves. Site mode uses the forest scene's lowland species everywhere.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 
