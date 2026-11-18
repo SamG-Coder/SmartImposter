@@ -738,8 +738,13 @@ impl App {
         let capture = capture && !settling;
         let (stats, img) = s.r.render(&g, s.cam.pos, s.lod, capture)?;
         s.frame = s.frame.wrapping_add(1);
-        if settling && !views.is_empty() && (s.rendered + 1) % shot_frames == 0 {
+        if settling && shot_due {
             s.settle += 1; // hold this view
+            if s.settle == 400 {
+                if let Some(gs) = s.r.globe.as_ref() {
+                    println!("still streaming after 400 held frames: {}", gs.busy_detail());
+                }
+            }
             s.frame_times.clear();
         } else {
             s.settle = 0;

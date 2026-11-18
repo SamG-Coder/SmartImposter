@@ -189,6 +189,12 @@ static WORK: [[std::sync::atomic::AtomicU64; 2]; 2] =
 /// `n` workers: half take terrain tiles first, half tree tiles first, each falling back to the
 /// other queue, so the whole pool goes where the work is and neither queue starves when the
 /// camera moves fast.
+/// What each worker is doing (kind, tile, since): diagnostics for work that never finishes.
+static DROPPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static RECEIVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ALIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ACTIVE: std::sync::Mutex<Vec<Option<(usize, TileId, std::time::Instant)>>> = std::sync::Mutex::new(Vec::new());
+
 fn spawn_workers(
     n: usize,
     queue: &Queue,
@@ -197,10 +203,22 @@ fn spawn_workers(
     trees: impl Fn(TileId) -> TreeTile + Send + Sync + 'static,
 ) {
     let work = Arc::new((terrain, trees));
+    ACTIVE.lock().unwrap().resize(n, None);
     for w in 0..n {
         let (q, tx, work) = (queue.clone(), tx.clone(), work.clone());
         let first = w % 2;
+        ALIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::thread::spawn(move || loop {
+            struct Bye;
+            impl Drop for Bye {
+                fn drop(&mut self) {
+                    if std::thread::panicking() {
+                        ALIVE.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        eprintln!("globe worker died (panic)");
+                    }
+                }
+            }
+            let _bye = Bye;
             let (kind, id) = {
                 let (lock, cv) = &*q;
                 let mut g = lock.lock().unwrap();
@@ -215,9 +233,11 @@ fn spawn_workers(
                 }
             };
             let t = std::time::Instant::now();
+            ACTIVE.lock().unwrap()[w] = Some((kind, id, t));
             let sent = if kind == 0 { tx.0.send((work.0)(id)).is_ok() } else { tx.1.send((work.1)(id)).is_ok() };
             WORK[kind][0].fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             WORK[kind][1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            ACTIVE.lock().unwrap()[w] = None;
             if !sent {
                 return;
             }
@@ -365,6 +385,8 @@ pub struct GlobeScene {
     keep: HashSet<TileId>,
     table_cpu: Vec<u64>,
     held: usize,
+    /// running mean plant records per tree tile and per understory tile (the request budget)
+    recs_mean: [f64; 2],
     /// camera of the previous frame (motion for prefetching)
     prev_cam: Option<DVec3>,
 }
@@ -489,6 +511,7 @@ impl GlobeScene {
             keep: HashSet::new(),
             table_cpu: Vec::new(),
             held: 0,
+            recs_mean: [1500.0, 1500.0],
             prev_cam: None,
         };
         // the coarse levels everywhere, built up front so the globe is never missing pieces
@@ -647,6 +670,35 @@ impl GlobeScene {
     }
 
     /// Terrain and tree tiles still being built.
+    /// What keeps the scene busy (screenshot diagnostics).
+    pub fn busy_detail(&self) -> String {
+        let slow: Vec<String> = ACTIVE
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|a| a.2.elapsed().as_secs_f64() > 5.0)
+            .map(|(k, id, t)| format!("{} {:?} for {:.0} s", if *k == 0 { "terrain" } else { "trees" }, id, t.elapsed().as_secs_f64()))
+            .collect();
+        let ql = {
+            let g = self.queue.0.lock().unwrap();
+            (g[0].len(), g[1].len())
+        };
+        format!(
+            "received {} dropped {} resident trees {}; workers alive {} queues {:?}; waiting {} tree_pending {} backlog {} tree_backlog {}; stuck: {:?}",
+            RECEIVED.load(std::sync::atomic::Ordering::Relaxed),
+            DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            self.trees.values().map(|t| t.count as usize).sum::<usize>(),
+            ALIVE.load(std::sync::atomic::Ordering::Relaxed),
+            ql,
+            self.waiting,
+            self.tree_pending.len(),
+            self.backlog.len(),
+            self.tree_backlog.len(),
+            slow
+        )
+    }
+
     pub fn busy(&self) -> bool {
         // nothing requested before the first frames
         self.frame < 2 || self.waiting > 0 || !self.tree_pending.is_empty() || !self.backlog.is_empty() || !self.tree_backlog.is_empty()
@@ -783,6 +835,32 @@ impl GlobeScene {
         self.range = forest::tree_range(eye);
         let mut near = forest::under_tiles(cam);
         near.extend(forest::tiles_near(cam, self.range));
+        // Only what fits the plant record pool, nearest first: in dense forest seen from high up
+        // the tiles out to the horizon hold more trees than the pool; the farthest are left to the
+        // terrain's canopy colour instead of staying requested (and missing) for ever.
+        // (resident tiles stay: only new requests must fit what is left, so arriving tiles never
+        // move the cut and evict others that would be requested again)
+        {
+            near.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let budget = forest::CAPACITY as f64 * 0.85;
+            let mut sum: f64 = near.iter().filter_map(|x| self.trees.get(&x.1)).map(|t| t.count as f64).sum();
+            let mut full = false;
+            near.retain(|(_, id)| {
+                if self.trees.contains_key(id) {
+                    return true;
+                }
+                if full {
+                    return false;
+                }
+                let est = self.recs_mean[(id.level == forest::UNDER_LEVEL) as usize] * 1.2;
+                if sum + est > budget {
+                    full = true;
+                    return false;
+                }
+                sum += est;
+                true
+            });
+        }
         self.keep = near.iter().map(|x| x.1).collect();
         // Hand-over: a resident tree tile that left the list stays (drawn) while a tile replacing
         // it over the same ground, finer or coarser, is still growing; no bare patches meanwhile.
@@ -938,6 +1016,12 @@ impl GlobeScene {
             match self.tree_rx.try_recv() {
                 Ok(t) => {
                     self.tree_pending.remove(&t.id);
+                    let k = (t.id.level == forest::UNDER_LEVEL) as usize;
+                    self.recs_mean[k] += (t.recs.len() as f64 - self.recs_mean[k]) * 0.02;
+                    RECEIVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !keep.contains(&t.id) {
+                        DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     if keep.contains(&t.id) {
                         budget += t.recs.len();
                         self.tree_backlog.push_back(t);

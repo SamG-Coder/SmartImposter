@@ -27,11 +27,11 @@ layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX]; // th
 const float GT = 2.048; // metres per texture repeat (divides tiles.rs TEX_PERIOD)
 // The scans' mean albedos differ ~10x: bring them to plausible ground albedos (as tri.rchit).
 // (layers 12-25: measured mean linear albedo -> beach sand 0.36, sand 0.34, arid soil 0.24, red
-// clay 0.2, tundra 0.18, lichen 0.2, boreal floor 0.1, glacier 0.55, mud 0.11, salt 0.45,
+// clay 0.2, tundra 0.1, lichen 0.12, boreal floor 0.1, glacier 0.55, mud 0.11, salt 0.45,
 // ploughed 0.15, lava sand 0.07, steppe soil 0.17, dry grass 0.24; very dark scans capped)
 const int LAYERS = 26;
 const float GAIN[LAYERS] = float[LAYERS](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0,
-                                         1.02, 1.99, 4.0, 2.27, 6.0, 1.41, 0.58, 4.09, 3.69, 2.65, 2.62, 3.97, 3.44, 4.02);
+                                         1.02, 1.99, 4.0, 2.27, 3.3, 0.85, 0.58, 4.09, 3.69, 2.65, 2.62, 3.97, 3.44, 4.02);
 
 struct Hex { vec2 uv[3]; mat2 rot[3]; vec3 w; };
 Hex hexTile(vec2 uv) {
@@ -138,7 +138,6 @@ float organic(float a, float n, float sharp) {
 // `bed` (0..1): the bottom of a lake, river or the sea; `shore`: the strip of land at the water.
 // `biome`: RESOLVE biome number (biomes.rs); `sea`: the water at the shore / over the bed is sea.
 vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, int biome, bool sea, out float ao) {
-    float ptint = 1.0, pw = 0.0; // crop parcels: brightness of this parcel, its weight
     float slope = 1.0 - max(dot(n, up), 0.0);
     vec2 q = uvm;
     float desert = biome == 13 ? 1.0 : 0.0;
@@ -198,9 +197,9 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // built-up land (no buildings yet): the local soil with gravel, and gardens where it is not dry
     // land, in low contrast; never dark blotches
     float nb = fbmN(q * 0.035 + 61.0, 3);
-    w[7] = (bare - rockBare) * (1.0 - scree) + built * 0.55 * (1.0 - 0.5 * dryLand);  // gravel
+    w[7] = (bare - rockBare) * (1.0 - scree);                                     // gravel
     w[2] += built * 0.3 * (1.0 - dryLand) * smoothstep(0.55, 0.35, nb);
-    w[8] = moss;                                                                  // lichen rock
+    w[8] = moss * 0.25;                                                           // lichen rock
     w[9] = 0.0;
     w[10] = 0.0;
     w[11] = wet * 0.8;                                                            // wet grass
@@ -214,33 +213,17 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     for (int l = 0; l < 12; ++l) if (l != 4 && l != 5 && l != 6) w[l] *= 1.0 - cliff;
     // ---- the biome's own surfaces (biomes.rs numbers; layers 12-25, catalog.rs GROUND_LAYERS)
     float soil = 1.0 - cliff;
-    // cropland: parcels on a rotated, jittered grid (one orientation and size per ~2 km region),
-    // each ploughed, green, ripe or stubble, with grass margins along the edges
+    // cropland: no invented field layout (it never matches the real fields): the crop fraction
+    // from the land cover data as a soft mix of ploughed soil, green and ripening crop
     if (crop > 0.01) {
-        vec2 rg = floor(q / 1900.0);
-        uint hr = hash2(uvec2(ivec2(rg) + 40000));
-        float ang = float(hr & 0xFFFFu) * (6.2831853 / 65536.0);
-        vec2 size = vec2(110.0 + float((hr >> 16) & 0xFFu) * 0.6, 40.0 + float(hr >> 24) * 0.2);
-        vec2 r = mat2(cos(ang), sin(ang), -sin(ang), cos(ang)) * q;
-        // gently bent furrow lines: the parcel edges follow the land a little
-        r += vec2(fbmN(q * 0.004 + 5.0, 2) - 0.5, fbmN(q * 0.004 + 9.0, 2) - 0.5) * 40.0;
-        float row = floor(r.y / size.y);
-        r.x += float(hash2(uvec2(int(row) + 70000, hr)) & 0xFFFFu) / 65536.0 * size.x;
-        vec2 cellId = vec2(floor(r.x / size.x), row);
-        vec2 f = fract(r / size) * size;
-        float edge = min(min(f.x, size.x - f.x), min(f.y, size.y - f.y));
-        float margin = smoothstep(2.5, 0.8, edge + (nA - 0.5) * 1.5);
-        uint hc = hash2(uvec2(ivec2(cellId) + 50000) ^ uvec2(hr));
-        float st = float(hc & 0xFFu) / 255.0;
-        int layer = st < 0.25 ? 22 : st < 0.62 ? 2 : st < 0.82 ? (biome == 8 || biome == 13 ? 25 : 3) : 24;
         float cw = crop * soil;
+        float c1 = fbmN(q * 0.004 + 71.0, 3), c2 = fbmN(q * 0.0025 + 77.0, 3);
+        int ripe = biome == 8 || biome == 13 ? 25 : 3;
         w[2] = max(w[2] - crop * 0.45, 0.0);
         w[3] = max(w[3] - crop * 0.55, 0.0);
-        w[layer] += cw * (1.0 - margin);
-        ptint = 0.78 + 0.36 * float((hc >> 8) & 0xFFu) / 255.0;
-        pw = cw * (1.0 - margin);
-        w[1] += cw * margin * 0.6;
-        w[2] += cw * margin * 0.4;
+        w[22] += cw * (0.25 + 0.3 * smoothstep(0.45, 0.7, c1));
+        w[2] += cw * (0.3 + 0.3 * smoothstep(0.55, 0.3, c2));
+        w[ripe] += cw * (0.2 + 0.3 * smoothstep(0.45, 0.7, c2));
     }
     // forest floor: moss under boreal and mountain conifers, red soil in the tropics
     float conifer = biome == 6 ? 0.7 : biome == 5 ? 0.4 : 0.0;
@@ -265,11 +248,16 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
     w[14] = bareFlat * (desert * (0.45 - 0.3 * nB) + hot * 0.4 + med * 0.8);
     w[15] += bareFlat * hot * 0.5;
-    w[16] = bareFlat * arctic * 0.55 + moss * arctic * 0.3;
-    w[17] = bareFlat * arctic * 0.35 + moss * (0.4 + 0.3 * arctic);
+    // (tundra: sedge, moss and dwarf shrubs over most of the ground, lichen and stones in patches)
+    w[16] = bareFlat * arctic * 0.55 + moss * 0.08;
+    w[17] = bareFlat * arctic * 0.35 + moss * 0.18;                               // lichen
+    w[18] += moss * 0.5;                                                          // moss mat
+    w[1] += moss * 0.4;                                                           // sedge, mossy grass
+    w[3] += moss * 0.1;
     w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
     w[8] *= 1.0 - 0.6 * arctic;
-    w[7] += built * 0.45 * soil; // built-up land keeps its gravel in every biome
+    // towns: grey gravel (never the biome's red earth or sand), on dry land half the local soil
+    w[7] += built * 0.55 * (1.0 - 0.5 * dryLand) * soil;
     // wetlands and mangroves: mud
     float marsh = (biome == 9 || biome == 14) ? 0.6 : 0.25;
     w[20] = w[11] * marsh;
@@ -335,7 +323,6 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     }
     // large-scale variation so meadows and forests are not one flat colour from a distance
     alb *= mix(0.8, 1.15, nB) * mix(0.9, 1.1, nA);
-    alb *= mix(1.0, ptint, clamp(pw, 0.0, 1.0));
     ao = mix(1.0, ao, 0.8);
     // east in Earth axes, into the camera frame the instance is placed in
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
@@ -470,10 +457,7 @@ void main() {
     // (closed stands cover ~85% of the ground), darker for the shade between the crowns.
     if (!water && cover) {
         float kept = 1.0;
-        if (t > gg.misc.y) {
-            float k = max(floor(log2(t / gg.misc.z)), 1.0); // levels coarser than the finest
-            kept = exp2(-2.0 * k);
-        }
+        kept = exp2(-2.0 * thinLevels(t)); // as impostor.rint thins the trees
         if (t > gg.misc.w) kept = 0.0;
         float canopy = A.x * 0.85 * (1.0 - kept);
         alb = mix(alb, vec3(0.040, 0.062, 0.024), canopy);

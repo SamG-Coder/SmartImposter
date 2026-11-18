@@ -342,7 +342,7 @@ void main() {
                     gr += (d * nd.y + c * nd.z / 2.2) * slope;
                 }
                 gr *= gust;
-                lostVar *= gust * gust;
+                lostVar *= 0.8; // the mean gust strength (gust patches would turn the glitter into blobs)
             } else {
                 float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
                 gr = vec2(hx - h0, hz - h0) / e;

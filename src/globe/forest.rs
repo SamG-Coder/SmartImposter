@@ -163,8 +163,8 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
     let (u0, v0, s) = id.uv();
     let edge = id.edge();
     let mut rng = Rng(hash(0xA5A5 ^ ((id.face as u64) << 56) ^ ((id.x as u64) << 24) ^ id.y as u64));
-    // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass, 3 rocks and deadwood
-    for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2), (6.0, 3)] {
+    // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass, 3 deadwood, 4 rocks
+    for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2), (6.0, 3), (5.0, 4)] {
         let n = (edge / spacing).ceil() as usize;
         for j in 0..n {
             for i in 0..n {
@@ -183,12 +183,11 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                     (2, lc::GRASS) | (2, lc::SHRUB) if dryish => (if g == lc::GRASS { 0.8 } else { 0.4 }, &sp.dry_grass),
                     (0, lc::SHRUB) if arid => (0.22, if r_pick < 0.5 && !sp.dry.is_empty() { &sp.dry } else { &sp.shrubs }),
                     (0, lc::BARE) if arid => (0.06, &sp.dry),
-                    // rocks on bare ground and tundra, deadwood on the forest floor
-                    (3, lc::BARE) => (0.22, &sp.rocks),
-                    (3, lc::MOSS) => (0.25, &sp.rocks),
-                    (3, lc::SHRUB) => (0.07, if r_pick < 0.3 { &sp.deadwood } else { &sp.rocks }),
-                    (3, lc::GRASS) => (0.025, &sp.rocks),
-                    (3, lc::TREE) => (0.12, if r_pick < 0.75 { &sp.deadwood } else { &sp.rocks }),
+                    // deadwood on the forest floor (rocks: below, where the ground is rocky)
+                    (3, lc::TREE) => (0.09, &sp.deadwood),
+                    (3, lc::SHRUB) => (0.03, &sp.deadwood),
+                    (4, lc::BARE) | (4, lc::MOSS) => (0.9, &sp.rocks),
+                    (4, lc::SHRUB) | (4, lc::GRASS) | (4, lc::TREE) => (0.5, &sp.rocks),
                     // dry land plants: cacti, yuccas, dead shrubs (the biome masks keep them in the
                     // deserts and dry scrub)
                     (0, lc::BARE) => (0.12, &sp.dry),
@@ -206,6 +205,20 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                     (0, lc::GRASS) | (0, lc::MOSS) => (0.05, &sp.heath),
                     _ => continue,
                 };
+                // Rocks are not strewn evenly: they lie in fields (scree, moraine, rocky knolls) and
+                // under steep ground, where the soil is thin
+                if layer == 4 {
+                    let m = 4.0 / 111_320.0;
+                    let c = lat.to_radians().cos().max(0.05);
+                    let sx = (terrain.height(lat, lon + m / c) - terrain.height(lat, lon - m / c)) as f64 / 8.0;
+                    let sz = (terrain.height(lat + m, lon) - terrain.height(lat - m, lon)) as f64 / 8.0;
+                    let steep = smooth(0.25, 0.6, sx.hypot(sz));
+                    let p = d * R_EARTH;
+                    let field = smooth(0.62, 0.8, vnoise3(p / 220.0) * 0.65 + vnoise3(p / 45.0 + DVec3::splat(7.0)) * 0.35);
+                    if rng.f() > (field + steep * 0.7).min(1.0) {
+                        continue;
+                    }
+                }
                 let list = if list.is_empty() && layer < 3 && !(layer == 0 && g == lc::BARE) { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
                 if list.is_empty() || r_keep > p {
                     continue;
@@ -220,7 +233,7 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let info = &sp.infos[vid];
                 // rocks and logs: big ones are rarer (one 20 m ledge per many boulders), and the
                 // big ledges are outcrops: only where the ground slopes
-                if layer == 3 {
+                if layer >= 3 {
                     let foot = ((info.bmax[0] - info.bmin[0]) * (info.bmax[2] - info.bmin[2])).max(0.01) as f64;
                     if rng.f() > (6.0 / foot).min(1.0) {
                         continue;
@@ -254,12 +267,12 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let sc = 0.7 + 0.6 * r_size;
                 let (x, y, z) = (x * sc, y * sc, z * sc);
                 // rocks sink into the ground a little (their lowest point is the base)
-                let sink = if layer == 3 { 0.03 + 0.12 * (info.bmax[1] - info.bmin[1]) as f64 * sc } else { 0.03 };
+                let sink = if layer == 4 { 0.08 + 0.2 * (info.bmax[1] - info.bmin[1]) as f64 * sc } else if layer == 3 { 0.03 + 0.1 * (info.bmax[1] - info.bmin[1]) as f64 * sc } else { 0.03 };
                 let t = d * (R_EARTH + h - sink) - center;
                 let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
                 let seed = 1 + (rng.f() * 8190.0) as u32;
                 // rocks keep their colour
-                let dry = if layer == 3 { 0 } else { dryness(biome) };
+                let dry = if layer >= 3 { 0 } else { dryness(biome) };
                 let mut rec = [0u32; REC_WORDS];
                 for (ri, row) in rows.iter().enumerate() {
                     for (ci, v) in row.iter().enumerate() {
@@ -309,6 +322,11 @@ pub struct TreeTile {
 const CONTRAST: f64 = 4.0;
 
 /// Smooth value noise in 3D (Earth-fixed metres / scale), in [0, 1].
+fn smooth(e0: f64, e1: f64, x: f64) -> f64 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 fn vnoise3(p: DVec3) -> f64 {
     let c = p.floor();
     let f = p - c;
@@ -355,8 +373,9 @@ impl Rng {
 /// section 5 (e.g. birch for eucalyptus, oak for acacia and teak, poplar crowns for rainforest).
 const BIOME_TREES: [&[(&str, f32)]; 15] = [
     /* 0 none     */ &[("Silver_Birch", 0.5), ("Norway_Spruce", 0.5)],
-    /* 1 tropical moist */ &[("Black_Poplar", 0.3), ("Giant_Bamboo", 0.2), ("Alexandra_Palm", 0.12), ("Tropical_Palm", 0.08), ("European_Hornbeam", 0.15), ("English_Oak", 0.15)],
-    /* 2 tropical dry   */ &[("English_Oak", 0.4), ("European_Hornbeam", 0.25), ("Giant_Bamboo", 0.15), ("Baltic_Pine", 0.1), ("Tropical_Palm", 0.1)],
+    // (broad, rounded crowns stand in for the rainforest canopy; no columnar poplars)
+    /* 1 tropical moist */ &[("English_Oak", 0.3), ("European_Beech", 0.25), ("Norway_Maple", 0.15), ("Black_Alder", 0.12), ("Giant_Bamboo", 0.1), ("Common_Hazel", 0.08)],
+    /* 2 tropical dry   */ &[("English_Oak", 0.45), ("Norway_Maple", 0.2), ("Giant_Bamboo", 0.15), ("Common_Hazel", 0.1), ("Baltic_Pine", 0.1)],
     /* 3 tropical conifer */ &[("Baltic_Pine", 0.6), ("English_Oak", 0.4)],
     /* 4 temperate broadleaf */ &[("European_Beech", 0.3), ("English_Oak", 0.22), ("Norway_Maple", 0.1), ("European_Hornbeam", 0.06), ("Silver_Birch", 0.08), ("European_Aspen", 0.07), ("Common_Hazel", 0.07), ("Rowan", 0.04), ("Norway_Spruce", 0.04), ("Elder", 0.02)],
     /* 5 temperate conifer */ &[("Norway_Spruce", 0.4), ("Baltic_Pine", 0.2), ("European_Beech", 0.16), ("Silver_Birch", 0.06), ("European_Aspen", 0.06), ("Rowan", 0.05), ("Norway_Maple", 0.04), ("Dead_Pine", 0.03)],
@@ -546,7 +565,9 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
                     rec[ri * 4 + ci] = (*v as f32).to_bits();
                 }
             }
-            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21;
+            // levels coarser than the finest (impostor.rint thins the trees on with distance)
+            let k = (TREE_LEVEL - id.level).min(7) as u32;
+            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21 | k << 25;
             // tile-local bounds of the transformed box
             let (bmin, bmax) = (info.bmin, info.bmax);
             let mut lo = [f32::MAX; 3];

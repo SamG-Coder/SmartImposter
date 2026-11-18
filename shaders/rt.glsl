@@ -42,6 +42,20 @@ uint plantVariant(PlantRec p) { return p.data & 0xFFu; }
 uint plantSeed(PlantRec p) { return (p.data >> 8) & 0x1FFFu; }
 // How dry the plant's biome is, 0..1 (forest.rs dryness): dusty, sun-bleached foliage.
 float plantDry(PlantRec p) { return float((p.data >> 21) & 15u) / 15.0; }
+// Globe tree tiles: how many levels coarser than the finest the plant's tile is (forest.rs: such a
+// tile keeps 1 / 4^k of the trees).
+uint plantThin(PlantRec p) { return (p.data >> 25) & 7u; }
+
+// The tree density the globe aims for at distance d, as levels of thinning (continuous): tiles k
+// levels coarser cover [THIN_BASE 2^k, THIN_BASE 2^(k+1)) beyond THIN_NEAR (forest.rs
+// tiles_near: SPLIT x the finest tile edge; NEAR), full density closer in. Trees fade out within
+// their tile towards the next level's density, so neighbouring tiles meet without a step; the
+// terrain's canopy colour (globe.rchit) follows the same curve.
+const float THIN_BASE = 2443.4;  // forest.rs SPLIT x the level-15 tile edge, m
+const float THIN_NEAR = 6000.0;  // forest.rs NEAR
+float thinLevels(float d) {
+    return max(log2(d / THIN_BASE), 0.0) * smoothstep(0.5 * THIN_NEAR, THIN_NEAR, d);
+}
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
 struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)
