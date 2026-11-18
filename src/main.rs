@@ -6,6 +6,7 @@
 
 mod accel;
 mod asset;
+mod bc7;
 mod catalog;
 mod dlss;
 mod erosion;
@@ -775,6 +776,9 @@ impl App {
                     );
                 }
                 println!("{}", s.r.profile.line());
+                if std::env::var("SI_MEM").is_ok() {
+                    print!("{}", s.r.gpu.memory_report());
+                }
                 if let Some(scene) = &s.r.globe {
                     println!("{}", scene.stats_line());
                     if let Some(geo) = &s.geo {

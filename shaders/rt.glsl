@@ -32,7 +32,8 @@ uint instSeed(uint ci) { return ci >> 11; }
 
 // Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs PlantRec)
 // is at gl_InstanceCustomIndexEXT + gl_PrimitiveID: object->world 3x4 (rows), variant | seed << 8.
-struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; uint pad0; uint pad1; uint pad2; };
+// 52 bytes, packed (the buffers use scalar layout): 13 million trees cost no padding
+struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; };
 mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xyz)); }
 vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
 uint plantVariant(PlantRec p) { return p.data & 0xFFu; }

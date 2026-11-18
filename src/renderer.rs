@@ -626,9 +626,10 @@ impl Renderer {
         let mut atlas_bytes = 0u64;
         let mut raw_bytes = 0u64;
         let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 20% of the GPU's largest
-        // device-local heap): with many species (the globe's biomes), every variant's texels grow
-        // by the same factor until they fit, instead of running out of memory.
+        // Memory budget for the atlases (SI_IMPOSTOR_MB, default 30% of the GPU's largest
+        // device-local heap, room made by compressed textures and compacted BLASes): with many
+        // species (the globe's biomes), every variant's texels grow by the same factor until they
+        // fit, instead of running out of memory.
         let imp_in = imp;
         let mut imp = imp;
         {
@@ -639,7 +640,7 @@ impl Renderer {
                 .map(|h| h.size)
                 .max()
                 .unwrap_or(8 << 30);
-            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 5);
+            let budget = std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram * 3 / 10);
             let planned = |imp: &ImpostorSettings| -> u64 {
                 pack.trees
                     .iter()
@@ -790,7 +791,7 @@ impl Renderer {
             b(10, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
             b(11, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
             b(12, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
-            b(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 4 * MAX_SPECIES as u32, rt_all),
+            b(13, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32, rt_all),
             b(14, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, nvar, rt_all),
             b(15, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, MAX_GROUND_TEX as u32, rt_all),
@@ -873,7 +874,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 24 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 2 * (4 * nvar + 4 * MAX_SPECIES as u32 + MAX_GROUND_TEX as u32 + 1),
+                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1),
             },
         ];
         let desc_pool = unsafe {
@@ -1180,7 +1181,6 @@ impl Renderer {
                     c.x_axis.z, c.y_axis.z, c.z_axis.z, o.z,
                 ],
                 data: t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8),
-                pad: [0; 3],
             });
             let asset = &pack.trees[t.variant as usize];
             let (lo, hi) = (asset.bmin - Vec3::splat(0.05), asset.bmax + Vec3::splat(0.05));
@@ -1334,7 +1334,7 @@ impl Renderer {
                 })
                 .collect()
         };
-        let mat_tex = tex(&self.mat_tex, 4 * MAX_SPECIES);
+        let mat_tex = tex(&self.mat_tex, crate::textures::SPECIES_SLOTS * MAX_SPECIES);
         let ground_tex = tex(&self.ground_tex, MAX_GROUND_TEX);
         let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
@@ -2426,7 +2426,6 @@ impl Renderer {
 struct PlantRecGpu {
     rows: [f32; 12],
     data: u32,
-    pad: [u32; 3],
 }
 
 struct Clusters {

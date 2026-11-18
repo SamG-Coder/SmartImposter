@@ -493,8 +493,13 @@ Goat Willow, Norway Maple, Aleppo Pine, Dead Pine, Rowan, Elder, Giant Bamboo, B
 Anemone, European Spindle, Greasewood, Bracken, Heather, Huckleberry Oak and 7 grasses; 26 ground
 scans. Megaplants are exported from Unreal with `tools/ue_export_megaplants.py` (the USD plugins
 must be enabled) and converted with `tools/megaplant_to_mtree.py` (needs Pixar's `usd-core`).
-Impostor atlases share a memory budget (`SI_IMPOSTOR_MB`, default 20% of VRAM): with many
-species their texels grow uniformly instead of running out of memory.
+GPU memory is kept in check without losing detail: textures are block-compressed on first use
+and cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
+>= 35 dB for almost all of them, a quarter of RGBA8 or less; static and streamed BLASes are
+compacted (the tree meshes 1.9 -> 0.7 GB); tree AABBs are build input only; plant records carry
+no padding. Impostor atlases share a budget (`SI_IMPOSTOR_MB`, default 30% of VRAM): with many
+species their texels grow uniformly instead of running out of memory. `SI_MEM=1` prints the GPU
+memory by allocation with the benchmark output.
 
 **Still to do** (see the plan): the glTF 3D plants (palms, cacti, Xanadu, marram and ribbon
 grass, poppies, dandelions) need an importer; rivers from HydroRIVERS (the 10 m land cover has the

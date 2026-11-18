@@ -66,12 +66,16 @@ pub fn create_accel_in(gpu: &Gpu, buffer: vk::Buffer, offset: u64, size: u64, ty
     }
 }
 
+/// Streamed BLASes are built to be compacted afterwards (globe/scene.rs).
+const STREAM_FLAGS: vk::BuildAccelerationStructureFlagsKHR =
+    vk::BuildAccelerationStructureFlagsKHR::from_raw(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE.as_raw() | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION.as_raw());
+
 /// BLAS build sizes (storage, scratch) for one geometry.
 pub fn blas_sizes(gpu: &Gpu, g: &vk::AccelerationStructureGeometryKHR, count: u32) -> (u64, u64) {
     let gs = [*g];
     let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(STREAM_FLAGS)
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .geometries(&gs);
     let mut size = vk::AccelerationStructureBuildSizesInfoKHR::default();
@@ -84,7 +88,7 @@ pub fn cmd_build_blas(gpu: &Gpu, cb: vk::CommandBuffer, g: &vk::AccelerationStru
     let gs = [*g];
     let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
         .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
-        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .flags(STREAM_FLAGS)
         .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
         .dst_acceleration_structure(dst)
         .geometries(&gs)
@@ -100,7 +104,7 @@ pub fn destroy_accel(gpu: &Gpu, a: &mut Accel) {
 
 /// Build one BLAS per (geometry, primitive count), all in a single submission.
 pub fn build_blases(gpu: &Gpu, geoms: &[(vk::AccelerationStructureGeometryKHR<'static>, u32)]) -> Result<Vec<Accel>> {
-    let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE;
+    let flags = vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE | vk::BuildAccelerationStructureFlagsKHR::ALLOW_COMPACTION;
     let mut out = Vec::new();
     let mut max_scratch = 0u64;
     for (g, count) in geoms {
@@ -144,6 +148,51 @@ pub fn build_blases(gpu: &Gpu, geoms: &[(vk::AccelerationStructureGeometryKHR<'s
         }
     })?;
     gpu.destroy_buffer(&mut scratch);
+    compact(gpu, out)
+}
+
+/// Copy static BLASes (built with ALLOW_COMPACTION) into buffers of their compacted size and free
+/// the originals: typically half the memory, the same tracing speed.
+fn compact(gpu: &Gpu, mut built: Vec<Accel>) -> Result<Vec<Accel>> {
+    if built.is_empty() {
+        return Ok(built);
+    }
+    let before: u64 = built.iter().map(|a| a.buf.size).sum();
+    let mut out = Vec::with_capacity(built.len());
+    // in batches, so the originals and their copies never all coexist
+    for chunk in built.chunks_mut(256) {
+        let n = chunk.len() as u32;
+        let pool = unsafe {
+            gpu.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR).query_count(n),
+                None,
+            )?
+        };
+        let raws: Vec<vk::AccelerationStructureKHR> = chunk.iter().map(|a| a.raw).collect();
+        gpu.one_time(|cb| unsafe {
+            gpu.device.cmd_reset_query_pool(cb, pool, 0, n);
+            gpu.accel_fn.cmd_write_acceleration_structures_properties(cb, &raws, vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, pool, 0);
+        })?;
+        let mut sizes = vec![0u64; n as usize];
+        unsafe { gpu.device.get_query_pool_results(pool, 0, &mut sizes, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)? };
+        unsafe { gpu.device.destroy_query_pool(pool, None) };
+        let mut compact: Vec<Accel> = Vec::with_capacity(chunk.len());
+        for s in &sizes {
+            compact.push(create_accel(gpu, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL, (*s).max(256))?);
+        }
+        gpu.one_time(|cb| {
+            for (src, dst) in chunk.iter().zip(&compact) {
+                let info = vk::CopyAccelerationStructureInfoKHR::default().src(src.raw).dst(dst.raw).mode(vk::CopyAccelerationStructureModeKHR::COMPACT);
+                unsafe { gpu.accel_fn.cmd_copy_acceleration_structure(cb, &info) };
+            }
+        })?;
+        for a in chunk.iter_mut() {
+            destroy_accel(gpu, a);
+        }
+        out.extend(compact);
+    }
+    let after: u64 = out.iter().map(|a| a.buf.size).sum();
+    println!("BLAS compaction: {:.0} MB -> {:.0} MB", before as f64 / 1e6, after as f64 / 1e6);
     Ok(out)
 }
 

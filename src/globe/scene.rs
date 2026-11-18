@@ -45,6 +45,8 @@ const TREE_UPLOADS_PER_FRAME: usize = 96;
 const TREES_PER_FRAME: usize = 80_000;
 /// Per-frame staging (host -> device copies) and BLAS build scratch.
 const STAGING: u64 = 48 << 20;
+/// Bytes per plant record (forest::REC_WORDS words).
+const PLANT_REC_BYTES: u64 = forest::REC_WORDS as u64 * 4;
 /// Prefetch along the motion: look this many frames ahead (at most MAX_LEAD m; below MIN_LEAD m
 /// the camera counts as still).
 const LEAD_FRAMES: f64 = 30.0;
@@ -59,10 +61,12 @@ pub const SBT_IMPOSTOR: u32 = 1;
 pub const SBT_GLOBE_TERRAIN: u32 = 3;
 
 struct TileGpu {
-    /// slot in the vertex and BLAS pools
+    /// slot in the vertex pool
     slot: u32,
+    /// BLAS object, its address and its place in the AS heap (built, then compacted)
     blas: vk::AccelerationStructureKHR,
     blas_addr: u64,
+    heap: HeapSlot,
     vtx_addr: u64,
     center: DVec3,
     last_used: u64,
@@ -76,16 +80,14 @@ struct TreeTileGpu {
     blas: Option<(vk::AccelerationStructureKHR, u64, HeapSlot)>,
     center: DVec3,
     /// finest tiles: the plant records on the CPU too (mesh LOD near the camera)
-    recs: Vec<[u32; 16]>,
+    recs: Vec<[u32; forest::REC_WORDS]>,
 }
 
-/// Terrain tile storage: fixed-size slots for vertices and BLASes in device-local chunks of
-/// POOL_CHUNK tiles, added as tiles become resident (up to `cap`), freed slots reused.
+/// Terrain tile vertices: fixed-size slots in device-local chunks of POOL_CHUNK tiles, added as
+/// tiles become resident (up to `cap`), freed slots reused. (Their BLASes live in the AS heap.)
 struct TilePool {
     vtx: Vec<Buffer>,
-    blas: Vec<Buffer>,
     vslot: u64,
-    bslot: u64,
     free: Vec<u32>,
     cap: u32,
 }
@@ -93,8 +95,8 @@ struct TilePool {
 const POOL_CHUNK: u32 = 512;
 
 impl TilePool {
-    fn new(vtx_bytes: u64, blas_bytes: u64, cap: u32) -> Self {
-        TilePool { vtx: Vec::new(), blas: Vec::new(), vslot: vtx_bytes.div_ceil(256) * 256, bslot: blas_bytes.div_ceil(256) * 256, free: Vec::new(), cap }
+    fn new(vtx_bytes: u64, cap: u32) -> Self {
+        TilePool { vtx: Vec::new(), vslot: vtx_bytes.div_ceil(256) * 256, free: Vec::new(), cap }
     }
     /// A free slot (adding a chunk when all are taken), or None at capacity.
     fn alloc(&mut self, gpu: &Gpu) -> Result<Option<u32>> {
@@ -102,17 +104,12 @@ impl TilePool {
         if self.free.is_empty() && have < self.cap {
             let vu = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR | vk::BufferUsageFlags::TRANSFER_DST;
             self.vtx.push(gpu.create_buffer(self.vslot * POOL_CHUNK as u64, vu, MemoryLocation::GpuOnly, "terrain vertex pool")?);
-            let bu = vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR;
-            self.blas.push(gpu.create_buffer(self.bslot * POOL_CHUNK as u64, bu, MemoryLocation::GpuOnly, "terrain blas pool")?);
             self.free.extend((have..have + POOL_CHUNK).rev());
         }
         Ok(self.free.pop())
     }
     fn vtx(&self, i: u32) -> (&Buffer, u64) {
         (&self.vtx[(i / POOL_CHUNK) as usize], (i % POOL_CHUNK) as u64 * self.vslot)
-    }
-    fn blas(&self, i: u32) -> (&Buffer, u64) {
-        (&self.blas[(i / POOL_CHUNK) as usize], (i % POOL_CHUNK) as u64 * self.bslot)
     }
 }
 
@@ -124,8 +121,9 @@ struct HeapSlot {
     offset: u64,
 }
 
-/// Acceleration structure storage for variable-size BLASes: power-of-two size classes carved
-/// out of 64 MB device chunks, freed slots reused per class (no allocator calls per tile).
+/// Acceleration structure storage for the streamed BLASes (terrain and trees): size classes
+/// 1/8 octave apart (~9%: compacted BLASes vary in size) carved out of 64 MB device chunks,
+/// freed slots reused per class (no allocator calls per tile).
 struct AsHeap {
     chunks: Vec<Buffer>,
     bump: u64,
@@ -134,19 +132,26 @@ struct AsHeap {
 
 const AS_CHUNK: u64 = 64 << 20;
 const AS_MIN_CLASS: u64 = 4 << 10;
+const AS_CLASSES: usize = 96; // 4 KB .. 16 MB
 
 impl AsHeap {
     fn new() -> Self {
-        AsHeap { chunks: Vec::new(), bump: AS_CHUNK, free: vec![Vec::new(); 16] }
+        AsHeap { chunks: Vec::new(), bump: AS_CHUNK, free: vec![Vec::new(); AS_CLASSES] }
+    }
+    /// The class of a size, and that class's size (a multiple of 256: AS offsets must be).
+    fn class_of(size: u64) -> (usize, u64) {
+        let c = ((size.max(AS_MIN_CLASS) as f64 / AS_MIN_CLASS as f64).log2() * 8.0).ceil() as usize;
+        let c = c.min(AS_CLASSES - 1);
+        let bytes = (AS_MIN_CLASS as f64 * 2f64.powf(c as f64 / 8.0)).ceil() as u64;
+        (c, bytes.div_ceil(256) * 256)
     }
     fn alloc(&mut self, gpu: &Gpu, size: u64) -> Result<HeapSlot> {
-        let csize = size.max(AS_MIN_CLASS).next_power_of_two();
-        let class = (csize / AS_MIN_CLASS).trailing_zeros() as usize;
+        let (class, csize) = Self::class_of(size);
         if let Some((chunk, offset)) = self.free[class].pop() {
             return Ok(HeapSlot { class, chunk, offset });
         }
         if self.bump + csize > AS_CHUNK {
-            self.chunks.push(gpu.create_buffer(AS_CHUNK, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "tree blas heap")?);
+            self.chunks.push(gpu.create_buffer(AS_CHUNK, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "blas heap")?);
             self.bump = 0;
         }
         let s = HeapSlot { class, chunk: self.chunks.len() - 1, offset: self.bump };
@@ -163,7 +168,12 @@ enum Op {
     Copy { src: u64, dst: vk::Buffer, dst_off: u64, size: u64 },
     Terrain { vtx: u64, dst: vk::AccelerationStructureKHR, scratch: u64 },
     Trees { aabbs: u64, count: u32, dst: vk::AccelerationStructureKHR, scratch: u64 },
+    /// copy a BLAS built in an earlier frame to its compacted size
+    Compact { src: vk::AccelerationStructureKHR, dst: vk::AccelerationStructureKHR },
 }
+
+/// Most BLAS builds per frame whose compacted size is queried.
+const QUERIES: u32 = 1024;
 
 /// Work queues (0 terrain tiles, 1 tree tiles), served by one pool of workers.
 type Queue = Arc<(Mutex<[VecDeque<TileId>; 2]>, Condvar)>;
@@ -318,10 +328,15 @@ pub struct GlobeScene {
     /// device-local pools: terrain tile vertices and BLASes (fixed slots), tree BLAS heap,
     /// tree AABBs (indexed like the plant records)
     pool: TilePool,
+    /// compaction: the compacted-size queries of this frame's builds (terrain?, tile, BLAS), read
+    /// next frame; and BLASes replaced by their compacted copies, freed after the next fence
+    query_pool: vk::QueryPool,
+    queried: Vec<(bool, TileId, vk::AccelerationStructureKHR)>,
+    built: Vec<(bool, TileId, vk::AccelerationStructureKHR)>,
+    retire: Vec<(vk::AccelerationStructureKHR, HeapSlot)>,
     blas_size: u64,
     terrain_scratch: u64,
     as_heap: AsHeap,
-    aabbs: Buffer,
     /// per-frame staging ring and build scratch, and the work recorded for this frame
     staging: Buffer,
     staging_used: u64,
@@ -375,7 +390,7 @@ impl GlobeScene {
         let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
         let table = gpu.create_buffer(MAX_TERRAIN_TILES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
         let recs = forest::CAPACITY as u64;
-        let plants = gpu.create_buffer(recs * 64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "globe plants")?;
+        let plants = gpu.create_buffer(recs * PLANT_REC_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "globe plants")?;
         let mut plant_state = gpu.create_buffer(recs * 4, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "globe plant state")?;
         plant_state.mapped().fill(0);
         // pools: every terrain tile has the same vertex count and topology, so the same BLAS size
@@ -384,27 +399,32 @@ impl GlobeScene {
         let sample = terrain_geometry(0, idx.addr, nverts);
         let (blas_size, terrain_scratch) = accel::blas_sizes(gpu, &sample, tri_count);
         // a slot: the tile's vertices, then its shoreline field (tiles.rs TILE_FLOATS)
-        let mut pool = TilePool::new((tiles::TILE_FLOATS * 4) as u64, blas_size, (CACHE_TILES + 512) as u32);
+        let mut pool = TilePool::new((tiles::TILE_FLOATS * 4) as u64, (CACHE_TILES + 512) as u32);
+        let query_pool = unsafe {
+            gpu.device.create_query_pool(
+                &vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR).query_count(QUERIES),
+                None,
+            )?
+        };
         // a typical view keeps 5-9k tiles: allocate the first chunks now, not mid-flight
         let mut first = Vec::new();
         for _ in 0..12 * POOL_CHUNK {
             first.extend(pool.alloc(gpu)?);
         }
         pool.free.extend(first.into_iter().rev());
-        let aabbs = gpu.create_buffer(
-            recs * 24,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR | vk::BufferUsageFlags::TRANSFER_DST,
-            MemoryLocation::GpuOnly,
-            "tree aabbs",
+        let staging = gpu.create_buffer(
+            STAGING,
+            vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            MemoryLocation::CpuToGpu,
+            "globe staging",
         )?;
-        let staging = gpu.create_buffer(STAGING, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "globe staging")?;
         let scratch = gpu.create_buffer(SCRATCH + 4096, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "globe build scratch")?;
         println!(
-            "Globe pools: terrain tiles {:.0} KB vertices + {:.0} KB BLAS each (chunks of {}), {:.0} MB plant records + AABBs",
+            "Globe pools: terrain tiles {:.0} KB vertices + {:.0} KB BLAS each before compaction (chunks of {}), {:.0} MB plant records",
             pool.vslot as f64 / 1e3,
-            pool.bslot as f64 / 1e3,
+            blas_size as f64 / 1e3,
             POOL_CHUNK,
-            (recs * 88) as f64 / 1e6
+            (recs * PLANT_REC_BYTES) as f64 / 1e6
         );
 
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -441,10 +461,13 @@ impl GlobeScene {
             idx,
             tri_count,
             pool,
+            query_pool,
+            queried: Vec::new(),
+            built: Vec::new(),
+            retire: Vec::new(),
             blas_size,
             terrain_scratch,
             as_heap: AsHeap::new(),
-            aabbs,
             staging,
             staging_used: 0,
             scratch,
@@ -483,6 +506,7 @@ impl GlobeScene {
         s.backlog.extend(meshes);
         while !s.backlog.is_empty() {
             s.begin_frame();
+            s.compact(gpu)?;
             s.upload(gpu)?;
             gpu.one_time(|cb| s.record(gpu, cb))?;
         }
@@ -543,7 +567,7 @@ impl GlobeScene {
                     accel::cmd_build_blas(gpu, cb, &terrain_geometry(*vtx, self.idx.addr, nverts), self.tri_count, *dst, *scratch);
                 }
                 Op::Trees { aabbs, count, dst, scratch } => accel::cmd_build_blas(gpu, cb, &accel::aabb_geometry(*aabbs), *count, *dst, *scratch),
-                Op::Copy { .. } => {}
+                Op::Copy { .. } | Op::Compact { .. } => {}
             }
         }
         gpu.memory_barrier(
@@ -553,6 +577,69 @@ impl GlobeScene {
             vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR,
         );
+        // earlier frames' builds into their compacted size
+        for op in &self.ops {
+            if let Op::Compact { src, dst } = op {
+                let info = vk::CopyAccelerationStructureInfoKHR::default().src(*src).dst(*dst).mode(vk::CopyAccelerationStructureModeKHR::COMPACT);
+                unsafe { gpu.accel_fn.cmd_copy_acceleration_structure(cb, &info) };
+            }
+        }
+        // this frame's builds: their compacted sizes, read next frame (update)
+        self.queried = std::mem::take(&mut self.built);
+        self.queried.truncate(QUERIES as usize);
+        if !self.queried.is_empty() {
+            let raws: Vec<vk::AccelerationStructureKHR> = self.queried.iter().map(|q| q.2).collect();
+            unsafe {
+                d.cmd_reset_query_pool(cb, self.query_pool, 0, raws.len() as u32);
+                gpu.accel_fn.cmd_write_acceleration_structures_properties(cb, &raws, vk::QueryType::ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR, self.query_pool, 0);
+            }
+        }
+        gpu.memory_barrier(
+            cb,
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR | vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_COPY_KHR,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR | vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR,
+        );
+    }
+
+    /// After the previous frame's fence: free the BLASes its compaction copies replaced, then
+    /// compact the BLASes it built (their sizes are known now): copies recorded for this frame,
+    /// the tiles use the copies from the next frame's instances on.
+    fn compact(&mut self, gpu: &Gpu) -> Result<()> {
+        for (raw, heap) in self.retire.drain(..) {
+            unsafe { gpu.accel_fn.destroy_acceleration_structure(raw, None) };
+            self.as_heap.release(heap);
+        }
+        let queried = std::mem::take(&mut self.queried);
+        if queried.is_empty() {
+            return Ok(());
+        }
+        let mut sizes = vec![0u64; queried.len()];
+        unsafe { gpu.device.get_query_pool_results(self.query_pool, 0, &mut sizes, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT)? };
+        for ((terrain, id, raw), size) in queried.into_iter().zip(sizes) {
+            if size == 0 {
+                continue;
+            }
+            // still resident with that BLAS (not evicted or replaced since)
+            let current = if terrain {
+                self.tiles.get(&id).filter(|t| t.blas == raw).map(|t| t.heap)
+            } else {
+                self.trees.get(&id).and_then(|t| t.blas).filter(|b| b.0 == raw).map(|b| b.2)
+            };
+            let Some(old_heap) = current else { continue };
+            let heap = self.as_heap.alloc(gpu, size)?;
+            let (dst, addr) = accel::create_accel_in(gpu, self.as_heap.chunks[heap.chunk].raw, heap.offset, size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
+            self.ops.push(Op::Compact { src: raw, dst });
+            self.retire.push((raw, old_heap));
+            if terrain {
+                let t = self.tiles.get_mut(&id).unwrap();
+                (t.blas, t.blas_addr, t.heap) = (dst, addr, heap);
+            } else {
+                self.trees.get_mut(&id).unwrap().blas = Some((dst, addr, heap));
+            }
+        }
+        Ok(())
     }
 
     pub fn index_addr(&self) -> u64 {
@@ -583,13 +670,15 @@ impl GlobeScene {
             };
             let scratch = self.scratch_for(self.terrain_scratch).unwrap();
             let src = self.stage(bytes).unwrap();
-            let (bbuf, boff) = self.pool.blas(slot);
-            let (blas, blas_addr) = accel::create_accel_in(gpu, bbuf.raw, boff, self.blas_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
+            let heap = self.as_heap.alloc(gpu, self.blas_size)?;
+            let (blas, blas_addr) =
+                accel::create_accel_in(gpu, self.as_heap.chunks[heap.chunk].raw, heap.offset, self.blas_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
             let (vbuf, off) = self.pool.vtx(slot);
             let vtx_addr = vbuf.addr + off;
             self.ops.push(Op::Copy { src, dst: vbuf.raw, dst_off: off, size: bytes.len() as u64 });
             self.ops.push(Op::Terrain { vtx: vtx_addr, dst: blas, scratch });
-            self.tiles.insert(m.id, TileGpu { slot, blas, blas_addr, vtx_addr, center: m.center, last_used: self.frame });
+            self.built.push((true, m.id, blas));
+            self.tiles.insert(m.id, TileGpu { slot, blas, blas_addr, heap, vtx_addr, center: m.center, last_used: self.frame });
         }
         Ok(())
     }
@@ -608,7 +697,7 @@ impl GlobeScene {
             }
             let g = accel::aabb_geometry(0);
             let (as_size, sc_size) = accel::blas_sizes(gpu, &g, n as u32);
-            let need = (n * 64 + n * 24 + 512) as u64;
+            let need = (n * PLANT_REC_BYTES as usize + n * 24 + 512) as u64;
             if self.staging_used + need > STAGING {
                 self.tree_backlog.push_front(t);
                 break;
@@ -626,11 +715,12 @@ impl GlobeScene {
             };
             let src_r = self.stage(bytemuck::cast_slice(&t.recs)).unwrap();
             let src_a = self.stage(bytemuck::cast_slice(&t.aabbs)).unwrap();
-            self.ops.push(Op::Copy { src: src_r, dst: self.plants.raw, dst_off: base as u64 * 64, size: (n * 64) as u64 });
-            self.ops.push(Op::Copy { src: src_a, dst: self.aabbs.raw, dst_off: base as u64 * 24, size: (n * 24) as u64 });
+            self.ops.push(Op::Copy { src: src_r, dst: self.plants.raw, dst_off: base as u64 * PLANT_REC_BYTES, size: n as u64 * PLANT_REC_BYTES });
             let hs = self.as_heap.alloc(gpu, as_size)?;
             let (blas, addr) = accel::create_accel_in(gpu, self.as_heap.chunks[hs.chunk].raw, hs.offset, as_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
-            self.ops.push(Op::Trees { aabbs: self.aabbs.addr + base as u64 * 24, count: n as u32, dst: blas, scratch });
+            // the build reads the AABBs straight from staging (only BLAS build input: no copy kept)
+            self.ops.push(Op::Trees { aabbs: self.staging.addr + src_a, count: n as u32, dst: blas, scratch });
+            self.built.push((false, t.id, blas));
             let keep_recs = if t.id.level >= forest::TREE_LEVEL { t.recs } else { Vec::new() };
             self.trees.insert(t.id, TreeTileGpu { base, count: n as u32, blas: Some((blas, addr, hs)), center: t.center, recs: keep_recs });
         }
@@ -653,6 +743,7 @@ impl GlobeScene {
         for (_, _, id) in old.into_iter().take(excess) {
             if let Some(t) = self.tiles.remove(&id) {
                 unsafe { gpu.accel_fn.destroy_acceleration_structure(t.blas, None) };
+                self.as_heap.release(t.heap);
                 self.pool.free.push(t.slot);
             }
         }
@@ -837,7 +928,6 @@ impl GlobeScene {
         }
         let tu = std::time::Instant::now();
         self.evict(gpu);
-        self.upload(gpu)?;
         let ms_terrain = tu.elapsed().as_secs_f64() * 1e3;
 
         // Finished tree tiles join the backlog (up to a budget of trees per frame).
@@ -858,6 +948,9 @@ impl GlobeScene {
         }
         self.tree_backlog.retain(|t| keep.contains(&t.id));
         self.evict_trees(gpu, &keep);
+        // (evicted tiles are gone before their compaction would be recorded)
+        self.compact(gpu)?;
+        self.upload(gpu)?;
         self.upload_trees(gpu)?;
         self.keep = keep;
         Ok([ms_terrain, tt.elapsed().as_secs_f64() * 1e3])
@@ -865,7 +958,7 @@ impl GlobeScene {
 
     /// Trees of the finest tiles within `radius` of the camera (ECEF): (plant record index, tile
     /// centre, record: object -> tile rows, variant | seed << 8).
-    pub fn near_trees(&self, cam: DVec3, radius: f64, mut f: impl FnMut(u32, DVec3, &[u32; 16])) {
+    pub fn near_trees(&self, cam: DVec3, radius: f64, mut f: impl FnMut(u32, DVec3, &[u32; forest::REC_WORDS])) {
         let edge = 0.5 * std::f64::consts::PI * R_EARTH / (1u64 << forest::TREE_LEVEL) as f64;
         let ground = cam.normalize() * R_EARTH; // tile centres are at sea level: compare along the ground
         for (id, t) in &self.trees {
@@ -885,10 +978,10 @@ impl GlobeScene {
     /// Residency summary for the benchmark output.
     pub fn stats_line(&self) -> String {
         format!(
-            "globe: {} terrain tiles resident ({} pool chunks, {:.0} MB), {} drawn; {} tree tiles, {} trees drawn; tree BLAS heap {} MB",
+            "globe: {} terrain tiles resident ({} vertex pool chunks, {:.0} MB), {} drawn; {} tree tiles, {} trees drawn; BLAS heap (terrain + trees, compacted) {} MB",
             self.tiles.len(),
             self.pool.vtx.len(),
-            (self.pool.vtx.len() as u64 * POOL_CHUNK as u64 * (self.pool.vslot + self.pool.bslot)) as f64 / 1e6,
+            (self.pool.vtx.len() as u64 * POOL_CHUNK as u64 * self.pool.vslot) as f64 / 1e6,
             self.drawn,
             self.trees.len(),
             self.trees_drawn,

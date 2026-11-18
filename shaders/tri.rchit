@@ -11,8 +11,9 @@ hitAttributeEXT vec2 bary;
 
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
 layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[]; };
-// 4 textures per species (texSet): foliage CA, foliage NT, bark C, bark NAH.
-layout(set = 0, binding = 13) uniform sampler2D matTex[4 * MAX_SPECIES];
+// 6 textures per species (texSet; textures.rs SLOTS): foliage colour + alpha (BC7), normal x / y
+// (BC5), translucency (BC4); bark colour (BC7), normal x / y (BC5), occlusion (BC4).
+layout(set = 0, binding = 13) uniform sampler2D matTex[6 * MAX_SPECIES];
 layout(set = 0, binding = 15, scalar) readonly buffer Species { SpeciesInfo species[]; };
 
 // Unreal material tints are around 0.5 = neutral; applied at reduced strength.
@@ -317,7 +318,7 @@ void main() {
     float ao = 1.0;
     vec3 trans = vec3(0.0);
     vec3 albedo;
-    uint ts = m.texSet * 4u;
+    uint ts = m.texSet * 6u;
     SpeciesInfo spc = species[m.texSet];
     if (mat == MAT_TERRAIN) {
         vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
@@ -349,7 +350,7 @@ void main() {
         // hit vs the texel size on this triangle. Negative spread = fixed footprint (impostor bake).
         float spread = g.camFwd.w;
         float footprint = spread > 0.0 ? gl_HitTEXT * spread : -spread;
-        float texRes = float(textureSize(matTex[nonuniformEXT(ts + (mat == MAT_LEAF ? 0u : 2u))], 0).x);
+        float texRes = float(textureSize(matTex[nonuniformEXT(ts + (mat == MAT_LEAF ? 0u : 3u))], 0).x);
         float lod = log2(max(footprint, 1e-6)) + 0.5 * log2(max(uvArea, 1e-14) / max(worldArea, 1e-14)) + log2(texRes);
         lod = clamp(lod, 0.0, 12.0);
 
@@ -365,7 +366,7 @@ void main() {
         vec4 nrmTex;
         if (mat == MAT_LEAF) {
             vec4 ca = textureLod(matTex[nonuniformEXT(ts + 0u)], uv, lod);
-            nrmTex = textureLod(matTex[nonuniformEXT(ts + 1u)], uv, lod);
+            nrmTex = vec4(textureLod(matTex[nonuniformEXT(ts + 1u)], uv, lod).rg, textureLod(matTex[nonuniformEXT(ts + 2u)], uv, lod).r, 1.0);
             // set below, once the albedo is known
             // Subtle per-leaf variation on top of the texture (texture already has per-leaf colour).
             uint lr = pcg(leafId * 7919u + uint(gl_InstanceID) * 104729u + 17u);
@@ -377,8 +378,8 @@ void main() {
             trans = albedo * spc.transTint.rgb * (nrmTex.b * spc.transTint.w);
             extraFlags = underside ? 0u : FLAG_GLOSSY;
         } else {
-            albedo = textureLod(matTex[nonuniformEXT(ts + 2u)], uv, lod).rgb * ueTint(spc.barkTint.rgb);
-            nrmTex = textureLod(matTex[nonuniformEXT(ts + 3u)], uv, lod);
+            albedo = textureLod(matTex[nonuniformEXT(ts + 3u)], uv, lod).rgb * ueTint(spc.barkTint.rgb);
+            nrmTex = vec4(textureLod(matTex[nonuniformEXT(ts + 4u)], uv, lod).rg, textureLod(matTex[nonuniformEXT(ts + 5u)], uv, lod).r, 1.0);
             ao = pow(nrmTex.b, 1.5); // AO Strength 1.5
         }
         // Normal map (DirectX convention, Unreal). The back side of a leaf sees the mirrored bumps.

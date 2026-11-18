@@ -279,6 +279,35 @@ impl Gpu {
     }
 
     // ------------------------------------------------------------------ buffers
+    /// GPU memory by allocation name (names that differ only in a leading asset name, e.g.
+    /// "<variant> albedo", are summed together): the biggest first.
+    pub fn memory_report(&self) -> String {
+        let r = self.allocator.lock().unwrap().generate_report();
+        let mut by: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
+        for a in &r.allocations {
+            let key = match a.name.rsplit_once(' ') {
+                Some((head, tail)) if head.contains('_') => format!("* {tail}"),
+                _ => a.name.clone(),
+            };
+            let e = by.entry(key).or_default();
+            e.0 += a.size;
+            e.1 += 1;
+        }
+        let mut v: Vec<_> = by.into_iter().collect();
+        v.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let mut out = format!(
+            "GPU memory: {:.2} GB allocated, {:.2} GB reserved in blocks
+",
+            r.total_allocated_bytes as f64 / 1e9,
+            r.total_reserved_bytes as f64 / 1e9
+        );
+        for (name, (size, n)) in v.iter().take(18) {
+            out += &format!("  {:>8.0} MB  {name} ({n})
+", *size as f64 / 1e6);
+        }
+        out
+    }
+
     pub fn create_buffer(&self, size: u64, usage: vk::BufferUsageFlags, loc: MemoryLocation, name: &str) -> Result<Buffer> {
         let size = size.max(16);
         unsafe {

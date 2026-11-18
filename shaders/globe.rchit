@@ -203,7 +203,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     vec3 alb = vec3(0.0);
     vec2 nxy = vec2(0.0);
     ao = 0.0;
-    uint mask = uint(gg.params.w);
+    uint mask = floatBitsToUint(gg.params.w); // a bit mask stored as float bits (26 layers)
     Hex hx = hexTile(q / GT);
     bool near = footprint < 4.0;
     for (int k = 0; k < 3; ++k) {

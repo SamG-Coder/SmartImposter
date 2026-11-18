@@ -177,7 +177,7 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let t = d * (R_EARTH + h - 0.03) - center;
                 let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
                 let seed = 1 + (rng.f() * 8190.0) as u32;
-                let mut rec = [0u32; 16];
+                let mut rec = [0u32; REC_WORDS];
                 for (ri, row) in rows.iter().enumerate() {
                     for (ci, v) in row.iter().enumerate() {
                         rec[ri * 4 + ci] = (*v as f32).to_bits();
@@ -210,11 +210,14 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
     tile
 }
 
+/// Words per plant record (rt.glsl PlantRec: 3x4 rows, variant | seed << 8; 52 bytes).
+pub const REC_WORDS: usize = 13;
+
 pub struct TreeTile {
     pub id: TileId,
     pub center: DVec3,
     /// rt.glsl PlantRec: object -> tile 3x4 rows, then variant | seed << 8 and padding (16 x 4 bytes)
-    pub recs: Vec<[u32; 16]>,
+    pub recs: Vec<[u32; REC_WORDS]>,
     /// tile-local AABB per tree
     pub aabbs: Vec<[f32; 6]>,
 }
@@ -454,7 +457,7 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let t = d * (R_EARTH + h - 0.2) - center;
             let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
             let seed = 1 + (rng.f() * 8190.0) as u32;
-            let mut rec = [0u32; 16];
+            let mut rec = [0u32; REC_WORDS];
             for (ri, row) in rows.iter().enumerate() {
                 for (ci, v) in row.iter().enumerate() {
                     rec[ri * 4 + ci] = (*v as f32).to_bits();
