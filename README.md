@@ -419,14 +419,25 @@ so far:
       different levels meet with a visible density step from high up. (Measured at Lake Como,
       2560x1392 DLSS Quality: smooth 11.28 ms, stepped 11.32 ms average, within run-to-run
       noise.)
-  - Clouds (`shaders/clouds.glsl`): a volumetric cumulus layer 1.5-4.2 km above sea level,
-    fixed to the Earth and drifting with the wind. Cover comes from ~600 km weather systems,
-    ~40 km cells and ~8 km clusters, with fewer clouds over the subtropical deserts and more at
-    the equator. Ray marched along every primary ray and the water reflection rays (light marched
-    towards the sun, forward and back scattering, a multiple-scattering floor, sky ambient, the
-    air in front of a cloud hazing it). Every lit point marches once more towards the sun for the
-    cloud shadows on the ground, and the sky light dims under the cover. About 2.7 ms at
-    2560x1392 (Lake Como, 14.0 vs 11.3 ms); `--clouds off` or key U turns them off.
+  - Clouds (`shaders/clouds.glsl`, noise from `src/cloudnoise.rs`), after Schneider's Nubis
+    (Horizon), Hillaire's Frostbite sky and Wrenninge's multiple scattering:
+    - Three layers fixed to the Earth: low clouds from 600 m (stratus and stratocumulus ~1 km
+      thick, cumulus to ~3 km, cumulonimbus towers with anvils to 11 km), altocumulus at
+      3.5-5 km, cirrus streaks at 8-9.5 km drawn out along the wind.
+    - Where they form: the equatorial band of towering convection, clear subtropics and
+      deserts, marine stratocumulus decks off subtropical west coasts (ocean with land to the
+      east), the cloudy mid-latitude storm tracks, polar stratus; weather systems of ~800 km and
+      cells of ~12 km that grow and decay over tens of minutes; `--cloud-cover` scales it all.
+    - Shapes from tiling 3D noise textures built once and cached: Perlin-Worley billows eroded by
+      Worley fBm, a height profile per cloud type (flat bases, rounded tops), wispy below.
+    - Light: sunlight marched towards the sun and summed over three scattering octaves
+      (multiple scattering: bright, soft interiors), the droplet phase function of Jendersie &
+      d'Eon 2023 (Henyey-Greenstein + Draine fitted to Mie: silver linings, fogbow and glory
+      lobes), darker thin edges seen away from the sun (powder), light diffused down through the
+      cloud above (1 / (1 + 0.75 tau (1 - g)): thick parts darker on the base), sky light from the
+      atmosphere and the sunlit ground's bounce. Clouds shadow the ground through all three
+      layers, dim the sky light under them and show in water reflections.
+    - About 3.2 ms at 2560x1392 (Lake Como, 15.0 vs 11.8 ms); `--clouds off` or key U.
   - Atmosphere: ozone absorption, and samples packed towards the eye with each one dimmed only to
     its own middle, so the horizon is pale and hazy rather than a brown band.
   - The sea (`src/globe/ocean.rs`, `shaders/main.rgen`), built the way film and game oceans are

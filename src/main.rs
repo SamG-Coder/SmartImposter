@@ -8,6 +8,7 @@ mod accel;
 mod asset;
 mod bc7;
 mod catalog;
+mod cloudnoise;
 mod dlss;
 mod erosion;
 mod flypath;
@@ -725,6 +726,10 @@ impl App {
             // (a half moon gives ~2.4e-6 of daylight; ^0.85 leaves a moonlit night ~3 stops darker
             // than day, as a dark-adapted eye sees it; airglow and starlight keep a floor)
             let target = ((4.6 / (day + moon_up + 2e-8)).powf(0.85)).clamp(1.0, 1e6) as f32;
+            // high up the whole view is sunlit ground and cloud tops: expose down as a camera in
+            // orbit does (about a stop and a half from ~200 km)
+            let alt = geo.ecef.length() - globe::tiles::R_EARTH;
+            let target = target * (1.0 - 0.62 * smoothstep(8_000.0, 200_000.0, alt)) as f32;
             geo.adapt = if geo.adapt == 0.0 || geo.rate == 0.0 { target } else { (geo.adapt.ln() + (target.ln() - geo.adapt.ln()) * (1.0 - (-3.0 * dt).exp())).exp() };
             // applied in main.rgen before the 16-bit targets (night radiance would flush to zero)
             sun_true = [ss.x, ss.y, ss.z, geo.adapt];

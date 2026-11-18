@@ -397,6 +397,82 @@ impl Gpu {
         }
     }
 
+    /// A 3D RGBA8 texture (one level) filled from `voxels` (x fastest), ready to sample.
+    pub fn upload_volume(&self, n: u32, voxels: &[u8], name: &str) -> Result<Image> {
+        unsafe {
+            let format = vk::Format::R8G8B8A8_UNORM;
+            let raw = self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_3D)
+                    .format(format)
+                    .extent(vk::Extent3D { width: n, height: n, depth: n })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )?;
+            let req = self.device.get_image_memory_requirements(raw);
+            let alloc = self.allocator.lock().unwrap().allocate(&AllocationCreateDesc {
+                name,
+                requirements: req,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })?;
+            self.device.bind_image_memory(raw, alloc.memory(), alloc.offset())?;
+            let view = self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default().image(raw).view_type(vk::ImageViewType::TYPE_3D).format(format).subresource_range(color_range(0, 1)),
+                None,
+            )?;
+            let mut staging = self.create_buffer(voxels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "volume staging")?;
+            staging.mapped()[..voxels.len()].copy_from_slice(voxels);
+            self.one_time(|cb| {
+                let b = |old, new, sa, da, ss, ds| {
+                    [vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(ss)
+                        .src_access_mask(sa)
+                        .dst_stage_mask(ds)
+                        .dst_access_mask(da)
+                        .old_layout(old)
+                        .new_layout(new)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(raw)
+                        .subresource_range(color_range(0, 1))]
+                };
+                let t = vk::PipelineStageFlags2::TRANSFER;
+                let b1 = b(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags2::NONE, vk::AccessFlags2::TRANSFER_WRITE, vk::PipelineStageFlags2::NONE, t);
+                self.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b1));
+                self.device.cmd_copy_buffer_to_image(
+                    cb,
+                    staging.raw,
+                    raw,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[vk::BufferImageCopy {
+                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                        image_extent: vk::Extent3D { width: n, height: n, depth: n },
+                        ..Default::default()
+                    }],
+                );
+                let b2 = b(
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags2::TRANSFER_WRITE,
+                    vk::AccessFlags2::SHADER_READ,
+                    t,
+                    vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR | vk::PipelineStageFlags2::COMPUTE_SHADER,
+                );
+                self.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b2));
+            })?;
+            self.destroy_buffer(&mut staging);
+            Ok(Image { raw, alloc: Some(alloc), view, mip_views: Vec::new(), format, width: n, height: n, mips: 1 })
+        }
+    }
+
     pub fn destroy_image(&self, img: &mut Image) {
         unsafe {
             for v in img.mip_views.drain(..) {

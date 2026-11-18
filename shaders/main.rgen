@@ -105,9 +105,12 @@ bool globe() { return g.planet.w > 0.5; }
 // Longest primary / reflection ray: the forest scene ends within 100 km; on the globe the far
 // side of the planet from orbit is ~10,000 km away.
 float farRay() { return globe() ? 2.0e7 : 1.0e5; }
-vec3 globeSky(vec3 d) {
+vec3 globeSkyFrom(vec3 ro, vec3 d);
+vec3 globeSky(vec3 d) { return globeSkyFrom(-g.planet.xyz, d); }
+// The sky seen from ro (relative to the planet centre) in direction d (reflections: from the
+// reflecting point, not the camera; from orbit the two differ).
+vec3 globeSkyFrom(vec3 ro, vec3 d) {
     vec3 T;
-    vec3 ro = -g.planet.xyz;
     vec3 c = atmosphere(ro, d, 1e30, g.sunDir.xyz, g.sunDir.w, T);
     vec2 hg = raySphere(ro, d, R_GROUND);
     if (hg.x > 0.0 && hg.y > 0.0) return c; // the planet hides what lies behind it
@@ -566,7 +569,7 @@ void main() {
             traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, p + (globeWater ? normalize(gq) : vec3(0.0, 1.0, 0.0)) * 0.05, 0.02, R, farRay(), 0);
             vec3 refl;
             if (pl.t < 0.0) {
-                refl = skyColor(R);
+                refl = globeWater ? globeSkyFrom(p - g.planet.xyz, R) : skyColor(R);
             } else {
                 vec3 rp = p + R * pl.t;
                 vec3 rn = dot(pl.n, R) > 0.0 ? -pl.n : pl.n;
@@ -645,7 +648,8 @@ void main() {
     if (globe() && dbg == 0u && cloudsOn()) {
         vec4 cl = cloudMarch(-g.planet.xyz, dir, pl.t < 0.0 ? 1e30 : pl.t, 40, rnd(rng));
         col = col * cl.a + cl.rgb;
-    } else if (pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
+    } else if (!globe() && pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
+        // (the forest scene's haze; the globe has its atmosphere above)
         vec3 beta = (vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x;
         vec3 T = exp(-beta * pl.t);
         col = col * T + hazeColor(dir) * (1.0 - T);

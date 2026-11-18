@@ -57,17 +57,21 @@ vec3 atmosphere(vec3 ro, vec3 rd, float tmax, vec3 L, float sunI, out vec3 T) {
     vec2 gnd = raySphere(ro, rd, R_GROUND);
     if (gnd.x > 0.0) t1 = min(t1, gnd.x);
     if (t1 <= t0) return vec3(0.0);
-    // Samples packed towards the eye (t ~ u^2): a ray along the ground crosses hundreds of km of
-    // dense air, most of the light it gathers comes from the first tens of km. Each sample is
-    // dimmed by the air up to its own middle, not to the end of its step (that turned the horizon
-    // brown: a 50 km step of sea-level air holds an optical depth of ~1.6 in blue).
+    // Samples packed towards the ray's lower (denser) end, quadratically: a ray along the ground
+    // crosses hundreds of km of air and gathers most of its light in the first tens of km; a ray
+    // from orbit down to the ground meets the dense air at its far end. Each sample is dimmed by
+    // the air up to its own middle, not to the end of its step (that turned the horizon brown: a
+    // 50 km step of sea-level air holds an optical depth of ~1.6 in blue).
     const int N = 20;
     float len = t1 - t0;
+    bool denseEnd = length(ro + rd * t1) < length(ro + rd * t0);
     vec2 od = vec2(0.0);
     vec3 sumR = vec3(0.0), sumM = vec3(0.0);
     for (int i = 0; i < N; ++i) {
         float ua = float(i) / float(N), ub = float(i + 1) / float(N);
-        float ta = t0 + len * ua * ua, tb = t0 + len * ub * ub;
+        float sa = denseEnd ? 1.0 - (1.0 - ua) * (1.0 - ua) : ua * ua;
+        float sb = denseEnd ? 1.0 - (1.0 - ub) * (1.0 - ub) : ub * ub;
+        float ta = t0 + len * sa, tb = t0 + len * sb;
         float ds = tb - ta;
         vec3 x = ro + rd * (0.5 * (ta + tb));
         float h = max(length(x) - R_GROUND, 0.0);

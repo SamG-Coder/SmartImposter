@@ -1,15 +1,35 @@
-// Volumetric clouds (globe mode, main.rgen): a layer of cumulus between CLOUD_BASE and CLOUD_TOP
-// above sea level, Earth-fixed (the camera frame turns into Earth axes through g.earthX..Z),
-// drifting with a constant wind. Ray marched along primary and reflection rays (sunlight marched
-// towards the sun through the cloud, dual-lobe phase, a multiple-scattering floor, sky ambient),
-// and marched again from every lit point towards the sun for the cloud shadows on the ground.
-// Needs atmosphere.glsl, shared.glsl (pcg) and the Globals `g`.
+// Volumetric clouds (globe mode, main.rgen), after Schneider's Nubis (Horizon Zero Dawn / Forbidden
+// West), Hillaire's Frostbite sky and Wrenninge's multiple-scattering approximation:
+//
+// - Three layers, fixed to the Earth (the camera frame turns into Earth axes through g.earthX..Z):
+//   low clouds from 600 m (stratus and stratocumulus sheets ~1 km thick, cumulus to ~3 km,
+//   cumulonimbus towers to 11 km, by cloud type), altocumulus at 3.5-5 km, cirrus at 8-9.5 km.
+// - Where they are (weatherAt): the climate of real cloud cover (ISCCP / MODIS): the equatorial
+//   band of towering convection (ITCZ), clear subtropics and deserts (sinking air), marine
+//   stratocumulus decks off subtropical west coasts (ocean with land not far to the east), the
+//   cloudy storm tracks of the mid-latitudes, polar stratus; moving weather systems of ~800 km and
+//   cells of ~12 km that grow and decay over tens of minutes.
+// - Shapes: a tiling Perlin-Worley base eroded by Worley fBm (cloudnoise.rs, 3D textures 34, 35),
+//   shaped by a height profile per type (flat bases, rounded tops), wispy below, billowy above.
+// - Light: sunlight marched towards the sun, summed over Wrenninge's scattering octaves (multiple
+//   scattering: bright, soft interiors), Jendersie & d'Eon's droplet phase function (HG + Draine:
+//   the sharp forward peak of the silver lining, fogbow and glory lobes), the "powder" darkening of
+//   thin edges seen away from the sun, sky light from the atmosphere above and the sunlit ground's
+//   bounce below. Clouds shadow the ground (cloudShadow) and dim the sky light under them.
+// Needs atmosphere.glsl, shared.glsl and the Globals `g`.
 #ifndef CLOUDS_GLSL
 #define CLOUDS_GLSL
 
-const float CLOUD_BASE = 1500.0;
-const float CLOUD_TOP = 4200.0;
-const float CLOUD_SIGMA = 0.035; // extinction at full density, 1/m (cumulus: ~0.02-0.1)
+layout(set = 0, binding = 32) uniform sampler2D cloudElev;   // ETOPO (globe.rchit elevTex): land / sea
+layout(set = 0, binding = 34) uniform sampler3D cloudShape;  // R Perlin-Worley, GBA Worley fBm
+layout(set = 0, binding = 35) uniform sampler3D cloudDetail; // RGB Worley fBm (fine)
+
+const float LOW_BASE = 600.0, LOW_TOP = 11000.0;
+const float MID_BASE = 3500.0, MID_TOP = 5000.0;
+const float HIGH_BASE = 8000.0, HIGH_TOP = 9500.0;
+// extinction at full density (1/m): cumulus ~0.03-0.15 (liquid water 0.2-1 g/m3, 10 um droplets),
+// altocumulus thinner, cirrus (ice) ~0.001-0.003
+const float SIGMA_LOW = 0.06, SIGMA_MID = 0.03, SIGMA_HIGH = 0.0008;
 
 bool cloudsOn() { return g.planet.w > 0.5 && g.cloud.y > 0.5; }
 
@@ -36,125 +56,303 @@ float cnoise3(vec3 p) {
     return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
 }
 
-float cfbm3(vec3 p, int oct) {
-    float s = 0.0, a = 0.5, n = 0.0;
-    for (int i = 0; i < oct; ++i) {
-        s += a * cnoise3(p);
-        n += a;
-        p = p * 2.03 + vec3(17.1, 3.7, 9.3);
-        a *= 0.5;
-    }
-    return s / n;
+float cremap(float v, float lo, float hi, float nlo, float nhi) { return nlo + (v - lo) / max(hi - lo, 1e-4) * (nhi - nlo); }
+
+// Wind (km of drift) and the time axis of the evolving noise: the layers drift with the westerly
+// / trade winds of their latitude (slower aloft for the low layer), and shapes change over minutes.
+float cloudTime() { return g.params.x; }
+vec3 cloudDrift(vec3 e, float speed) {
+    vec3 u = normalize(e);
+    vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), u) + vec3(1e-5, 0.0, 0.0));
+    float lat = abs(u.z);
+    float dirSign = lat > 0.5 ? 1.0 : -1.0; // westerlies poleward of 30 degrees, easterly trades within
+    return east * dirSign * speed * cloudTime() * 1e-3;
 }
 
-// Wind: the whole layer drifts (km); the shapes also change slowly.
-vec3 cloudWind() { return vec3(0.011, 0.004, 0.0) * g.params.x; }
-
-// Cloud cover (0..1) of the column over Earth-fixed point e (km): weather cells of ~40 km and
-// clusters of ~8 km, fewer clouds over the subtropical deserts belts, more at the equator.
-float cloudCover(vec3 e) {
-    vec3 q = e + cloudWind();
-    float lat = degrees(asin(clamp(e.z / length(e), -1.0, 1.0)));
-    float belt = 1.0 - 0.55 * exp(-pow((abs(lat) - 24.0) / 9.0, 2.0)) + 0.25 * exp(-pow(lat / 8.0, 2.0));
-    float cov = clamp(g.cloud.x * belt, 0.0, 1.0);
-    // weather systems (~600 km: fronts, clear highs), cells of ~40 km, clusters of ~8 km
-    float sys = cfbm3(q / 600.0 + 11.0, 3);
-    cov = clamp(cov + (sys - 0.5) * 0.9, 0.0, 1.0);
-    float w = cfbm3(q / 40.0, 2) * 0.55 + cfbm3(q / 8.0 + 3.0, 3) * 0.45;
-    return smoothstep(1.0 - cov - 0.12, 1.0 - cov + 0.12, w);
+// Weather of a column (Earth-fixed unit direction u):
+// x low cover, y low type (0 stratus / stratocumulus, 0.5 cumulus, 1 cumulonimbus), z mid cover,
+// w high (cirrus) cover.
+// land fraction around u (~60 km blur): coastlines change the weather gradually, not at a line
+float landAt(vec3 u) {
+    float lat = asin(clamp(u.z, -1.0, 1.0)), lon = atan(u.y, u.x);
+    float e = textureLod(cloudElev, vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI), 6.0).r * 32767.0;
+    return smoothstep(-150.0, 150.0, e);
+}
+vec4 weatherAt(vec3 e) {
+    vec3 u = normalize(e);
+    float lat = degrees(asin(clamp(u.z, -1.0, 1.0)));
+    float a = abs(lat);
+    float landF = landAt(u);
+    // climate bands
+    float itcz = exp(-pow((lat - 6.0) / 7.0, 2.0));                        // north of the equator
+    float subtrop = smoothstep(10.0, 18.0, a) * (1.0 - smoothstep(30.0, 40.0, a));
+    float storm = smoothstep(35.0, 45.0, a) * (1.0 - smoothstep(65.0, 75.0, a));
+    float polar = smoothstep(62.0, 72.0, a);
+    // marine stratocumulus: subtropical ocean with land 4-16 degrees to the east (west coasts)
+    float deck = 0.0;
+    if (landF < 0.9 && a > 8.0 && a < 38.0) {
+        vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), u));
+        float land = 0.0;
+        // nearer land counts more: the deck thins out westward, away from the coast
+        for (int i = 1; i <= 6; ++i) land = max(land, landAt(normalize(u + east * (0.035 * float(i)))) * (1.12 - 0.15 * float(i)));
+        land = smoothstep(0.0, 1.0, land) * (0.75 + 0.5 * cnoise3(e / 300.0 + 4.0));
+        deck = (1.0 - landF) * land * smoothstep(8.0, 16.0, a) * (1.0 - smoothstep(30.0, 38.0, a));
+    }
+    // weather systems: fronts and highs ~800 km, moving and changing over hours
+    vec3 q = e / 800.0 + vec3(0.0, 0.0, cloudTime() / 20000.0);
+    float sys = cnoise3(q) * 0.65 + cnoise3(q * 2.3 + 7.7) * 0.35;
+    // (broken cumulus on a typical day; overcast only where the systems and the climate agree)
+    // (decks: closed cells, ~75% cover, not a featureless sheet)
+    float c = 0.16 + 0.25 * itcz + 0.22 * storm + 0.2 * polar + 0.5 * deck - 0.2 * subtrop * (1.0 - deck) - 0.2 * subtrop * landF;
+    c += (sys - 0.5) * (0.8 + 0.4 * storm);
+    c = clamp(c * (g.cloud.x / 0.45), 0.0, 1.0);
+    // type: towering over the ITCZ (and over warm land on unsettled days), sheets in the decks and
+    // the polar regions, cumulus in the trades, mixed in the storm tracks
+    float type = 0.5 + 0.45 * itcz * smoothstep(0.4, 0.7, sys) - 0.5 * deck - 0.35 * polar - 0.2 * storm * (1.0 - sys);
+    type = clamp(type + 0.2 * landF * (1.0 - subtrop) * smoothstep(0.55, 0.8, sys), 0.0, 1.0);
+    // altocumulus and cirrus with the weather: ahead of fronts in the storm tracks, the ITCZ's
+    // anvils; little in the subtropical highs
+    float mid = clamp((0.6 * storm + 0.35 * itcz) * smoothstep(0.45, 0.75, sys), 0.0, 1.0) * (g.cloud.x / 0.45);
+    float high = clamp((0.08 + 0.45 * itcz + 0.45 * storm * smoothstep(0.35, 0.75, sys)) * (1.0 - 0.7 * subtrop), 0.0, 1.0) * min(g.cloud.x / 0.45, 1.5);
+    return vec4(c, type, mid, high);
 }
 
-// Density (0..1) at x (relative to the planet centre, camera frame); `detail` erodes the edges
-// (off for the light and shadow marches).
-float cloudDensity(vec3 x, bool detail) {
-    float h = length(x) - R_GROUND;
-    if (h < CLOUD_BASE || h > CLOUD_TOP) return 0.0;
-    vec3 e = cloudEarth(x);
-    float c = cloudCover(e);
-    if (c <= 0.0) return 0.0;
-    float hn = (h - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE);
-    // flat bases, rounded tops that rise where the cover is denser (towers in the cells)
-    float shape = smoothstep(0.0, 0.08, hn) * (1.0 - smoothstep(0.35 + 0.6 * c, 1.0, hn));
-    float d = c * shape;
-    if (detail && d > 0.0) {
-        vec3 q = e + cloudWind() * 1.6;
-        float n = cfbm3(q / 0.9, 2);
-        d = clamp((d - (1.0 - n) * 0.55 * (1.0 - 0.4 * hn)) / 0.45, 0.0, 1.0);
-    }
+// Top of the low layer for a cloud type (m above sea level): stratus ~1.5 km, cumulus ~3 km,
+// cumulonimbus to 11 km.
+float lowTop(float type) {
+    return mix(mix(LOW_BASE + 900.0, LOW_BASE + 2600.0, smoothstep(0.0, 0.5, type)), LOW_TOP, smoothstep(0.6, 1.0, type));
+}
+
+// Low layer density at e (km, Earth-fixed) and height h (m), weather W; `detail`: the fine
+// erosion (off for the light and shadow marches).
+float lowDensity(vec3 e, float h, vec4 W, bool detail) {
+    float top = lowTop(W.y);
+    float hn = (h - LOW_BASE) / (top - LOW_BASE);
+    if (hn <= 0.0 || hn >= 1.0 || W.x <= 0.0) return 0.0;
+    vec3 p = e - cloudDrift(e, 8.0);
+    float t = cloudTime();
+    // cells of ~12 km that grow and decay (the tile's z axis is time)
+    float cell = textureLod(cloudShape, p / 48.0 + vec3(0.0, 0.0, t / 3000.0), 0.0).r;
+    float cov = clamp(W.x + (cell - 0.5) * 0.8, 0.0, 1.0);
+    if (cov <= 0.02) return 0.0;
+    // height profile: flat base, rounded top; stratus thin and even, towers anvil-wide at the top
+    float prof = smoothstep(0.0, 0.08 + 0.1 * W.y, hn) * smoothstep(1.0, mix(0.55, 0.75, W.y), hn);
+    if (W.y > 0.85) prof = max(prof, smoothstep(0.82, 0.9, hn) * smoothstep(1.0, 0.94, hn)); // anvil
+    vec4 s = textureLod(cloudShape, p / 9.0 + vec3(0.0, 0.0, t / 1200.0), 0.0);
+    float wf = s.g * 0.625 + s.b * 0.25 + s.a * 0.125;
+    float base = cremap(s.r, wf - 1.0, 1.0, 0.0, 1.0) * prof;
+    float d = clamp(cremap(base, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+    if (d <= 0.0 || !detail) return d;
+    vec3 dt = textureLod(cloudDetail, p / 1.2 + vec3(0.0, 0.0, t / 400.0), 0.0).rgb;
+    float df = dt.r * 0.625 + dt.g * 0.25 + dt.b * 0.125;
+    float m = mix(df, 1.0 - df, clamp(hn * 8.0, 0.0, 1.0)); // wispy bases, billowy tops
+    return clamp(cremap(d, m * 0.35, 1.0, 0.0, 1.0), 0.0, 1.0);
+}
+
+// Altocumulus: a thin layer of small puffs.
+float midDensity(vec3 e, float h, vec4 W, bool detail) {
+    float hn = (h - MID_BASE) / (MID_TOP - MID_BASE);
+    if (hn <= 0.0 || hn >= 1.0 || W.z <= 0.0) return 0.0;
+    vec3 p = e - cloudDrift(e, 15.0);
+    float t = cloudTime();
+    vec4 s = textureLod(cloudShape, p / 5.0 + vec3(0.0, 0.0, t / 1500.0), 0.0);
+    float cell = textureLod(cloudShape, p / 30.0 + vec3(0.0, 0.0, t / 3000.0), 0.0).g;
+    float cov = clamp(W.z + (cell - 0.5) * 0.9, 0.0, 1.0);
+    float prof = smoothstep(0.0, 0.25, hn) * smoothstep(1.0, 0.6, hn);
+    float base = cremap(s.r, s.g - 1.0, 1.0, 0.0, 1.0) * prof;
+    float d = clamp(cremap(base, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
+    if (d > 0.0 && detail) d = clamp(cremap(d, textureLod(cloudDetail, p / 0.8, 0.0).r * 0.4, 1.0, 0.0, 1.0), 0.0, 1.0);
     return d;
+}
+
+// Cirrus: thin ice streaks drawn out along the wind aloft.
+float highDensity(vec3 e, float h, vec4 W) {
+    float hn = (h - HIGH_BASE) / (HIGH_TOP - HIGH_BASE);
+    if (hn <= 0.0 || hn >= 1.0 || W.w <= 0.0) return 0.0;
+    vec3 p = e - cloudDrift(e, 30.0);
+    vec3 u = normalize(e);
+    vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), u) + vec3(1e-5, 0.0, 0.0)), north = cross(u, east);
+    // streak frame: long along east (the jet), short across
+    vec3 sp = vec3(dot(p, east) / 40.0, dot(p, north) / 6.0, dot(p, u) / 6.0);
+    float s = textureLod(cloudShape, sp + vec3(0.0, 0.0, cloudTime() / 4000.0), 0.0).g;
+    float f = textureLod(cloudDetail, vec3(dot(p, east) / 8.0, dot(p, north) / 1.0, 0.5), 0.0).r;
+    float prof = smoothstep(0.0, 0.3, hn) * smoothstep(1.0, 0.5, hn);
+    return clamp(cremap(s * 0.7 + f * 0.3, 1.0 - W.w, 1.0, 0.0, 1.0), 0.0, 1.0) * prof;
+}
+
+// Column cover (0..1) over Earth-fixed e: the sky light is dimmed under it (main.rgen).
+float cloudCover(vec3 e) {
+    vec4 W = weatherAt(e);
+    float cell = textureLod(cloudShape, (e - cloudDrift(e, 8.0)) / 48.0 + vec3(0.0, 0.0, cloudTime() / 3000.0), 0.0).r;
+    return clamp(max(W.x + (cell - 0.5) * 0.8, W.z * 0.6), 0.0, 1.0);
+}
+
+// The droplet phase function: Jendersie & d'Eon 2023 (HG + Draine, fitted to Mie for droplets
+// of diameter D = 16 um); `k` < 1 widens it (Wrenninge's later octaves).
+float hgPhase(float mu, float g) { return (1.0 - g * g) / (4.0 * PI * pow(max(1.0 + g * g - 2.0 * g * mu, 1e-5), 1.5)); }
+float drainePhase(float mu, float g, float a) {
+    return hgPhase(mu, g) * (1.0 + a * mu * mu) / (1.0 + a * (1.0 + 2.0 * g * g) / 3.0);
+}
+float dropletPhase(float mu, float k) {
+    const float D = 16.0;
+    float gHG = exp(-0.0990567 / (D - 1.67154));
+    float gD = exp(-2.20679 / (D + 3.91029) - 0.428934);
+    float aD = exp(3.62489 - 8.29288 / (D + 5.52825));
+    float wD = exp(-0.599085 / (D - 0.641583) - 0.665888);
+    return mix(hgPhase(mu, gHG * k), drainePhase(mu, gD * k, aD), wD);
+}
+
+// Optical depth (per unit extinction) towards the sun from x through one layer (coarse density).
+float lightDepthCloud(vec3 x, vec3 L, int layer, vec4 W) {
+    float od = 0.0, t = 0.0, dl = layer == 0 ? 60.0 : 120.0;
+    for (int j = 0; j < 5; ++j) {
+        t += dl;
+        vec3 y = x + L * (t - 0.5 * dl);
+        float h = length(y) - R_GROUND;
+        vec3 e = cloudEarth(y);
+        float d = layer == 0 ? lowDensity(e, h, W, false) : midDensity(e, h, W, false);
+        od += d * dl;
+        dl *= 2.0;
+    }
+    return od;
 }
 
 // Sun transmittance through the clouds from x (planet-centred) towards L: the cloud shadows.
 float cloudShadow(vec3 x, vec3 L) {
     if (!cloudsOn()) return 1.0;
-    float h = length(x) - R_GROUND;
-    if (h > CLOUD_TOP) return 1.0;
-    vec2 top = raySphere(x, L, R_GROUND + CLOUD_TOP);
-    vec2 base = raySphere(x, L, R_GROUND + CLOUD_BASE);
-    float t0 = h < CLOUD_BASE ? max(base.y, 0.0) : 0.0;
-    float t1 = top.y;
-    if (t1 <= t0) return 1.0;
-    t1 = min(t1, t0 + 12000.0);
-    const int N = 6;
-    float ds = (t1 - t0) / float(N), od = 0.0;
-    for (int i = 0; i < N; ++i) od += cloudDensity(x + L * (t0 + (float(i) + 0.5) * ds), false) * ds;
-    return exp(-CLOUD_SIGMA * 0.7 * od);
+    float h0 = length(x) - R_GROUND;
+    if (h0 > HIGH_TOP) return 1.0;
+    vec4 W = weatherAt(cloudEarth(x));
+    float od = 0.0;
+    // low and mid layers: where the sun ray crosses them, 8 coarse samples
+    vec2 bot = raySphere(x, L, R_GROUND + LOW_BASE), top = raySphere(x, L, R_GROUND + lowTop(W.y));
+    float t0 = h0 < LOW_BASE ? max(bot.y, 0.0) : 0.0, t1 = min(top.y, t0 + 15000.0);
+    if (t1 > t0) {
+        float ds = (t1 - t0) / 8.0;
+        for (int i = 0; i < 8; ++i) {
+            vec3 y = x + L * (t0 + (float(i) + 0.5) * ds);
+            od += lowDensity(cloudEarth(y), length(y) - R_GROUND, W, false) * ds * SIGMA_LOW;
+        }
+    }
+    vec2 mb = raySphere(x, L, R_GROUND + MID_BASE), mt = raySphere(x, L, R_GROUND + MID_TOP);
+    if (h0 < MID_BASE && mt.y > mb.y) {
+        float ds = (mt.y - mb.y) / 3.0;
+        for (int i = 0; i < 3; ++i) {
+            vec3 y = x + L * (mb.y + (float(i) + 0.5) * ds);
+            od += midDensity(cloudEarth(y), length(y) - R_GROUND, W, false) * ds * SIGMA_MID;
+        }
+    }
+    vec2 hb = raySphere(x, L, R_GROUND + HIGH_BASE + 700.0);
+    if (h0 < HIGH_BASE && hb.y > 0.0) {
+        vec3 y = x + L * hb.y;
+        od += highDensity(cloudEarth(y), length(y) - R_GROUND, W) * 1500.0 * SIGMA_HIGH;
+    }
+    // (multiple scattering lets ~30% more light through a cloud than single extinction says)
+    return exp(-0.7 * od);
 }
 
-float hgPhase(float mu, float k) { return (1.0 - k * k) / (4.0 * PI * pow(1.0 + k * k - 2.0 * k * mu, 1.5)); }
-
-// March the clouds along ro + rd * [0, tmax] (ro relative to the planet centre): in-scattered
-// light (rgb, already dimmed by the air in front of the cloud) and transmittance (a). `steps`:
-// 40 for primary rays, fewer for reflections. `jitter` in [0, 1) per pixel and frame.
-vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
-    if (!cloudsOn()) return vec4(0.0, 0.0, 0.0, 1.0);
-    float rb = R_GROUND + CLOUD_BASE, rt = R_GROUND + CLOUD_TOP;
-    float h0 = length(ro) - R_GROUND;
+// One layer's slab [rb, rt] (radii) along ro + rd t within tmax: (t0, t1), empty if t1 <= t0.
+vec2 cloudSlab(vec3 ro, vec3 rd, float rb, float rt, float tmax) {
+    float r0 = length(ro);
     vec2 top = raySphere(ro, rd, rt), base = raySphere(ro, rd, rb);
     float t0, t1;
-    if (h0 < CLOUD_BASE) {
-        t0 = base.y; t1 = top.y;                       // from below: up through the layer
-    } else if (h0 > CLOUD_TOP) {
-        if (top.y < 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
-        t0 = max(top.x, 0.0);                          // from above: down to the base or out again
+    if (r0 < rb) {
+        t0 = base.y; t1 = top.y;
+    } else if (r0 > rt) {
+        if (top.y < 0.0) return vec2(0.0, -1.0);
+        t0 = max(top.x, 0.0);
         t1 = (base.x > 0.0 && base.y > 0.0) ? base.x : top.y;
     } else {
         t0 = 0.0;
         t1 = (base.x > 0.0 && base.y > 0.0) ? base.x : top.y;
     }
-    t1 = min(t1, tmax);
-    if (t1 <= t0) return vec4(0.0, 0.0, 0.0, 1.0);
-    t1 = min(t1, t0 + 90000.0); // the layer seen edge-on: beyond this it is haze
+    return vec2(t0, min(t1, tmax));
+}
+
+// March the clouds along ro + rd * [0, tmax] (ro relative to the planet centre): in-scattered
+// light (rgb, hazed by the air in front of it) and transmittance (a). `steps`: 40 for primary
+// rays, fewer for reflections; `jitter` in [0, 1) per pixel and frame.
+vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
+    if (!cloudsOn()) return vec4(0.0, 0.0, 0.0, 1.0);
     vec3 L = g.sunDir.xyz;
     float mu = dot(rd, L);
-    float phase = mix(hgPhase(mu, 0.72), hgPhase(mu, -0.15), 0.35);
-    // sunlight at the layer (through the air above it) and the sky light: once per ray
-    vec3 xm = ro + rd * (0.5 * (t0 + t1));
-    vec3 Esun = g.sunDir.w * extinction(lightDepth(xm, L));
-    vec3 amb = Esun * vec3(0.06, 0.075, 0.11) + vec3(0.02, 0.03, 0.05) * g.sunDir.w * max(dot(normalize(xm), L) + 0.2, 0.0);
-    float ds = (t1 - t0) / float(steps);
+    // phase, with Wrenninge's octaves (a = 0.5 attenuation, b = 0.5 contribution, c = 0.5 eccentricity)
+    float ph[3] = float[3](dropletPhase(mu, 1.0), dropletPhase(mu, 0.5), dropletPhase(mu, 0.25));
     float T = 1.0, tFirst = -1.0;
     vec3 S = vec3(0.0);
-    for (int i = 0; i < steps; ++i) {
-        float t = t0 + (float(i) + jitter) * ds;
-        vec3 x = ro + rd * t;
-        float d = cloudDensity(x, true);
-        if (d <= 0.0) continue;
-        if (tFirst < 0.0) tFirst = t;
-        // towards the sun: 3 samples over ~1.6 km (coarse density)
-        float odL = 0.0;
-        for (int j = 0; j < 3; ++j) {
-            float tl = (float(j) + 0.5) * 530.0;
-            odL += cloudDensity(x + L * tl, false) * 530.0;
+    float q = float(steps) / 40.0;
+    vec3 sky = vec3(-1.0); // the sky light over the clouds: once per ray (it varies over 100s of km)
+    for (int layer = 0; layer < 3; ++layer) {
+        float rb = R_GROUND + (layer == 0 ? LOW_BASE : layer == 1 ? MID_BASE : HIGH_BASE);
+        float rt = R_GROUND + (layer == 0 ? LOW_TOP : layer == 1 ? MID_TOP : HIGH_TOP);
+        vec2 sl = cloudSlab(ro, rd, rb, rt, tmax);
+        if (sl.y <= sl.x) continue;
+        sl.y = min(sl.y, sl.x + (layer == 2 ? 150000.0 : 100000.0)); // edge-on: beyond is haze
+        float len = sl.y - sl.x;
+        // weather at the segment's two ends, interpolated along it (it varies over 100s of km)
+        vec4 Wa = weatherAt(cloudEarth(ro + rd * sl.x)), Wb = weatherAt(cloudEarth(ro + rd * sl.y));
+        if (layer == 0 && max(Wa.x, Wb.x) <= 0.0) continue;
+        if (layer == 1 && max(Wa.z, Wb.z) <= 0.0) continue;
+        if (layer == 2 && max(Wa.w, Wb.w) <= 0.0) continue;
+        int n = int(float(layer == 0 ? 56 : layer == 1 ? 14 : 6) * q) + 2;
+        float ds = len / float(n);
+        float sigma = layer == 0 ? SIGMA_LOW : layer == 1 ? SIGMA_MID : SIGMA_HIGH;
+        // light at the layer: the sun through the air above it, the sky above (atmosphere) and
+        // the sunlit ground below (albedo ~0.15), once per layer
+        vec3 xm = ro + rd * (0.5 * (sl.x + sl.y));
+        vec3 up = normalize(xm);
+        vec3 Esun = g.sunDir.w * extinction(lightDepth(xm, L));
+        if (sky.x < 0.0) {
+            vec3 Tz;
+            sky = atmosphere(xm, up, 1e30, L, g.sunDir.w, Tz) * PI;
         }
-        float Tl = exp(-CLOUD_SIGMA * odL);
-        float ms = max(Tl, 0.3 * exp(-CLOUD_SIGMA * 0.25 * odL)); // multiple scattering floor
-        float hn = (length(x) - R_GROUND - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE);
-        vec3 Li = Esun * phase * ms + amb * (0.5 + 0.5 * hn);  // brighter tops
-        float sig = CLOUD_SIGMA * d;
-        float Ts = exp(-sig * ds);
-        S += T * Li * (1.0 - Ts);                      // energy-conserving step integral
-        T *= Ts;
+        vec3 bounce = Esun * max(dot(up, L), 0.0) * 0.15;
+        float odPrev = -1.0;
+        int lit = 0;
+        for (int i = 0; i < n; ++i) {
+            float t = sl.x + (float(i) + jitter) * ds;
+            vec3 x = ro + rd * t;
+            float h = length(x) - R_GROUND;
+            vec3 e = cloudEarth(x);
+            vec4 W = mix(Wa, Wb, (t - sl.x) / max(len, 1.0));
+            float d = layer == 0 ? lowDensity(e, h, W, true) : layer == 1 ? midDensity(e, h, W, true) : highDensity(e, h, W);
+            if (d <= 0.0) continue;
+            if (tFirst < 0.0) tFirst = t;
+            float hn = layer == 0 ? (h - LOW_BASE) / (lowTop(W.y) - LOW_BASE) : layer == 1 ? (h - MID_BASE) / (MID_TOP - MID_BASE) : 0.5;
+            // sunlight: optical depth to the sun, Wrenninge's octaves
+            // (the march towards the sun changes little from one sample to the next: every other
+            // sample reuses it)
+            float odL;
+            if (layer == 2) odL = d * 600.0;
+            else if ((lit & 1) == 1 && odPrev >= 0.0) odL = odPrev;
+            else odL = lightDepthCloud(x, L, layer, W);
+            odPrev = odL;
+            ++lit;
+            float sunS = 0.0, a = 1.0, b = 1.0;
+            for (int o = 0; o < 3; ++o) {
+                sunS += b * ph[o] * exp(-sigma * a * odL);
+                a *= 0.5;
+                b *= 0.5;
+            }
+            // powder: thin edges catch little light scattered towards the eye, seen away from the sun
+            float powder = 1.0 - exp(-sigma * d * 400.0);
+            sunS *= mix(1.0, powder, 0.65 * (0.5 - 0.5 * mu));
+            // Light diffused down through the cloud above (multiple scattering: a cloud of optical
+            // depth tau passes ~1 / (1 + 0.75 tau (1 - g)) of it, g ~ 0.85): the sun's and the
+            // sky's, plus the sunlit ground's bounce from below. Dark bases, bright tops.
+            // (tau from the march towards the sun: the cloud's own thick and thin parts show as
+            // darker and lighter patches on its base, plus what lies above that march's reach)
+            float top = layer == 0 ? lowTop(W.y) : layer == 1 ? MID_TOP : HIGH_TOP;
+            float reach = layer == 0 ? 1860.0 : 3720.0;
+            float tauUp = sigma * (odL + max(top - h - reach, 0.0) * (layer == 0 ? W.x : W.z) * 0.4);
+            float diff = 1.0 / (1.0 + 0.75 * 0.15 * tauUp);
+            vec3 amb = (sky * diff + Esun * max(dot(up, L), 0.0) * diff * (1.0 - diff) * 2.0 + bounce * (1.0 - hn) * 0.6) / (4.0 * PI);
+            vec3 Li = Esun * sunS + amb;
+            float Ts = exp(-sigma * d * ds);
+            S += T * Li * (1.0 - Ts);                  // single-scattering albedo ~1
+            T *= Ts;
+            if (T < 0.01) break;
+        }
         if (T < 0.01) break;
     }
     if (tFirst < 0.0) return vec4(0.0, 0.0, 0.0, 1.0);

@@ -295,6 +295,8 @@ pub struct Renderer {
     resize_count: u32,
     mat_tex: Vec<Image>,
     ground_tex: Vec<Image>,
+    /// volumetric cloud noise (cloudnoise.rs): 3D shape and detail textures, bindings 34 / 35
+    cloud_noise: [Image; 2],
     ground_layers: u32,
     mat_sampler: vk::Sampler,
     has_tex: bool,
@@ -554,6 +556,13 @@ impl Renderer {
         };
         let dlss_mode = if dlss_ok { dlss_mode } else { None };
         let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog)?;
+        let cloud_noise = {
+            let (shape, detail) = crate::cloudnoise::load_or_build();
+            [
+                gpu.upload_volume(crate::cloudnoise::SHAPE as u32, &shape, "cloud shape noise")?,
+                gpu.upload_volume(crate::cloudnoise::DETAIL as u32, &detail, "cloud detail noise")?,
+            ]
+        };
         let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground)?;
         // bit per scanned ground layer present (tri.rchit uses procedural stand-ins for the others)
         let ground_layers = catalog.ground.iter().enumerate().map(|(i, g)| (g.is_some() as u32) << i).sum::<u32>();
@@ -832,6 +841,8 @@ impl Renderer {
             b(31, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
             b(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, OCEAN_TEX as u32, rt_all),
+            b(34, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
+            b(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -897,7 +908,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 24 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1 + OCEAN_TEX as u32),
+                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1 + OCEAN_TEX as u32 + 2),
             },
         ];
         let desc_pool = unsafe {
@@ -1033,6 +1044,7 @@ impl Renderer {
             resize_count: 0,
             mat_tex,
             ground_tex,
+            cloud_noise,
             ground_layers,
             mat_sampler,
             has_tex,
@@ -1356,6 +1368,8 @@ impl Renderer {
             _ => unreachable!("globe bindings without resources"),
         };
         let globe_elev = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_elev).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let cloud_info = |v: vk::ImageView| [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(v).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let (cloud_shape, cloud_detail) = (cloud_info(self.cloud_noise[0].view), cloud_info(self.cloud_noise[1].view));
         let ocean_tex: Vec<vk::DescriptorImageInfo> = (0..OCEAN_TEX)
             .map(|k| {
                 let view = match (&self.globe, &self.globe_dummy) {
@@ -1417,6 +1431,8 @@ impl Renderer {
             w(31, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&globe_table),
             w(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&globe_elev),
             w(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ocean_tex),
+            w(34, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_shape),
+            w(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_detail),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
