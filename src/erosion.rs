@@ -296,6 +296,8 @@ impl Erosion {
         h
     }
 
+    // cells are indices into several grids at once (area, height, parent, done): index loops
+    #[allow(clippy::needless_range_loop)]
     fn extract_rivers(&mut self, parent: &[u32]) {
         let n = N;
         let pos = |i: usize| i as f32 * self.cell - self.half;

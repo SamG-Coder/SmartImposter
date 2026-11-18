@@ -1021,7 +1021,7 @@ impl GlobeScene {
     fn evict(&mut self, gpu: &Gpu) {
         // tiles nothing has drawn for STALE_FRAMES (the camera moved on: a jump, or a long
         // flight) go whatever the cache holds, so their memory is given back
-        if self.frame > STALE_FRAMES && self.frame % 30 == 0 {
+        if self.frame > STALE_FRAMES && self.frame.is_multiple_of(30) {
             let stale: Vec<TileId> = self.tiles.iter().filter(|(id, t)| id.level > 2 && t.last_used + STALE_FRAMES < self.frame).map(|(id, _)| *id).collect();
             for id in stale {
                 if let Some(t) = self.tiles.remove(&id) {
@@ -1300,7 +1300,7 @@ impl GlobeScene {
         self.evict_trees(gpu, &keep);
         // (evicted tiles are gone before their compaction would be recorded)
         self.compact(gpu)?;
-        if self.frame % 30 == 0 {
+        if self.frame.is_multiple_of(30) {
             self.as_heap.trim(gpu, 2);
             self.pool.trim(gpu, 1);
         }

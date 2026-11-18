@@ -439,7 +439,7 @@ impl App {
                 }
             }
         }
-        let (mut pack, mut cat) = (pack, cat);
+        let (pack, cat) = (pack, cat);
         let globe_terrain = if a.globe { Some(std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?)) } else { None };
         if let Some([lat, lon]) = a.site {
             let terrain = std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?);
@@ -932,7 +932,7 @@ impl App {
             cam_up: cam_now[2],
             cam_fwd: cam_now[3],
             sun_dir: [sun.x, sun.y, sun.z, sun_w],
-            params: [now.elapsed().as_secs_f32(), 0.0, s.exposure, 4.0],
+            params: [0.0, 0.0, s.exposure, 4.0], // x and y are set by the renderer
             iparams: [s.accum, s.debug, s.frame, s.ao_rays],
             lod_params: [self.args.lod_band, s.lod2, self.args.lod2_band, 0.0],
             prev_pos: prev[0],
@@ -1038,8 +1038,8 @@ impl App {
             let mode = ["lit", "LOD view", "normals", "albedo", "AO", "sun visibility"][s.debug.min(5) as usize];
             let cam_mode = if let Some(geo) = &s.geo {
                 let rate = match geo.rate {
-                    r if r == 0.0 => "stopped".to_string(),
-                    r if r == 1.0 => "real time".to_string(),
+                    0.0 => "stopped".to_string(),
+                    1.0 => "real time".to_string(),
                     r if r < 3600.0 => format!("{:.0} min/s", r / 60.0),
                     r if r < 86_400.0 => format!("{:.0} h/s", r / 3600.0),
                     r => format!("{:.0} day/s", r / 86_400.0),

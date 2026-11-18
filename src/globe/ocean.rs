@@ -155,7 +155,8 @@ impl Rng {
     fn gauss(&mut self) -> (f32, f32) {
         let (a, b) = (self.next(), self.next());
         let r = (-2.0 * a.ln()).sqrt();
-        (r * (6.2831853 * b).cos(), r * (6.2831853 * b).sin())
+        let a = std::f32::consts::TAU * b;
+        (r * a.cos(), r * a.sin())
     }
 }
 
@@ -464,15 +465,18 @@ fn pack_mips(l0: &[[f32; 4]]) -> Vec<u16> {
     out
 }
 
+/// The next request (sea state, time) and the newest finished frame, with a signal for the thread.
+type Shared = Arc<(Mutex<(Option<(SeaState, f32)>, Option<Frame>)>, Condvar)>;
+
 /// The simulation on its own thread: the scene posts the sea state each frame and takes the
 /// newest finished frame when there is one (never waits).
 pub struct Ocean {
-    shared: Arc<(Mutex<(Option<(SeaState, f32)>, Option<Frame>)>, Condvar)>,
+    shared: Shared,
 }
 
 impl Ocean {
     pub fn spawn() -> Self {
-        let shared: Arc<(Mutex<(Option<(SeaState, f32)>, Option<Frame>)>, Condvar)> = Arc::new((Mutex::new((None, None)), Condvar::new()));
+        let shared: Shared = Arc::new((Mutex::new((None, None)), Condvar::new()));
         let s = shared.clone();
         std::thread::Builder::new()
             .name("ocean".into())

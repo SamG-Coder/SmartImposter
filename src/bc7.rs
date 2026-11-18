@@ -234,7 +234,9 @@ fn encode_mode6(px: &[[u8; 4]; 16]) -> [u8; 16] {
     let mut e0: [f32; 4] = std::array::from_fn(|c| (mean[c] + axis[c] * tmin).clamp(0.0, 255.0));
     let mut e1: [f32; 4] = std::array::from_fn(|c| (mean[c] + axis[c] * tmax).clamp(0.0, 255.0));
 
-    let mut best: Option<([u32; 4], [u32; 4], u32, u32, [u8; 16], u32)> = None;
+    // endpoints, p-bits, indices, error
+    type Candidate = ([u32; 4], [u32; 4], u32, u32, [u8; 16], u32);
+    let mut best: Option<Candidate> = None;
     for round in 0..3 {
         // p-bits: all four combinations, keep the best
         for p0 in 0..2u32 {

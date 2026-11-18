@@ -158,10 +158,13 @@ struct Slot {
     used: AtomicU64,
 }
 
+/// A worker's recent tiles by key (a ring, with the next slot to replace).
+type RecentTiles = ([((i32, i32), Option<Arc<Tile>>); 4], usize);
+
 thread_local! {
     /// Each worker's recent tiles, held and read in place: a sample touches no shared counter
     /// (13 workers cloning one tile's Arc per sample made the cache line bounce between cores).
-    static LAST: std::cell::RefCell<([((i32, i32), Option<Arc<Tile>>); 4], usize)> =
+    static LAST: std::cell::RefCell<RecentTiles> =
         std::cell::RefCell::new((std::array::from_fn(|_| ((i32::MIN, 0), None)), 0));
 }
 
@@ -217,10 +220,6 @@ impl Glo30 {
 
     pub fn has(&self, lat: i32, lon: i32) -> bool {
         self.index.contains(&(lat, lon))
-    }
-
-    pub fn tile_count(&self) -> usize {
-        self.index.len()
     }
 
     fn path(&self, (lat, lon): (i32, i32)) -> PathBuf {

@@ -1,11 +1,13 @@
-//! Procedural terrain, forest growth and layout.
+//! The forest scene: terrain, forest growth and layout.
 //!
-//! * Terrain: rolling hills on a graded grid (3 m cells in the middle, up to 300 m at the edge)
-//!   reaching TERRAIN_HALF in every direction, with the Earth's curvature (d^2 / 2R).
+//! * Terrain: the erosion simulation's landscape (erosion.rs), or a real place (`--site`, from the
+//!   Earth data), on a graded grid (3 m cells in the middle, up to 300 m at the edge) reaching
+//!   TERRAIN_HALF in every direction, with the Earth's curvature (d^2 / 2R).
+//! * What grows on it: the biome preset (biome.rs, `--biome`).
 //! * Canopy: a seed-dispersal simulation. Founder trees start in pairs; every generation each tree
 //!   drops seeds with its species' dispersal kernel, and a seedling survives depending on the site
 //!   (biome), crowding and shade tolerance. Stands, groves and ragged edges emerge on their own.
-//! * Understory and grass: jittered grids driven by the simulated canopy cover.
+//! * Understory, grass, boulders and deadwood: jittered grids driven by the simulated canopy cover.
 //! * Every plant is an individual instance with its own transform; the renderer groups them into
 //!   cluster acceleration structures (one impostor box per plant), so the forest can reach far out.
 
@@ -32,7 +34,6 @@ pub struct TreeInstance {
     pub center: Vec3, // world-space bounding sphere centre, used for LOD distance
     pub variant: u8,
     pub seed: u16, // 13 bits, never 0 (0 = untinted, used by the baker)
-    pub color: u8, // impostor instance-mask colour
     /// dryness tint 0..15 (rt.glsl plantDry; biome.rs Preset::dry_tint)
     pub dry: u8,
 }
@@ -158,7 +159,6 @@ fn land() -> &'static Land {
 pub struct Site {
     terrain: std::sync::Arc<crate::globe::dem::Terrain>,
     pub lat: f64,
-    pub lon: f64,
     up: glam::DVec3,
     east: glam::DVec3,
     north: glam::DVec3,
@@ -172,7 +172,7 @@ pub fn set_site(terrain: std::sync::Arc<crate::globe::dem::Terrain>, lat: f64, l
     let up = crate::globe::tiles::dir_from_lat_lon(lat, lon);
     let east = glam::DVec3::Z.cross(up).normalize();
     let north = up.cross(east);
-    let mut s = Site { terrain, lat, lon, up, east, north, drainage: None };
+    let mut s = Site { terrain, lat, up, east, north, drainage: None };
     // drainage of the real terrain around the site: the small streams the land cover map misses
     let half = 15_360.0;
     let n = Erosion::GRID;
@@ -438,7 +438,7 @@ fn pick(groups: &[(f32, &[usize])], r1: f32, r2: f32) -> Option<usize> {
             return Some(vs[((r2 * vs.len() as f32) as usize).min(vs.len() - 1)]);
         }
     }
-    live().last().map(|g| g.1[0])
+    live().next_back().map(|g| g.1[0])
 }
 
 /// Run `f(row)` for every row on all cores; rows are written into `out` (row length `w`).
@@ -557,7 +557,7 @@ fn grow_forest(world: &World, radius: f32, avail: [bool; 6], spacing: f32) -> Ve
         s
     };
     // Try to establish a tree; returns false when crowded / shaded out.
-    let mut try_add = |trees: &mut Vec<Seedling>, grid: &mut Vec<Vec<u32>>, rng: &mut Rng, t: Seedling| -> bool {
+    let try_add = |trees: &mut Vec<Seedling>, grid: &mut Vec<Vec<u32>>, rng: &mut Rng, t: Seedling| -> bool {
         if t.x * t.x + t.z * t.z > radius * radius {
             return false;
         }
@@ -786,7 +786,7 @@ impl World {
                 let pos = Vec3::new(x + tw * 0.5 - (t.bmin.x + t.bmax.x) * 0.5, 0.0, z - depth * 0.5 - (t.bmin.z + t.bmax.z) * 0.5);
                 let xform = Affine3A::from_translation(pos);
                 let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
-                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, color: (v % 7) as u8, dry: 0 });
+                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, dry: 0 });
                 x += tw;
             }
             z -= depth + 2.0;
@@ -868,7 +868,8 @@ impl World {
             let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
             let seed = 1 + (rng.f() * 8190.0) as u16;
             canopy.push(world.trees.len());
-            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color: (rng.next() % 7) as u8, dry: bp.dry_tint });
+            rng.next(); // (a draw kept so the forest's random sequence, and so the scene, stays the same)
+            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint });
             counts[0] += 1;
         }
         world.cover = world.splat_cover(trees, cat);
@@ -1016,10 +1017,9 @@ impl World {
                     let xform = Affine3A::from_scale_rotation_translation(Vec3::splat(scale), rot, Vec3::new(x, y, z));
                     let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
                     let seed = 1 + (hs(gx, gz, 8) * 8190.0) as u16;
-                    let color = (gx + 3 * gz + 2 * layer as i32).rem_euclid(7) as u8;
                     // (the boulder scans are mossy: in dry biomes they take the dry tint too)
                     let dry = bp.dry_tint;
-                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, color, dry });
+                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry });
                     counts[(layer as usize).min(4)] += 1;
                 }
             }
@@ -1122,7 +1122,7 @@ impl World {
             }
         }
         let tri_count = indices.len() / 3;
-        let materials = vec![MAT_TERRAIN; (tri_count + 3) / 4 * 4];
+        let materials = vec![MAT_TERRAIN; tri_count.div_ceil(4) * 4];
         // UV channel carries the water data to the terrain shader: u = water depth over the bed
         // (m), v = bank proximity.
         let mut uvs = vec![0.0; n * n * 2];
@@ -1172,7 +1172,7 @@ impl World {
         let mut under = vec![0.0f32; res * res];
         for t in &self.trees {
             let v = t.variant as usize;
-            if v >= cat.variants.len() || !matches!(cat.variants[v].kind, Kind::Shrub | Kind::Plant) && !(cat.variants[v].kind == Kind::Tree && cat.variants[v].height < 4.0) {
+            if v >= cat.variants.len() || !(matches!(cat.variants[v].kind, Kind::Shrub | Kind::Plant) || cat.variants[v].kind == Kind::Tree && cat.variants[v].height < 4.0) {
                 continue;
             }
             let a = &trees[v];

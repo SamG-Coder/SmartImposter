@@ -43,7 +43,6 @@ pub struct Variant {
 
 /// A scanned ground surface: albedo, normal (DirectX), occlusion/roughness/metal.
 pub struct GroundMaterial {
-    pub name: String,
     pub albedo: PathBuf,
     pub normal: PathBuf,
     pub orm: PathBuf,
@@ -158,8 +157,8 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
             cat.variants.push(Variant { species: si, kind, height, lod_scale, cull, texel_scale });
             pack.trees.push(t);
         }
-        cat.mesh_species.extend(std::iter::repeat(si as u32).take(p.meshes.len()));
-        cat.mesh_alpha.extend(std::iter::repeat(alpha).take(p.meshes.len()));
+        cat.mesh_species.extend(std::iter::repeat_n(si as u32, p.meshes.len()));
+        cat.mesh_alpha.extend(std::iter::repeat_n(alpha, p.meshes.len()));
         pack.meshes.extend(p.meshes);
         cat.species.push(Species {
             name: j["species"].as_str().unwrap_or("?").to_string(),
@@ -189,7 +188,8 @@ pub const GROUND_LAYERS: [&str; 26] = [
     "Mossy_Riverbed-ecca0e0f",   // https://www.fab.com/listings/ecca0e0f-0ae5-4f4c-8db0-49537d799253
     "Pebbles_Round-60ac923a",    // https://www.fab.com/listings/60ac923a-b915-40b0-92af-9748ba20c453
     "Wet_Grass_Ground-138dc11e", // https://www.fab.com/listings/138dc11e-bdbd-41cd-8c63-6e16846d0b72
-    // the globe's biomes (globe.rchit groundMaterial); the forest scene uses the first 12
+    // the globe's biomes (globe.rchit groundMaterial); the forest scene blends 12 slots, which a
+    // --biome preset maps onto any of these (biome.rs)
     "Beach_Sand",            // 12 sea coasts
     "Sand-",                 // 13 dunes, sandy desert
     "Arid_Soil_Ground",      // 14 dry desert and Mediterranean soil
@@ -223,7 +223,7 @@ pub fn find_ground() -> Vec<Option<GroundMaterial>> {
         collect_pngs(&dir, &mut files, 0);
         let pick = |suffix: &str| files.iter().find(|p| p.to_string_lossy().ends_with(suffix)).cloned();
         match (pick("_B.png"), pick("_N.png"), pick("_ORM.png")) {
-            (Some(albedo), Some(normal), Some(orm)) => out.push(Some(GroundMaterial { name: name.to_string(), albedo, normal, orm })),
+            (Some(albedo), Some(normal), Some(orm)) => out.push(Some(GroundMaterial { albedo, normal, orm })),
             _ => out.push(None),
         }
     }

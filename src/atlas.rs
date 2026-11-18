@@ -8,7 +8,7 @@
 //! A cache file is the bake's BC block stream for one variant: per level 0..mips the albedo
 //! (BC3), normal (BC5) and depth (BC5) atlases, then the half-resolution visibility (BC3) levels.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
@@ -146,26 +146,38 @@ pub fn read_regions(path: &Path, regions: &[Region]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Full-atlas reads off the render thread: requests in, (variant, stream) out.
+/// Where the loader writes a stream: an address in mapped upload memory and its length.
+/// (The renderer keeps the region reserved until the GPU has copied it out.)
+#[derive(Clone, Copy)]
+pub struct Dest {
+    pub addr: usize,
+    pub len: usize,
+}
+
+/// Full-atlas reads off the render thread, straight into the renderer's upload buffer:
+/// requests (variant, cache file, destination) in, (variant, result) out.
 pub struct Loader {
-    tx: std::sync::mpsc::Sender<(usize, PathBuf)>,
-    pub rx: std::sync::mpsc::Receiver<(usize, Result<Vec<u8>>)>,
+    tx: std::sync::mpsc::Sender<(usize, PathBuf, Dest)>,
+    pub rx: std::sync::mpsc::Receiver<(usize, Result<()>)>,
 }
 
 impl Loader {
     pub fn spawn() -> Self {
-        let (tx, req) = std::sync::mpsc::channel::<(usize, PathBuf)>();
+        let (tx, req) = std::sync::mpsc::channel::<(usize, PathBuf, Dest)>();
         let (done, rx) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name("atlas loader".into())
             .spawn(move || {
-                for (v, path) in req {
-                    let r = std::fs::read(&path).map_err(anyhow::Error::from).and_then(|b| {
-                        if b.len() < HEADER as usize {
-                            bail!("{} is truncated", path.display());
-                        }
-                        Ok(b[HEADER as usize..].to_vec())
-                    });
+                for (v, path, dest) in req {
+                    // SAFETY: the renderer reserved [addr, addr + len) of its persistently mapped
+                    // upload buffer for this request and touches it again only after our reply.
+                    let out = unsafe { std::slice::from_raw_parts_mut(dest.addr as *mut u8, dest.len) };
+                    let r = (|| -> Result<()> {
+                        let mut f = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
+                        f.seek(SeekFrom::Start(HEADER))?;
+                        f.read_exact(out).with_context(|| format!("{} is truncated", path.display()))?;
+                        Ok(())
+                    })();
                     if done.send((v, r)).is_err() {
                         break;
                     }
@@ -175,8 +187,45 @@ impl Loader {
         Loader { tx, rx }
     }
 
-    pub fn request(&self, v: usize, path: PathBuf) {
-        let _ = self.tx.send((v, path));
+    pub fn request(&self, v: usize, path: PathBuf, dest: Dest) {
+        let _ = self.tx.send((v, path, dest));
+    }
+}
+
+/// First-fit allocator of byte ranges in the upload buffer (free ranges sorted, merged on release).
+pub struct Ranges {
+    free: Vec<(u64, u64)>,
+}
+
+impl Ranges {
+    pub fn new(size: u64) -> Self {
+        Ranges { free: vec![(0, size)] }
+    }
+    /// A range of `n` bytes starting at a multiple of 16 (buffer-to-image copy offsets must be
+    /// multiples of the 16-byte BC block).
+    pub fn alloc(&mut self, n: u64) -> Option<u64> {
+        let n = n.div_ceil(16) * 16;
+        let i = self.free.iter().position(|r| r.1 >= n)?;
+        let start = self.free[i].0;
+        self.free[i].0 += n;
+        self.free[i].1 -= n;
+        if self.free[i].1 == 0 {
+            self.free.remove(i);
+        }
+        Some(start)
+    }
+    pub fn release(&mut self, start: u64, n: u64) {
+        let n = n.div_ceil(16) * 16;
+        let i = self.free.partition_point(|r| r.0 < start);
+        self.free.insert(i, (start, n));
+        if i + 1 < self.free.len() && self.free[i].0 + self.free[i].1 == self.free[i + 1].0 {
+            self.free[i].1 += self.free[i + 1].1;
+            self.free.remove(i + 1);
+        }
+        if i > 0 && self.free[i - 1].0 + self.free[i - 1].1 == self.free[i].0 {
+            self.free[i - 1].1 += self.free[i].1;
+            self.free.remove(i);
+        }
     }
 }
 
@@ -196,6 +245,18 @@ mod tests {
         assert_eq!(stream_bytes(12, 32, 3), l.iter().map(|r| r.bytes).sum::<u64>());
         assert_eq!(skip_for(3), 1);
         assert_eq!(skip_for(7), 2);
+    }
+
+    #[test]
+    fn ranges_reuse_and_merge() {
+        let mut r = Ranges::new(1000);
+        let a = r.alloc(100).unwrap();
+        let b = r.alloc(250).unwrap();
+        assert_eq!((a, b), (0, 112)); // 16-byte aligned
+        assert!(r.alloc(1000).is_none());
+        r.release(a, 100);
+        r.release(b, 250);
+        assert_eq!(r.alloc(990), Some(0)); // merged back into one range
     }
 
     #[test]
