@@ -46,6 +46,17 @@ float vnoise(vec2 p) {
     float a = hashf(i), b = hashf(i + vec2(1, 0)), c = hashf(i + vec2(0, 1)), d = hashf(i + vec2(1, 1));
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
+// Value noise with its derivatives: (value, d/dx, d/dy), quintic so the slopes are smooth too.
+vec3 vnoiseD(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+    vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+    float a = hashf(i), b = hashf(i + vec2(1, 0)), c = hashf(i + vec2(0, 1)), d = hashf(i + vec2(1, 1));
+    float k = a - b - c + d;
+    return vec3(a + (b - a) * u.x + (c - a) * u.y + k * u.x * u.y,
+                du.x * ((b - a) + k * u.y),
+                du.y * ((c - a) + k * u.x));
+}
 
 // ---------------------------------------------------------------- octahedral mappings
 float signNZ(float v) { return v >= 0.0 ? 1.0 : -1.0; }

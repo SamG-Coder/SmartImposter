@@ -390,16 +390,10 @@ void main() {
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
     float lat = degrees(asin(clamp(upE.z, -1.0, 1.0)));
     bool cover = C.z > 0.5;
-    // Water: a flat surface at the level wherever the ground lies below it on the mapped water, and
-    // a little beyond (the maps disagree by a pixel); where the mapped water climbs a bank the bank
-    // stays land. Shores follow the terrain's contours, lakes are flat.
-    float tol = 0.4 + cellM * 0.05;
-    // the mesh is linear between vertices, so its contours are straight: bend them with
-    // Earth-fixed noise (on the fine tiles, where a vertex spacing is visible)
-    float wig = ((fbmN(uvm * 0.22 + 17.0, 3) - 0.5) * 0.7 + (fbmN(uvm * 0.045 + 3.0, 2) - 0.5) * 0.9) * min(1.0, 6.0 / max(cellM, 1.0));
-    float above = hasLevel ? elev + wig - level : 1e3; // height of the ground over the water level
-    bool water = hasLevel ? (sd < 0.0 && above < tol) || (above < -0.05 && sd < min(12.0, 3.0 * cellM))
-                          : sd < 0.0;
+    // Water: the field is the distance to the drawn water (tiles.rs water_field: mapped water
+    // whose ground lies below the level), so it decides alone; the surface is flat at the level.
+    float above = hasLevel ? elev - level : 0.0; // height of the ground over the water level
+    bool water = sd < 0.0;
     bool lake = water && (hasLevel ? level > 0.5 : elev > 0.5); // a water surface above sea level
     // Where the tile mesh is coarser than the data (far away), coastline and relief come from the
     // elevation grid per pixel instead (geometry cells ~ t / 160 m, see tiles.rs SPLIT_K).
@@ -432,13 +426,16 @@ void main() {
     if (water) {
         float d = -sd;
         float floorE = max(-elevAt(elevUV(upE), 0.0), 0.0);
-        depth = lake ? min(max(d, 0.0) * 0.45, 18.0) : max(min(max(d, 0.0) * 0.3, 12.0), floorE * smoothstep(20.0, 36.0, d));
-        depth = max(max(depth, -above), 0.02);
+        // (both reach full depth within 30 m: the finest tiles' field reaches 37 m, so tiles of
+        // every size agree, no seams)
+        depth = lake ? min(max(d, 0.0) * 0.6, 18.0) : max(min(max(d, 0.0) * 0.4, 12.0), floorE * smoothstep(15.0, 30.0, d));
+        depth = max(max(depth, -above), 0.02); // (the shallows fade to the shore that is seen)
     }
+    float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
-    float band = max(2.5, footprint * 1.5);
+    float band = max(2.5 * (0.4 + 1.2 * nW0), footprint * 1.5);
     // (inside the mapped water but above the level: by the height over the water)
-    float shore = water ? 0.0 : sd >= 0.0 || !hasLevel ? smoothstep(band, 0.0, sd) : smoothstep(1.2, 0.0, above - tol);
+    float shore = water ? 0.0 : smoothstep(band, band * 0.25, sd);
     int biome = int(biomeF + 0.5);
     bool seaSide = elev < 4.0; // the water at this shore / over this bed is the sea
     if (water) {
@@ -447,7 +444,7 @@ void main() {
     } else if (cover) {
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
         // wet: right at the mapped water, and just above the water level along the contour
-        float damp = max(smoothstep(1.2, 0.0, sd), smoothstep(0.6, 0.0, above - tol) * step(sd, max(25.0, 2.0 * cellM)));
+        float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd);
         alb *= mix(1.0, 0.55, damp);
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));

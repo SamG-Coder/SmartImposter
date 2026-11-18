@@ -313,10 +313,40 @@ void main() {
             vec2 q = globeWater ? wq.xy + vec2(dot(ps - p, wtan), dot(ps - p, wvd)) : ps.xz;
             float e = 0.08;
             #define RIPPLE(Q) (0.022 * vnoise((Q) * 1.1 + vec2(0.55, 0.2) * tm) + 0.009 * vnoise((Q) * 3.3 - vec2(0.3, 0.75) * tm) + 0.004 * vnoise((Q) * 8.0 + vec2(0.9, 0.4) * tm))
-            float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
-            // fade the ripples out where a pixel covers many of them (no shimmer far away)
-            float rip = globeWater ? smoothstep(250.0, 40.0, tSurf) * 0.85 + 0.15 : 1.0;
-            vec2 gr = vec2(hx - h0, hz - h0) / e * rip;
+            vec2 gr;
+            float lostVar = 0.0; // slope variance of the ripples smaller than a pixel
+            if (globeWater) {
+                // wind waves: directional swells from 12 cm to 7 m spread around the wind, slope
+                // ~0.04 each, gusts (slow patches) varying their strength; waves smaller than a
+                // pixel are left out (no shimmer)
+                float pxM = tSurf * 2.0 * g.camUp.w / float(size.y) / max(dot(-dir, normalize(gq)), 0.15);
+                float gust = 0.35 + 0.9 * smoothstep(0.2, 0.8, vnoise(q * 0.025 + vec2(0.11, 0.07) * tm));
+                // wind ripples: 8 octaves of value noise from 5 m to 8 cm, each turned a little off
+                // the wind, stretched along its crests and drifting downwind at its wave speed;
+                // noise, unlike a sum of sines, never lines up into spots or a grid. Octaves smaller
+                // than a pixel are left out (no shimmer).
+                gr = vec2(0.0);
+                const float WIND = 0.7;
+                for (int i = 0; i < 8; ++i) {
+                    float fi = float(i);
+                    float lam = 5.0 * pow(0.55, fi);
+                    float ang = WIND + sin(fi * 2.399) * 0.45;
+                    vec2 d = vec2(cos(ang), sin(ang)), c = vec2(-d.y, d.x);
+                    float speed = sqrt(9.81 * lam / 6.2831853);
+                    vec2 sp = vec2((dot(q, d) - speed * tm) / lam, dot(q, c) / (lam * 2.2)) + fi * 17.3;
+                    vec3 nd = vnoiseD(sp);
+                    float keep = 1.0 - smoothstep(lam * 0.15, lam * 0.5, pxM);
+                    float slope = 0.09 * keep;
+                    lostVar += 0.18 * 0.0081 * (1.0 - keep * keep);
+                    // back from the stretched frame: d/dq = d * dx / lam + c * dy / (2.2 lam)
+                    gr += (d * nd.y + c * nd.z / 2.2) * slope;
+                }
+                gr *= gust;
+                lostVar *= gust * gust;
+            } else {
+                float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
+                gr = vec2(hx - h0, hz - h0) / e;
+            }
             float foam;
             if (globeWater) {
                 vec3 wup = normalize(gq);
@@ -337,7 +367,16 @@ void main() {
             pl.t = tSurf;
             col = refr;
             float tHit = pl.t;
-            vec3 R = reflect(dir, n);
+            // the ripples smaller than a pixel still tilt the surface: one random facet per pixel
+            // and frame from their slope spread (the denoiser averages them), so far water blurs
+            // and stretches its reflections instead of turning into a mirror
+            vec3 nR = n;
+            if (globeWater && lostVar > 0.0) {
+                float u1 = max(rnd(rng), 1e-6), u2 = rnd(rng);
+                vec2 gz = sqrt(-2.0 * log(u1)) * vec2(cos(6.2831853 * u2), sin(6.2831853 * u2)) * sqrt(lostVar);
+                nR = normalize(n - wtan * gz.x - wvd * gz.y);
+            }
+            vec3 R = reflect(dir, nR);
             if (globeWater) {
                 vec3 wup = normalize(gq);
                 float ru = dot(R, wup);
@@ -373,7 +412,7 @@ void main() {
                 }
             }
             vec3 H = normalize(L - dir);
-            float glint = pow(max(dot(n, H), 0.0), 900.0) * 120.0;
+            float glint = pow(max(dot(nR, H), 0.0), 900.0) * 120.0;
             col = mix(col, refl, F) + E * glint * F * sh;
             vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
             col = mix(col, foamCol, foam * 0.6);

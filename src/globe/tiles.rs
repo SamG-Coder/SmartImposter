@@ -158,33 +158,71 @@ fn edt(f: &mut [f64], tmp: &mut [f64]) {
     f.copy_from_slice(&tmp[..n]);
 }
 
-/// The shoreline field of a tile: signed distance (cells; + land, - water) from the land cover
-/// (ESA WorldCover permanent water), or where there is none, from ETOPO (below sea level =
-/// sea). Exact Euclidean distance between the cell centres of the other kind, minus half a cell,
-/// so the zero line runs between land and water cells and bilinear filtering draws it smooth.
-fn water_field(id: TileId, terrain: &Terrain) -> (f32, Vec<u8>) {
+/// The shoreline field and water levels of a tile.
+///
+/// The mapped water (ESA WorldCover permanent water, or where there is none, ETOPO below sea level)
+/// gives the water bodies; the 30 m DSM gives their surface height: the level grid (a low
+/// percentile of the ground height over the mapped water around each node, the sea at 0). Water
+/// is drawn where the water is mapped and the ground lies below its level, so the field is the
+/// signed distance (cells; + land, - water) to the edge of that drawn water: the shoreline
+/// follows the terrain, and globe.rchit's shallows fade towards the shore that is seen. Exact
+/// Euclidean distance between the cell centres of the other kind, minus half a cell, so the zero
+/// line runs between land and water cells and bilinear filtering draws it smooth.
+fn water_field(id: TileId, terrain: &Terrain) -> (f32, Vec<f32>, Vec<u8>) {
     let (u0, v0, s) = id.uv();
     let m = FIELD + 2 * APRON;
     let step = s / FIELD as f64;
     let cell_m = id.edge() / FIELD as f64;
-    let mut wet = vec![false; m * m];
+    let spacing = id.edge() / (GRID - 1) as f64; // the mesh's: the same height source
+    let coarse = spacing > 400.0; // ETOPO heights: lake beds, not surfaces
+    let mut mapped = vec![false; m * m];
+    let mut ll = vec![(0.0, 0.0); m * m];
     for b in 0..m {
         for a in 0..m {
             let d = face_dir(id.face, u0 + (a as f64 - APRON as f64 + 0.5) * step, v0 + (b as f64 - APRON as f64 + 0.5) * step);
             let (lat, lon) = lat_lon(d);
-            wet[b * m + a] = match terrain.cover.water_at(lat, lon, cell_m) {
+            ll[b * m + a] = (lat, lon);
+            mapped[b * m + a] = match terrain.cover.water_at(lat, lon, cell_m) {
                 Some(w) => w,
                 None => terrain.etopo.height(lat, lon) < 0.0,
             };
         }
     }
+    let lg = LEVEL_GRID;
+    let any_mapped = mapped.iter().any(|w| *w);
+    let (levels, wet) = if !any_mapped {
+        (vec![LEVEL_NONE; lg * lg], mapped)
+    } else if coarse {
+        (vec![LEVEL_UNKNOWN; lg * lg], mapped)
+    } else {
+        let h: Vec<f32> = ll.iter().map(|&(lat, lon)| terrain.height_at(lat, lon, spacing)).collect();
+        let levels = water_levels(&mapped, &h);
+        // the drawn water: mapped, with the ground below the level (bilinear between the nodes)
+        let span = (FIELD / (lg - 1)) as f64;
+        let level_at = |a: usize, b: usize| -> f32 {
+            let f = |c: usize| ((c as f64 - APRON as f64 + 0.5) / span).clamp(0.0, (lg - 1) as f64);
+            let (fx, fy) = (f(a), f(b));
+            let (i, j) = ((fx.floor() as usize).min(lg - 2), (fy.floor() as usize).min(lg - 2));
+            let (tx, ty) = ((fx - i as f64) as f32, (fy - j as f64) as f32);
+            let l = |i: usize, j: usize| levels[j * lg + i];
+            let (p, q, r, t) = (l(i, j), l(i + 1, j), l(i, j + 1), l(i + 1, j + 1));
+            if p.min(q).min(r).min(t) < -1e6 {
+                return p.max(q).max(r).max(t);
+            }
+            let top = p + (q - p) * tx;
+            let bot = r + (t - r) * tx;
+            top + (bot - top) * ty
+        };
+        let wet: Vec<bool> = (0..m * m).map(|c| mapped[c] && h[c] < level_at(c % m, c / m) + WATER_TOL).collect();
+        (levels, wet)
+    };
     let any_wet = wet.iter().any(|w| *w);
     let any_dry = wet.iter().any(|w| !*w);
     let mut out = vec![0u8; FIELD * FIELD];
     if !(any_wet && any_dry) {
         // all land or all water: saturated
         out.fill(if any_wet { 0 } else { 255 });
-        return (cell_m as f32, out);
+        return (cell_m as f32, levels, out);
     }
     // squared distance to the nearest cell of the other kind (Felzenszwalb's 1D transforms, once
     // per kind): exact Euclidean on the grid
@@ -216,8 +254,11 @@ fn water_field(id: TileId, terrain: &Terrain) -> (f32, Vec<u8>) {
             out[y * FIELD + x] = (128.0 + sd * FIELD_SCALE).round().clamp(0.0, 255.0) as u8;
         }
     }
-    (cell_m as f32, out)
+    (cell_m as f32, levels, out)
 }
+
+/// Mapped water whose ground lies up to this far above the level is still water (DSM noise).
+const WATER_TOL: f32 = 0.3;
 
 /// Time spent on shoreline fields (ns), for the benchmark's worker line.
 pub static FIELD_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -321,48 +362,34 @@ pub fn build_tile(id: TileId, terrain: &Terrain) -> TileMesh {
     }
     // the shoreline field (globe.rchit reads it after the vertices)
     let tf = std::time::Instant::now();
-    let (cell_m, field) = water_field(id, terrain);
+    let (cell_m, levels, field) = water_field(id, terrain);
     FIELD_NS.fetch_add(tf.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     verts.push(cell_m);
-    verts.extend(water_levels(&field, &elev, cell > 400.0));
+    verts.extend(levels);
     verts.extend(field.chunks_exact(4).map(|b| f32::from_bits(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))));
     debug_assert_eq!(verts.len(), TILE_FLOATS);
     TileMesh { id, center, verts }
 }
 
-/// The water surface height on the LEVEL_GRID nodes: a low percentile of the ground height (the
-/// 30 m DSM gives water bodies their surface height) over the mapped water within one node
-/// spacing, the sea at 0; nodes without water nearby take their neighbours' level. globe.rchit
-/// draws water as this level wherever the ground lies below it, so shores follow the contours.
-/// `elev`: the tile's heights with a one-sample apron; `coarse`: they are ETOPO's.
-fn water_levels(field: &[u8], elev: &[f32], coarse: bool) -> Vec<f32> {
+/// The water surface height on the LEVEL_GRID nodes from the field cells (with the apron, so
+/// neighbouring tiles see the same water at their shared edge): a low percentile of the ground
+/// height `h` over the `mapped` water within one node spacing, the sea at 0; nodes without water
+/// nearby take their neighbours' level, LEVEL_NONE if there is none.
+fn water_levels(mapped: &[bool], h: &[f32]) -> Vec<f32> {
     let lg = LEVEL_GRID;
-    if coarse || field.iter().all(|&f| f >= 128) {
-        return vec![if coarse { LEVEL_UNKNOWN } else { LEVEL_NONE }; lg * lg];
-    }
-    let (n, m) = (GRID, GRID + 2);
-    // ground height at a field cell centre: bilinear in the vertex grid (as the mesh has it)
-    let height = |x: usize, y: usize| -> f32 {
-        let g = |c: usize| ((c as f64 + 0.5) / FIELD as f64 * (n - 1) as f64).min((n - 1) as f64 - 1e-6);
-        let (gx, gy) = (g(x), g(y));
-        let (i, j) = (gx.floor() as usize, gy.floor() as usize);
-        let (tx, ty) = ((gx - i as f64) as f32, (gy - j as f64) as f32);
-        let e = |i: usize, j: usize| elev[(j + 1) * m + i + 1];
-        let a = e(i, j) + (e(i + 1, j) - e(i, j)) * tx;
-        let b = e(i, j + 1) + (e(i + 1, j + 1) - e(i, j + 1)) * tx;
-        a + (b - a) * ty
-    };
+    let m = FIELD + 2 * APRON;
     let span = FIELD / (lg - 1); // field cells between nodes
     let mut lv = vec![f32::NAN; lg * lg];
     let mut s = Vec::with_capacity((2 * span + 1) * (2 * span + 1));
     for ny in 0..lg {
         for nx in 0..lg {
             s.clear();
-            let (cx, cy) = (nx * span, ny * span);
-            for y in cy.saturating_sub(span)..(cy + span).min(FIELD) {
-                for x in cx.saturating_sub(span)..(cx + span).min(FIELD) {
-                    if field[y * FIELD + x] < 128 {
-                        s.push(height(x, y));
+            // the node sits on the corner between cells (APRON + n*span - 1) and (APRON + n*span)
+            let (cx, cy) = (APRON + nx * span, APRON + ny * span);
+            for y in cy - span..(cy + span).min(m) {
+                for x in cx - span..(cx + span).min(m) {
+                    if mapped[y * m + x] {
+                        s.push(h[y * m + x]);
                     }
                 }
             }
@@ -401,7 +428,7 @@ fn water_levels(field: &[u8], elev: &[f32], coarse: bool) -> Vec<f32> {
             }
         }
     }
-    lv
+    lv.iter().map(|v| if v.is_nan() { LEVEL_NONE } else { *v }).collect()
 }
 
 /// Shared index buffer for every tile (same topology): the grid, then the four skirts.
