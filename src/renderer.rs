@@ -47,6 +47,8 @@ pub struct Globals {
     pub prev_fwd: [f32; 4],
     /// x aerial perspective strength (1 = clear day, 0 = off)
     pub extra: [f32; 4],
+    /// Globe mode: xyz planet centre relative to the camera (camera frame), w = 1. 0 otherwise.
+    pub planet: [f32; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -345,6 +347,12 @@ pub struct Renderer {
     render_extent: vk::Extent2D,
     resolve_layout: vk::PipelineLayout,
     resolve_pipe: vk::Pipeline,
+    /// Globe mode: the streamed terrain and trees.
+    pub globe: Option<crate::globe::scene::GlobeScene>,
+    /// Placeholders for the globe bindings when not in globe mode.
+    globe_dummy: Option<(Buffer, Buffer, Image)>,
+    /// Globe mode: this frame's camera (ECEF), its frame rotation and globe.rchit's globals.
+    globe_view: Option<(glam::DVec3, glam::DMat3, crate::globe::scene::GlobeGlobals)>,
 }
 
 /// World -> view for NGX: row-major, row vectors (v_view = v_world * M), x right, y up, z forward.
@@ -401,6 +409,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         gpu.shader_module(spv!("impostor.rint"))?,
         gpu.shader_module(spv!("impostor.rchit"))?,
         gpu.shader_module(spv!("tri.rahit"))?,
+        gpu.shader_module(spv!("globe.rchit"))?,
     ];
     let kinds = [
         vk::ShaderStageFlags::RAYGEN_KHR,
@@ -410,6 +419,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         vk::ShaderStageFlags::INTERSECTION_KHR,
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::ANY_HIT_KHR,
+        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
     ];
     let stages: Vec<_> = modules
         .iter()
@@ -426,7 +436,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     };
     let u = vk::SHADER_UNUSED_KHR;
     // Hit records (instance SBT offset): 0 opaque triangles, 1 impostor AABBs,
-    // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve).
+    // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve), 3 globe terrain.
     let groups = [
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 0, u, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 1, u, u, u),
@@ -434,6 +444,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 3, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP, u, 5, u, 4),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 3, 6, u),
+        group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 7, u, u),
     ];
     let info = vk::RayTracingPipelineCreateInfoKHR::default()
         .stages(&stages)
@@ -449,21 +460,21 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         unsafe { gpu.device.destroy_shader_module(m, None) };
     }
 
-    // Shader binding table: raygen | miss, shadow miss | triangle hit, impostor hit, dissolving triangle hit.
+    // Shader binding table: raygen | miss, shadow miss | triangle hit, impostor hit, dissolving triangle hit, globe terrain hit.
     let hs = gpu.rt.handle_size as u64;
     let stride = align_up(hs, gpu.rt.handle_alignment as u64);
     let ba = gpu.rt.base_alignment as u64;
     let off_miss = align_up(stride, ba);
     let off_hit = align_up(off_miss + 2 * stride, ba);
-    let total = off_hit + 3 * stride;
-    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 6, 6 * hs as usize)? };
+    let total = off_hit + 4 * stride;
+    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 7, 7 * hs as usize)? };
     let mut sbt = gpu.create_buffer(total + ba, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR, MemoryLocation::CpuToGpu, "sbt")?;
     let base = align_up(sbt.addr, ba);
     let shift = (base - sbt.addr) as usize;
     {
         let m = sbt.mapped();
         for (group, off) in
-            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride)]
+            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride)]
         {
             let dst = shift + off as usize;
             m[dst..dst + hs as usize].copy_from_slice(&handles[group * hs as usize..(group + 1) * hs as usize]);
@@ -474,7 +485,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         pipe,
         rgen: region(0, stride),
         miss: region(off_miss, 2 * stride),
-        hit: region(off_hit, 3 * stride),
+        hit: region(off_hit, 4 * stride),
         _sbt: sbt,
     })
 }
@@ -494,6 +505,7 @@ impl Renderer {
         validation: bool,
         render_scale: f32,
         dlss_mode: Option<usize>,
+        globe: Option<std::sync::Arc<crate::globe::dem::Terrain>>,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let gpu = Gpu::new(display, window, validation)?;
@@ -727,6 +739,10 @@ impl Renderer {
             // plant records and per-plant LOD state (impostor clusters)
             b(23, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(24, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            // globe mode (globe.rchit): its globals, terrain tile table, elevation grid
+            b(30, vk::DescriptorType::UNIFORM_BUFFER, 1, rt_all),
+            b(31, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            b(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -788,11 +804,11 @@ impl Renderer {
         let pool_sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 2 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 64 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 4 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 8 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 24 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 2 * (4 * nvar + 4 * MAX_SPECIES as u32 + MAX_GROUND_TEX as u32),
+                descriptor_count: 2 * (4 * nvar + 4 * MAX_SPECIES as u32 + MAX_GROUND_TEX as u32 + 1),
             },
         ];
         let desc_pool = unsafe {
@@ -997,8 +1013,33 @@ impl Renderer {
             render_extent,
             resolve_layout,
             resolve_pipe,
+            globe: None,
+            globe_dummy: None,
+            globe_view: None,
         };
         let _ = r.set_layout;
+        // Globe mode: terrain and trees stream in around the camera (globe/scene.rs); the static
+        // world is empty. Otherwise the globe bindings get 1-element placeholders.
+        match globe {
+            Some(terrain) => {
+                let mut species: Vec<(String, Vec<usize>)> = Vec::new();
+                for sp in &r.catalog.species {
+                    if sp.kind == crate::catalog::Kind::Tree {
+                        let mut v: Vec<usize> = sp.variants.clone().collect();
+                        v.sort_by(|a, b| r.catalog.variants[*b].height.partial_cmp(&r.catalog.variants[*a].height).unwrap());
+                        species.push((sp.name.clone(), v));
+                    }
+                }
+                let sp = crate::globe::forest::Species { infos: r.imp_infos.clone(), species };
+                r.globe = Some(crate::globe::scene::GlobeScene::new(&r.gpu, terrain, sp)?);
+            }
+            None => {
+                let ubo = r.gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe placeholder")?;
+                let buf = r.gpu.create_buffer(16, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "globe placeholder")?;
+                let img = crate::textures::upload_with_mips(&r.gpu, 1, 1, &[0, 0, 0, 0], vk::Format::R8G8B8A8_UNORM, "globe placeholder")?;
+                r.globe_dummy = Some((ubo, buf, img));
+            }
+        }
         r.write_set(r.main_set, r.tlas.accel.raw, None);
         r.write_resolve_set();
         r.create_dlss_feature()?;
@@ -1174,8 +1215,16 @@ impl Renderer {
         let imps = buf(&self.imp_info);
         let inst_info = buf(&self.inst_info);
         let species = buf(&self.species_buf);
-        let plant_rec = buf(&self.plant_rec);
-        let plant_state = buf(&self.plant_state);
+        let (plant_rec, plant_state) = match &self.globe {
+            Some(g) => (buf(&g.plants), buf(&g.plant_state)),
+            None => (buf(&self.plant_rec), buf(&self.plant_state)),
+        };
+        let (globe_ubo, globe_table, globe_elev) = match (&self.globe, &self.globe_dummy) {
+            (Some(g), _) => (buf(&g.ubo), buf(&g.table), g.elev_tex.view),
+            (None, Some(d)) => (buf(&d.0), buf(&d.1), d.2.view),
+            _ => unreachable!("globe bindings without resources"),
+        };
+        let globe_elev = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_elev).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let tex = |list: &[Image], n: usize| -> Vec<vk::DescriptorImageInfo> {
             (0..n)
                 .map(|i| {
@@ -1223,6 +1272,9 @@ impl Renderer {
             w(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground_tex),
             w(23, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&plant_rec),
             w(24, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&plant_state),
+            w(30, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&globe_ubo),
+            w(31, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&globe_table),
+            w(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&globe_elev),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -1267,17 +1319,6 @@ impl Renderer {
         })?;
         // Encoded blocks of one variant (all levels of all four atlases): < 4.5 bytes per level-0 texel.
         let enc_size = max_size as u64 * max_size as u64 * 9 / 2;
-        // The compressed atlases are also written to a cache file the globe (--globe) loads, unless
-        // an up-to-date one exists (same variants and resolutions).
-        let export_path = std::path::Path::new(crate::impcache::CACHE_PATH);
-        let key = crate::impcache::key(&self.pack.trees.iter().map(|t| t.name.clone()).collect::<Vec<_>>(), &self.imp_infos);
-        let export = crate::impcache::needs_export(export_path, &key);
-        let mut readback = if export {
-            Some(self.gpu.create_buffer(enc_size, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "bc readback")?)
-        } else {
-            None
-        };
-        let mut exported: Vec<crate::impcache::Variant> = Vec::new();
         let mut enc = self.gpu.create_buffer(
             enc_size,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
@@ -1392,8 +1433,7 @@ impl Renderer {
 
             let size = grid * res;
             let a = &self.atlases[v];
-            let rb = readback.as_ref().map(|b| b.raw);
-            let jobs_out = self.gpu.one_time(|cb| unsafe {
+            self.gpu.one_time(|cb| unsafe {
                 let rw = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
                 let cs = vk::PipelineStageFlags2::COMPUTE_SHADER;
                 self.gpu.memory_barrier(cb, vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR, vk::AccessFlags2::SHADER_WRITE, cs, rw);
@@ -1461,14 +1501,7 @@ impl Renderer {
                 for (img, region) in &copies {
                     d.cmd_copy_buffer_to_image(cb, enc.raw, *img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[*region]);
                 }
-                if let Some(rb) = rb {
-                    d.cmd_copy_buffer(cb, enc.raw, rb, &[vk::BufferCopy::default().size(offset as u64 * 16)]);
-                }
-                let kind_of = |img: vk::Image| [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw].iter().position(|&x| x == img).unwrap() as u32;
-                let jobs_out: Vec<[u32; 4]> = copies
-                    .iter()
-                    .map(|(img, r)| [kind_of(*img), r.image_subresource.mip_level, r.image_extent.width, r.buffer_offset as u32])
-                    .collect();
+
                 for img in targets {
                     self.gpu.image_barrier(
                         cb,
@@ -1481,20 +1514,7 @@ impl Renderer {
                         vk::AccessFlags2::SHADER_READ,
                     );
                 }
-                (jobs_out, offset as usize * 16)
             })?;
-            if let Some(rb) = readback.as_mut() {
-                let vi = &self.catalog.variants[v];
-                exported.push(crate::impcache::Variant {
-                    name: tree.name.clone(),
-                    species: self.catalog.species[vi.species].name.clone(),
-                    kind: vi.kind as u32,
-                    height: vi.height,
-                    info: self.imp_infos[v],
-                    jobs: jobs_out.0,
-                    blocks: rb.mapped()[..jobs_out.1].to_vec(),
-                });
-            }
             if v == 0 {
                 if let Some(prefix) = self.dump_prefix.clone() {
                     self.dump_scratch(&scratch[0], size, &prefix)?;
@@ -1522,13 +1542,6 @@ impl Renderer {
             self.gpu.destroy_image(s);
         }
         self.gpu.destroy_buffer(&mut enc);
-        if let Some(mut rb) = readback.take() {
-            self.gpu.destroy_buffer(&mut rb);
-            match crate::impcache::write(export_path, &key, &exported) {
-                Ok(bytes) => println!("Impostor cache for the globe: {} ({:.2} GB)", export_path.display(), bytes as f64 / 1e9),
-                Err(e) => eprintln!("writing the impostor cache: {e}"),
-            }
-        }
         println!(
             "Baked {} impostors ({:.0}M source triangles) in {:.1}s",
             self.atlases.len(),
@@ -1705,6 +1718,12 @@ impl Renderer {
         self.tlas_dirty = true;
         self.upload_pending = false;
         self.profile.cpu_lod_parts[2] += t.elapsed().as_secs_f64() * 1000.0;
+    }
+
+    /// Globe mode: the camera for the next frame (ECEF position, rotation into the camera frame
+    /// from globe::scene::frame_at, globe.rchit's globals: planet centre, sun, ...).
+    pub fn set_globe_view(&mut self, ecef: glam::DVec3, rot: glam::DMat3, gg: crate::globe::scene::GlobeGlobals) {
+        self.globe_view = Some((ecef, rot, gg));
     }
 
     pub fn extent(&self) -> (u32, u32) {
@@ -1932,7 +1951,8 @@ impl Renderer {
         }
         let globals = &g;
         let t_lod = Instant::now();
-        let stats = self.update_instances(cam, lod, g.lod_params[0])?;
+        // Globe mode: the instances come from the streamed scene after the fence (below).
+        let stats = if self.globe.is_some() { FrameStats::default() } else { self.update_instances(cam, lod, g.lod_params[0])? };
         self.profile.cpu_lod += t_lod.elapsed().as_secs_f64() * 1000.0;
         let d = self.gpu.device.clone();
         let t_wait = Instant::now();
@@ -1960,6 +1980,34 @@ impl Renderer {
         };
         unsafe { d.reset_fences(&[self.fence])? };
 
+        if let (Some(scene), Some((ecef, rot, mut gg))) = (self.globe.as_mut(), self.globe_view) {
+            // Terrain and tree tiles around the camera, placed in the camera frame every frame.
+            let t0 = Instant::now();
+            scene.update(&self.gpu, ecef)?;
+            let t1 = Instant::now();
+            self.insts.clear();
+            scene.instances(ecef, rot, &mut self.insts);
+            if std::env::var("SI_TREE_STATS").is_ok() && (self.lod_frame % 60 == 0 || (t1 - t0).as_secs_f64() > 0.005) {
+                println!("globe cpu: update {:.2} ms, instances {:.2} ms", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
+            }
+            self.lod_frame = self.lod_frame.wrapping_add(1);
+            self.inst_data.clear();
+            self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
+            let a = scene.index_addr();
+            gg.addr = [a as u32, (a >> 32) as u32, 0, 0];
+            gg.params[1] = self.lod_frame as f32;
+            gg.params[2] = g.iparams[1] as f32;
+            gg.params[3] = self.ground_layers as f32;
+            gg.misc = [
+                g.cam_fwd[3],
+                crate::globe::forest::NEAR as f32,
+                (crate::globe::forest::SPLIT * 0.5 * std::f64::consts::PI * crate::globe::tiles::R_EARTH
+                    / (1u64 << crate::globe::forest::TREE_LEVEL) as f64) as f32,
+                scene.range as f32,
+            ];
+            scene.write_globals(&gg);
+            self.upload_pending = true;
+        }
         self.upload_instances();
         let t_rec = Instant::now();
         self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(globals));

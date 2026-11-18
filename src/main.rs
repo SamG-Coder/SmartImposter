@@ -11,14 +11,13 @@ mod dlss;
 mod erosion;
 mod flypath;
 mod globe;
-mod impcache;
 mod textures;
 mod gpu;
 mod renderer;
 mod world;
 
 use anyhow::Result;
-use glam::Vec3;
+use glam::{DVec3, Vec3};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use renderer::{Globals, ImpostorSettings, Renderer};
 use std::collections::HashSet;
@@ -37,6 +36,10 @@ struct Args {
     shot: Option<String>,
     /// A real place (`--site lat,lon`): terrain, water and forest from the Earth data.
     site: Option<[f64; 2]>,
+    /// The 1:1 globe (`--globe`): terrain and trees stream in from the Earth data around the camera.
+    globe: bool,
+    /// Globe start: lat, lon (deg), height above the ground (m), heading (deg from north), pitch (deg).
+    at: [f64; 5],
     /// Several cameras in one run (`--views`): x, height above ground, z, yaw, pitch.
     views: Vec<[f32; 7]>, // + optional mesh LOD distance and debug mode (-1 = unchanged)
     frames: u32,
@@ -78,6 +81,8 @@ fn parse_args() -> Args {
         shot: None,
         views: Vec::new(),
         site: None,
+        globe: false,
+        at: [46.05, 9.25, 300.0, 200.0, -8.0],
         frames: 1,
         cam: None,
         lod: 50.0,
@@ -130,6 +135,16 @@ fn parse_args() -> Args {
                     .collect();
             }
             "--frames" => a.frames = next.parse().unwrap_or(1),
+            "--globe" => {
+                a.globe = true;
+                i -= 1; // no value
+            }
+            "--at" => {
+                let v: Vec<f64> = next.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                if v.len() == 5 {
+                    a.at = [v[0], v[1], v[2], v[3], v[4]];
+                }
+            }
             "--site" => {
                 let v: Vec<f64> = next.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 if v.len() == 2 {
@@ -261,6 +276,25 @@ struct State {
     /// Last DLSS mode, restored by L.
     dlss_last: usize,
     haze: f32,
+    /// Globe mode: the camera on the Earth (the render frame is rebuilt around it every frame).
+    geo: Option<Geo>,
+    /// globe: frames a capture waited for streaming
+    settle: u32,
+}
+
+/// Globe camera: position in float64 Earth-centred coordinates; the renderer's world is the
+/// east / up / south frame at the camera, origin at the camera (Camera.pos stays 0).
+struct Geo {
+    ecef: DVec3,
+    /// direction to the sun, Earth-fixed (set from sun azimuth / elevation at the start)
+    sun: DVec3,
+    /// last frame's camera position and right / up / forward vectors, Earth-fixed (motion vectors)
+    prev: Option<[DVec3; 4]>,
+}
+
+fn geo_place(terrain: &globe::dem::Terrain, lat: f64, lon: f64, height: f64) -> DVec3 {
+    let d = globe::tiles::dir_from_lat_lon(lat, lon);
+    d * (globe::tiles::ground_radius(terrain, d) + height.max(1.7))
 }
 
 struct App {
@@ -310,12 +344,15 @@ impl App {
             println!("  {:<24} {:?} heights [{}] m", sp.name, sp.kind, hs.join(", "));
         }
         let (mut pack, mut cat) = (pack, cat);
+        let globe_terrain = if a.globe { Some(std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?)) } else { None };
         if let Some([lat, lon]) = a.site {
             let terrain = std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?);
             world::set_site(terrain, lat, lon);
             println!("Site: {lat:.5}, {lon:.5}");
         }
-        let world = if a.gallery {
+        let world = if a.globe {
+            world::World::empty()
+        } else if a.gallery {
             world::World::gallery(&pack.trees, &cat)
         } else {
             world::World::generate(&pack.trees, &cat, a.radius)
@@ -336,11 +373,24 @@ impl App {
             a.validation,
             a.ss,
             a.dlss,
+            globe_terrain.clone(),
         )?;
         let start_y = r.world.surface_at(0.0, 0.0) + 1.8;
         let cam = match a.cam {
             Some(c) => Camera { pos: Vec3::new(c[0], c[1], c[2]), yaw: c[3].to_radians(), pitch: c[4].to_radians(), fov_y: 60f32.to_radians() },
             None => Camera { pos: Vec3::new(0.0, start_y, 0.0), yaw: 0.0, pitch: 0.05, fov_y: 60f32.to_radians() },
+        };
+        let (cam, geo) = match &globe_terrain {
+            Some(t) => {
+                let ecef = geo_place(t, a.at[0], a.at[1], a.at[2]);
+                let c = Camera { pos: Vec3::ZERO, yaw: a.at[3].to_radians() as f32, pitch: a.at[4].to_radians() as f32, fov_y: 60f32.to_radians() };
+                // sun: azimuth / elevation at the start, then fixed to the Earth
+                let (az, el_) = (a.sun[0].to_radians() as f64, a.sun[1].to_radians() as f64);
+                let local = DVec3::new(el_.cos() * az.sin(), el_.sin(), -el_.cos() * az.cos());
+                let sun = globe::scene::frame_at(ecef).transpose() * local;
+                (c, Some(Geo { ecef, sun, prev: None }))
+            }
+            None => (cam, None),
         };
         let (cam_yaw, cam_pitch) = (cam.yaw, cam.pitch);
         let mut state = State {
@@ -378,6 +428,8 @@ impl App {
             cinematic: false,
             dlss_last: a.dlss.unwrap_or(1),
             haze: a.haze,
+            geo,
+            settle: 0,
         };
         if std::env::var("SI_FOREST_MAP").is_ok() {
             // Coarse tree-count map, 50 m cells over [-700, 700]^2, north (-Z) at the top.
@@ -429,7 +481,15 @@ impl App {
         let view = (s.rendered / shot_frames) as usize;
         if !views.is_empty() && s.rendered % shot_frames == 0 && view < views.len() {
             let v = views[view];
-            s.cam.pos = Vec3::new(v[0], s.r.world.surface_at(v[0], v[2]) + v[1], v[2]);
+            match (s.geo.as_mut(), &s.r.globe) {
+                // globe: lat, lon, height above the ground, heading, pitch
+                (Some(geo), Some(scene)) => {
+                    geo.ecef = geo_place(&scene.terrain, v[0] as f64, v[1] as f64, v[2] as f64);
+                    geo.prev = None;
+                    s.cam.pos = Vec3::ZERO;
+                }
+                _ => s.cam.pos = Vec3::new(v[0], s.r.world.surface_at(v[0], v[2]) + v[1], v[2]),
+            }
             s.cam.yaw = v[3].to_radians();
             s.cam.pitch = v[4].to_radians();
             s.yaw_target = s.cam.yaw;
@@ -473,6 +533,11 @@ impl App {
         if k(KeyCode::KeyE) || k(KeyCode::Space) { input.y += 1.0; }
         if k(KeyCode::KeyQ) { input.y -= 1.0; }
         let mut speed = s.base_speed;
+        if let (Some(geo), Some(scene)) = (&s.geo, &s.r.globe) {
+            // globe: fly speed follows the height above the ground
+            let alt = geo.ecef.length() - globe::tiles::ground_radius(&scene.terrain, geo.ecef);
+            speed *= (alt as f32 / 20.0).max(1.0);
+        }
         if k(KeyCode::ShiftLeft) { speed *= 4.0; }
         if k(KeyCode::ControlLeft) { speed *= 0.25; }
         if s.fly_on && input != Vec3::ZERO {
@@ -515,10 +580,22 @@ impl App {
                 s.vel = Vec3::ZERO;
             }
             s.cam.pos += s.vel * dt;
-            let ground = s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z) + 0.6;
-            if s.cam.pos.y < ground {
-                s.cam.pos.y = ground;
-                s.vel.y = s.vel.y.max(0.0);
+            if let (Some(geo), Some(scene)) = (s.geo.as_mut(), &s.r.globe) {
+                // globe: the move goes onto the Earth position; the frame follows the camera
+                let rot = globe::scene::frame_at(geo.ecef);
+                geo.ecef += rot.transpose() * s.cam.pos.as_dvec3();
+                s.cam.pos = Vec3::ZERO;
+                let ground = globe::tiles::ground_radius(&scene.terrain, geo.ecef) + 0.6;
+                if geo.ecef.length() < ground {
+                    geo.ecef = geo.ecef.normalize() * ground;
+                    s.vel.y = s.vel.y.max(0.0);
+                }
+            } else {
+                let ground = s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z) + 0.6;
+                if s.cam.pos.y < ground {
+                    s.cam.pos.y = ground;
+                    s.vel.y = s.vel.y.max(0.0);
+                }
             }
         }
         let (fwd, right, up) = s.cam.basis();
@@ -556,8 +633,27 @@ impl App {
             // Ray spread from the supersampled resolution: finer impostor mips when supersampling.
             [fwd.x, fwd.y, fwd.z, 2.0 * tan_half / rh as f32],
         ];
-        let prev = s.prev_cam.unwrap_or(cam_now);
+        let mut prev = s.prev_cam.unwrap_or(cam_now);
         s.prev_cam = Some(cam_now);
+        let mut sun = sun;
+        let mut planet = [0.0f32; 4];
+        if let Some(geo) = s.geo.as_mut() {
+            // globe: previous camera and the sun in this frame's coordinates, planet centre
+            let rot = globe::scene::frame_at(geo.ecef);
+            let rt = rot.transpose();
+            let now_e = [geo.ecef, rt * right.as_dvec3(), rt * up.as_dvec3(), rt * fwd.as_dvec3()];
+            let p = geo.prev.unwrap_or(now_e);
+            let v = |d: DVec3| (rot * d).as_vec3();
+            let pp = v(p[0] - geo.ecef);
+            let (pr, pu, pf) = (v(p[1]), v(p[2]), v(p[3]));
+            prev = [[pp.x, pp.y, pp.z, s.lod], [pr.x, pr.y, pr.z, prev[1][3]], [pu.x, pu.y, pu.z, prev[2][3]], [pf.x, pf.y, pf.z, prev[3][3]]];
+            geo.prev = Some(now_e);
+            sun = v(geo.sun).normalize();
+            let pc = v(-geo.ecef);
+            planet = [pc.x, pc.y, pc.z, 1.0];
+            let gg = globe::scene::GlobeGlobals { planet: [pc.x, pc.y, pc.z, globe::scene::RADIUS], ..Default::default() };
+            s.r.set_globe_view(geo.ecef, rot, gg);
+        }
         let g = Globals {
             cam_pos: cam_now[0],
             cam_right: cam_now[1],
@@ -572,13 +668,23 @@ impl App {
             prev_up: prev[2],
             prev_fwd: prev[3],
             extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() % 3600.0).unwrap_or(0.0)) as f32],
+            planet,
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
+        // globe: a view is only captured once its terrain and trees have streamed in
+        let settling = s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
+        let capture = capture && !settling;
         let (stats, img) = s.r.render(&g, s.cam.pos, s.lod, capture)?;
         s.frame = s.frame.wrapping_add(1);
-        s.rendered += 1;
+        if settling && !views.is_empty() && (s.rendered + 1) % shot_frames == 0 {
+            s.settle += 1; // hold this view
+            s.frame_times.clear();
+        } else {
+            s.settle = 0;
+            s.rendered += 1;
+        }
         if let Some(img) = img {
             let path = if shot_due && !views.is_empty() {
                 let p = shot.clone().unwrap();
@@ -864,10 +970,6 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<()> {
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    if raw.iter().any(|a| a == "--globe") {
-        return globe::app::run(globe::app::parse(&raw));
-    }
     let args = parse_args();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);

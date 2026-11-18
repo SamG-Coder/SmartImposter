@@ -959,6 +959,11 @@ impl World {
         world
     }
 
+    /// No terrain or plants of its own (globe mode: everything streams in, globe/scene.rs).
+    pub fn empty() -> Self {
+        Self::build_flat()
+    }
+
     fn build_flat() -> Self {
         let xs: Vec<f32> = (0..=256).map(|i| i as f32 * 12.0 - 1536.0).collect();
         let heights = vec![0.0; xs.len() * xs.len()];

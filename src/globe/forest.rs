@@ -1,16 +1,11 @@
-//! Trees on the globe: the forest scene's baked impostors (impcache.rs) placed per 300 m terrain
-//! tile wherever ESA WorldCover has tree cover, standing on the Copernicus / ETOPO terrain.
-//! Every tree is one AABB of a per-tile cluster BLAS, drawn by impostor.rint / impostor.rchit.
+//! Trees on the globe: the renderer's plant variants placed per terrain tile wherever ESA
+//! WorldCover has tree cover, standing on the Copernicus / ETOPO terrain. Every tree is one AABB
+//! of a per-tile cluster BLAS, drawn by impostor.rint / impostor.rchit (scene.rs).
 
 use super::dem::Terrain;
 use super::tiles::{face_dir, lat_lon, TileId, R_EARTH};
-use crate::gpu::{Gpu, Image};
-use crate::impcache;
 use crate::renderer::ImpostorInfo;
-use anyhow::Result;
-use ash::vk;
 use glam::DVec3;
-use gpu_allocator::MemoryLocation;
 
 /// Finest tree tiles: this quadtree level (~305 m on a side), every tree.
 pub const TREE_LEVEL: u8 = 15;
@@ -37,96 +32,12 @@ pub fn tree_range(eye_height: f64) -> f64 {
     ((2.0 * R_EARTH * h + h * h).sqrt() + (2.0 * R_EARTH * 1000.0).sqrt()).min(400_000.0)
 }
 
-pub struct Impostors {
-    pub albedo: Vec<Image>,
-    pub normal: Vec<Image>,
-    pub depth: Vec<Image>,
-    pub vis: Vec<Image>,
+/// What the tree growth needs from the renderer's catalog: every variant's impostor bounds, and
+/// the tree species with their variants (tallest first).
+#[derive(Clone, Default)]
+pub struct Species {
     pub infos: Vec<ImpostorInfo>,
-    /// tree species -> variant indices, tallest first
     pub species: Vec<(String, Vec<usize>)>,
-}
-
-/// Load the baked atlases written by the forest scene and upload them (BC3 / BC5 blocks per mip).
-pub fn load_impostors(gpu: &Gpu) -> Result<Impostors> {
-    let t = std::time::Instant::now();
-    let vars = impcache::read(std::path::Path::new(impcache::CACHE_PATH))?;
-    let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-    let mut im = Impostors { albedo: vec![], normal: vec![], depth: vec![], vis: vec![], infos: vec![], species: vec![] };
-    let d = &gpu.device;
-    for (vi, v) in vars.iter().enumerate() {
-        let size = v.info.grid * v.info.res;
-        let mips = v.info.mips;
-        let imgs = [
-            gpu.create_image(size, size, mips, vk::Format::BC3_UNORM_BLOCK, usage, "globe albedo atlas")?,
-            gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, "globe normal atlas")?,
-            gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, "globe depth atlas")?,
-            gpu.create_image(size / 2, size / 2, (mips - 1).max(1), vk::Format::BC3_UNORM_BLOCK, usage, "globe vis atlas")?,
-        ];
-        let mut staging = gpu.create_buffer(v.blocks.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas staging")?;
-        staging.mapped()[..v.blocks.len()].copy_from_slice(&v.blocks);
-        gpu.one_time(|cb| unsafe {
-            for img in &imgs {
-                gpu.image_barrier(
-                    cb,
-                    img.raw,
-                    vk::ImageLayout::UNDEFINED,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::PipelineStageFlags2::NONE,
-                    vk::AccessFlags2::NONE,
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                );
-            }
-            for j in &v.jobs {
-                let region = vk::BufferImageCopy {
-                    buffer_offset: j[3] as u64,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: j[1], base_array_layer: 0, layer_count: 1 },
-                    image_offset: vk::Offset3D::default(),
-                    image_extent: vk::Extent3D { width: j[2], height: j[2], depth: 1 },
-                };
-                d.cmd_copy_buffer_to_image(cb, staging.raw, imgs[j[0] as usize].raw, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
-            }
-            for img in &imgs {
-                gpu.image_barrier(
-                    cb,
-                    img.raw,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    vk::PipelineStageFlags2::TRANSFER,
-                    vk::AccessFlags2::TRANSFER_WRITE,
-                    vk::PipelineStageFlags2::ALL_COMMANDS,
-                    vk::AccessFlags2::SHADER_READ,
-                );
-            }
-        })?;
-        gpu.destroy_buffer(&mut staging);
-        let [a, n, dp, vs] = imgs;
-        im.albedo.push(a);
-        im.normal.push(n);
-        im.depth.push(dp);
-        im.vis.push(vs);
-        im.infos.push(v.info);
-        if v.kind == 0 {
-            match im.species.iter_mut().find(|s| s.0 == v.species) {
-                Some(s) => s.1.push(vi),
-                None => im.species.push((v.species.clone(), vec![vi])),
-            }
-        }
-    }
-    for s in &mut im.species {
-        s.1.sort_by(|a, b| vars[*b].height.partial_cmp(&vars[*a].height).unwrap());
-    }
-    println!(
-        "Globe trees: {} impostor variants, {} tree species ({}) ({:.1}s)",
-        vars.len(),
-        im.species.len(),
-        im.species.iter().map(|s| s.0.trim_start_matches("Tree_").to_string()).collect::<Vec<_>>().join(", "),
-        t.elapsed().as_secs_f32()
-    );
-    Ok(im)
 }
 
 pub struct TreeTile {
@@ -153,7 +64,7 @@ impl Rng {
     }
 }
 
-/// Which species groups the catalog has: indices into `Impostors::species` by role.
+/// Which species groups the catalog has: indices into `Species::species` by role.
 pub struct Roles {
     beech: Option<usize>,
     alder: Option<usize>,
@@ -164,7 +75,7 @@ pub struct Roles {
 }
 
 impl Roles {
-    pub fn new(im: &Impostors) -> Self {
+    pub fn new(im: &Species) -> Self {
         let find = |k: &str| im.species.iter().position(|s| s.0.contains(k));
         Roles {
             beech: find("Beech"),
@@ -180,7 +91,7 @@ impl Roles {
 /// Grow the trees of one tree tile: candidates every SPACING m (jittered), kept with the
 /// probability of the WorldCover tree fraction around them, species from the site (water nearby,
 /// altitude), size class weighted towards mature trees.
-pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Impostors, roles: &Roles) -> TreeTile {
+pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> TreeTile {
     let center = id.center_dir() * R_EARTH;
     let mut tile = TreeTile { id, center, recs: Vec::new(), aabbs: Vec::new() };
     if roles.any.is_empty() || terrain.cover.is_empty() {

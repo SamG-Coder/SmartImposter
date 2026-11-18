@@ -23,7 +23,7 @@ vec2 elevUV(vec3 up) {
 float elevAt(vec2 uv, float lod) { return textureLod(elevTex, uv, lod).r * 32767.0; }
 
 // ---- ground: Quixel scans (catalog.rs GROUND_LAYERS) blended by land cover, hex-tiled
-layout(set = 0, binding = 33) uniform sampler2D groundTex[36];
+layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX]; // the renderer's ground scans (3 per layer)
 const float GT = 2.048; // metres per texture repeat (divides tiles.rs TEX_PERIOD)
 // The scans' mean albedos differ ~10x: bring them to plausible ground albedos (as tri.rchit).
 const float GAIN[12] = float[12](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0);
@@ -181,7 +181,8 @@ void main() {
         C += unpackUnorm4x8(floatBitsToUint(V.v[b + 9u])) * w[c];
         uvm += vec2(V.v[b + 10u], V.v[b + 11u]) * w[c];
     }
-    n = normalize(n);
+    // tile-local (Earth axes) -> world (the camera frame: the instance rotates)
+    n = normalize(mat3(gl_ObjectToWorldEXT) * n);
     float t = gl_HitTEXT;
     vec3 p = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * t;
     vec3 up = normalize(p - gg.planet.xyz);

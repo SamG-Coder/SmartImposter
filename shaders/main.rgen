@@ -4,6 +4,7 @@
 #extension GL_NV_shader_invocation_reorder : require
 #endif
 #include "rt.glsl"
+#include "atmosphere.glsl"
 
 layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D depthImg;
@@ -21,6 +22,18 @@ layout(location = 1) rayPayloadEXT uint vis;
 
 vec3 sunColor() { return vec3(1.0, 0.92, 0.80) * g.sunDir.w; }
 
+// Globe mode (g.planet.w = 1): the camera frame is east / up / south at the camera, the planet
+// centre at g.planet.xyz; sky, sunlight, sky light and aerial perspective come from the
+// physically based atmosphere (atmosphere.glsl).
+bool globe() { return g.planet.w > 0.5; }
+vec3 globeSky(vec3 d) {
+    vec3 T;
+    vec3 ro = -g.planet.xyz;
+    vec3 c = atmosphere(ro, d, 1e30, g.sunDir.xyz, g.sunDir.w, T);
+    if (dot(d, g.sunDir.xyz) > 0.99996 && raySphere(ro, d, R_GROUND).x < 0.0) c += g.sunDir.w * 2000.0 * T;
+    return c;
+}
+
 float cloudFbm(vec2 p) {
     float s = 0.0, a = 0.5;
     for (int i = 0; i < 5; ++i) {
@@ -32,6 +45,7 @@ float cloudFbm(vec2 p) {
 }
 
 vec3 skyColor(vec3 d) {
+    if (globe()) return globeSky(d);
     vec3 L = g.sunDir.xyz;
     float y = clamp(d.y, -1.0, 1.0);
     vec3 zenith = vec3(0.045, 0.14, 0.46);
@@ -158,6 +172,8 @@ void main() {
         float sh = (ndl > 0.0 || leaf) ? ((profSkip & 1u) != 0u ? 1.0 : traceShadow(so, L, 1.0e4, pl.shadowMask)) * pl.sunVis : 0.0;
 
         vec3 E = sunColor();
+        vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
+        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L));
         vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
         // Leaf transmission: the foliage texture's translucency map times Unreal's "Translucency Tint"
         // (veins and thick spots transmit less), so back-lit leaves glow with visible veins.
@@ -216,7 +232,12 @@ void main() {
         // The hit is the bed under a water surface the ray crossed first (camera above it)?
         float wd = pl.wdepth;
         float tSurf = (wd > 0.0 && dir.y < -1e-4) ? (p.y + wd - org.y) / dir.y : -1.0;
-        bool water = tSurf > 0.0 && tSurf < pl.t;
+        // globe terrain flags its lakes / sea itself (the hit is the water surface)
+        if ((pl.flags & FLAG_WATER) != 0u && wd <= 0.0) {
+            tSurf = pl.t;
+            wd = 6.0; // open water: no shallows, no foam
+        }
+        bool water = tSurf > 0.0 && tSurf <= pl.t;
         gbN = nDir;
         gbAlb = alb;
         gbRough = water ? 0.05 : glossy ? (imp ? 0.6 : 0.35) : 1.0;
@@ -224,6 +245,14 @@ void main() {
         // Sky fill is kept well below the sun so shaded crowns go properly dark.
         vec3 skyUp = vec3(0.13, 0.20, 0.36), ground = vec3(0.05, 0.06, 0.035);
         vec3 amb = mix(ground, skyUp, n.y * 0.5 + 0.5);
+        if (globe()) {
+            // sky light: the zenith radiance over the hemisphere (as globe.rgen did)
+            vec3 up = normalize(gq), Tz;
+            vec3 skyZ = atmosphere(gq, up, 1e30, L, g.sunDir.w, Tz);
+            skyUp = skyZ * PI;
+            ground = skyUp * 0.25;
+            amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
+        }
         col = direct + alb * amb * ao;
 
         if (water && dbg == 0u) {
@@ -272,7 +301,11 @@ void main() {
                 float rsh = (rndl > 0.0) ? traceShadow(rp + rng2 * (0.01 + pl.t * 2e-4), L, 1.0e4, 0xFFu) * pl.sunVis : 0.0;
                 vec3 ramb = mix(ground, skyUp, rn.y * 0.5 + 0.5);
                 refl = pl.albedo / PI * E * max(rndl, 0.0) * rsh + pl.albedo * ramb * pl.ao;
-                if (g.extra.x > 0.0) {
+                if (globe()) {
+                    vec3 Tr;
+                    vec3 S = atmosphere(p - g.planet.xyz, R, pl.t, L, g.sunDir.w, Tr);
+                    refl = refl * Tr + S;
+                } else if (g.extra.x > 0.0) {
                     vec3 Tr = exp(-(vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x * pl.t);
                     refl = refl * Tr + hazeColor(R) * (1.0 - Tr);
                 }
@@ -313,7 +346,11 @@ void main() {
 
     // Aerial perspective: Rayleigh (+ a little aerosol) extinction and in-scattering along the
     // view ray. Clear-day density: distant hills turn blue-grey over tens of kilometres.
-    if (pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
+    if (pl.t > 0.0 && globe() && dbg == 0u) {
+        vec3 T;
+        vec3 S = atmosphere(-g.planet.xyz, dir, pl.t, g.sunDir.xyz, g.sunDir.w, T);
+        col = col * T + S;
+    } else if (pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
         vec3 beta = (vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x;
         vec3 T = exp(-beta * pl.t);
         col = col * T + hazeColor(dir) * (1.0 - T);

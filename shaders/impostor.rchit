@@ -14,7 +14,8 @@ void main() {
     uint vid = plantVariant(pr);
     vec4 a = unpackUnorm4x8(hit.albedoAo);
     vec3 alb = a.rgb * a.rgb; // atlas stores sqrt(albedo) for precision
-    vec3 n = normalize(plantMatrix(pr) * octDecode(unpackSnorm2x16(hit.normal)));
+    // plant -> instance space -> world (globe tiles rotate into the camera frame; identity in the forest scene)
+    vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (plantMatrix(pr) * octDecode(unpackSnorm2x16(hit.normal))));
     // Grass and ferns have no bark (bmin.w = 1): pale / dry blades must not be classified as bark.
     // Otherwise: bark is grey-brown (g/r ~ 0.78); every leaf variant has g/r > 1.
     bool foliageOnly = imps[vid].bmin.w > 0.5;
