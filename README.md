@@ -415,7 +415,10 @@ so far:
     vertices and BLASes, one plant record / AABB buffer, and size-class slabs for tree BLASes.
     Tile selection, instance lists and mesh LOD run while the previous frame is still on the GPU.
     A tree tile that is being replaced by a finer or coarser one stays until its replacement is
-    in, so the forest never shows bare patches.
+    in, so the forest never shows bare patches. The coarse terrain tiles above the drawn ones
+    (and their siblings) are never evicted, so very fast flight lowers the detail gradually
+    instead of dropping whole regions to a coarse tile. Moving fast, tiles are requested by their
+    distance from where the camera will be ~30 frames later, so the ground ahead fills first.
   - Elevation: NOAA ETOPO 2022 (60″, global, land and seafloor), Copernicus GLO-30 (30 m) where its
     tiles are present, blended at the edges. The whole ETOPO grid also lives on the GPU for
     per-pixel coastlines and relief far away.

@@ -45,6 +45,11 @@ const TREE_UPLOADS_PER_FRAME: usize = 192;
 const TREES_PER_FRAME: usize = 200_000;
 /// Per-frame staging (host -> device copies) and BLAS build scratch.
 const STAGING: u64 = 48 << 20;
+/// Prefetch along the motion: look this many frames ahead (at most MAX_LEAD m; below MIN_LEAD m
+/// the camera counts as still).
+const LEAD_FRAMES: f64 = 30.0;
+const MAX_LEAD: f64 = 15_000.0;
+const MIN_LEAD: f64 = 60.0;
 const SCRATCH: u64 = 96 << 20;
 /// Terrain tiles in the tile table (globe.rchit indexes it by instance custom index).
 pub const MAX_TERRAIN_TILES: usize = 16_384;
@@ -167,8 +172,9 @@ type Queue = Arc<(Mutex<[VecDeque<TileId>; 2]>, Condvar)>;
 static WORK: [[std::sync::atomic::AtomicU64; 2]; 2] =
     [[std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)], [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)]];
 
-/// `n` workers taking terrain tiles first (ground holes are worse than late trees), tree tiles
-/// otherwise, so the whole pool goes where the work is.
+/// `n` workers: half take terrain tiles first, half tree tiles first, each falling back to the
+/// other queue, so the whole pool goes where the work is and neither queue starves when the
+/// camera moves fast.
 fn spawn_workers(
     n: usize,
     queue: &Queue,
@@ -177,18 +183,19 @@ fn spawn_workers(
     trees: impl Fn(TileId) -> TreeTile + Send + Sync + 'static,
 ) {
     let work = Arc::new((terrain, trees));
-    for _ in 0..n {
+    for w in 0..n {
         let (q, tx, work) = (queue.clone(), tx.clone(), work.clone());
+        let first = w % 2;
         std::thread::spawn(move || loop {
             let (kind, id) = {
                 let (lock, cv) = &*q;
                 let mut g = lock.lock().unwrap();
                 loop {
-                    if let Some(id) = g[0].pop_front() {
-                        break (0, id);
+                    if let Some(id) = g[first].pop_front() {
+                        break (first, id);
                     }
-                    if let Some(id) = g[1].pop_front() {
-                        break (1, id);
+                    if let Some(id) = g[1 - first].pop_front() {
+                        break (1 - first, id);
                     }
                     g = cv.wait(g).unwrap();
                 }
@@ -312,6 +319,9 @@ pub struct GlobeScene {
     /// this frame's tree tiles (prepare) and terrain tile table (written after the fence)
     keep: HashSet<TileId>,
     table_cpu: Vec<u64>,
+    held: usize,
+    /// camera of the previous frame (motion for prefetching)
+    prev_cam: Option<DVec3>,
 }
 
 impl GlobeScene {
@@ -423,6 +433,8 @@ impl GlobeScene {
             range: 0.0,
             keep: HashSet::new(),
             table_cpu: Vec::new(),
+            held: 0,
+            prev_cam: None,
         };
         // the coarse levels everywhere, built up front so the globe is never missing pieces
         let mut ids = Vec::new();
@@ -597,11 +609,16 @@ impl GlobeScene {
         if self.tiles.len() <= CACHE_TILES {
             return;
         }
-        let mut old: Vec<(u64, TileId)> =
-            self.tiles.iter().filter(|(id, t)| id.level > 2 && t.last_used + 2 < self.frame).map(|(id, t)| (t.last_used, *id)).collect();
+        // least recently used first, and among those the finest (coarse tiles are cheap fallbacks)
+        let mut old: Vec<(u64, std::cmp::Reverse<u8>, TileId)> = self
+            .tiles
+            .iter()
+            .filter(|(id, t)| id.level > 2 && t.last_used + 2 < self.frame)
+            .map(|(id, t)| (t.last_used, std::cmp::Reverse(id.level), *id))
+            .collect();
         old.sort();
         let excess = self.tiles.len() - CACHE_TILES * 9 / 10;
-        for (_, id) in old.into_iter().take(excess) {
+        for (_, _, id) in old.into_iter().take(excess) {
             if let Some(t) = self.tiles.remove(&id) {
                 unsafe { gpu.accel_fn.destroy_acceleration_structure(t.blas, None) };
                 self.pool.free.push(t.slot);
@@ -631,6 +648,14 @@ impl GlobeScene {
     pub fn prepare(&mut self, cam: DVec3, rot: DMat3, out: &mut Vec<vk::AccelerationStructureInstanceKHR>) -> [f64; 2] {
         self.frame += 1;
         let t = std::time::Instant::now();
+        // Moving fast, request tiles by their distance from where the camera will be in about
+        // LEAD_FRAMES frames: the workers fill the ground ahead instead of chasing the tiles under
+        // the camera, which are behind it by the time they are done. Still or slow: nearest first.
+        let step = self.prev_cam.map(|p| cam - p).unwrap_or(DVec3::ZERO);
+        self.prev_cam = Some(cam);
+        let lead = step * LEAD_FRAMES;
+        let lead = if lead.length() > MAX_LEAD { lead * (MAX_LEAD / lead.length()) } else { lead };
+        let ahead = (lead.length() > MIN_LEAD).then(|| cam + lead);
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
         self.range = forest::tree_range(eye);
         let mut near = forest::under_tiles(cam);
@@ -638,6 +663,7 @@ impl GlobeScene {
         self.keep = near.iter().map(|x| x.1).collect();
         // Hand-over: a resident tree tile that left the list stays (drawn) while a tile replacing
         // it over the same ground, finer or coarser, is still growing; no bare patches meanwhile.
+        self.held = 0;
         let missing: HashSet<TileId> =
             near.iter().map(|x| x.1).filter(|id| id.level <= forest::TREE_LEVEL && !self.trees.contains_key(id)).collect();
         if !missing.is_empty() {
@@ -669,21 +695,34 @@ impl GlobeScene {
                 })
                 .copied()
                 .collect();
+            self.held = held.len();
             self.keep.extend(held);
         }
         {
             // resident or finished and waiting for a frame with room: not requested again
             let trees = &self.trees;
             let queued: HashSet<TileId> = self.tree_backlog.iter().map(|t| t.id).collect();
-            requeue(&self.queue, 1, &mut self.tree_pending, near.iter().map(|x| x.1), |id| trees.contains_key(id) || queued.contains(id), 8192);
+            let mut order: Vec<(f64, TileId)> = match ahead {
+                Some(a) => near.iter().map(|x| (tiles::tile_distance(x.1, a), x.1)).collect(),
+                None => Vec::new(),
+            };
+            order.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            let order = if ahead.is_some() { &order } else { &near };
+            requeue(&self.queue, 1, &mut self.tree_pending, order.iter().map(|x| x.1), |id| trees.contains_key(id) || queued.contains(id), 8192);
         }
         let ms_list = t.elapsed().as_secs_f64() * 1e3;
 
         let t = std::time::Instant::now();
-        let (draw, want) = {
+        let (draw, mut want) = {
             let tiles = &self.tiles;
             tiles::select(cam, &|id| tiles.contains_key(&id), &self.terrain)
         };
+        if let Some(a) = ahead {
+            for w in want.iter_mut() {
+                w.0 = tiles::tile_distance(w.1, a);
+            }
+            want.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        }
         {
             let tiles = &self.tiles;
             let queued: HashSet<TileId> = self.backlog.iter().map(|m| m.id).collect();
@@ -708,6 +747,25 @@ impl GlobeScene {
             self.table_cpu.push(t.vtx_addr);
         }
         self.drawn = n;
+        // The ancestors of drawn tiles are the fallback where the ground ahead is not in yet, and
+        // select() only descends into a tile while all four children are resident (also the ones
+        // over the horizon, never drawn): keep both, or a whole region drops to a coarse tile
+        // and refines back down one round trip per level.
+        for id in draw.iter().take(n) {
+            let mut p = id.parent();
+            while let Some(q) = p {
+                match self.tiles.get_mut(&q) {
+                    Some(t) if t.last_used != self.frame => t.last_used = self.frame,
+                    _ => break,
+                }
+                for k in q.children() {
+                    if let Some(t) = self.tiles.get_mut(&k) {
+                        t.last_used = self.frame;
+                    }
+                }
+                p = q.parent();
+            }
+        }
         let mut trees_drawn = 0usize;
         for (id, t) in &self.trees {
             // tiles outside `keep` are evicted after the fence: not drawn
@@ -717,6 +775,14 @@ impl GlobeScene {
             }
         }
         self.trees_drawn = trees_drawn;
+        if std::env::var("SI_STREAM_LOG").is_ok() {
+            let (lat, lon) = tiles::lat_lon(cam.normalize());
+            println!(
+                "stream {} {:.4},{:.4} eye {:.0} | terrain drawn {} want {} resident {} pending {} backlog {} | trees drawn {} tiles {} keep {} held {} pending {} backlog {}",
+                self.frame, lat, lon, eye, self.drawn, self.waiting, self.tiles.len(), self.pending.len(), self.backlog.len(),
+                self.trees_drawn, self.trees.len(), self.keep.len(), self.held, self.tree_pending.len(), self.tree_backlog.len()
+            );
+        }
         [ms_list, t.elapsed().as_secs_f64() * 1e3]
     }
 
