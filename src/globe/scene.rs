@@ -39,6 +39,8 @@ pub struct GlobeGlobals {
 }
 
 const CACHE_TILES: usize = 14_000;
+/// Terrain tiles not drawn for this many frames are evicted even below CACHE_TILES.
+const STALE_FRAMES: u64 = 240;
 const UPLOADS_PER_FRAME: usize = 64;
 const TREE_UPLOADS_PER_FRAME: usize = 96;
 /// Trees uploaded per frame at most (BLAS builds on the GPU, recorded in the frame).
@@ -84,11 +86,13 @@ struct TreeTileGpu {
 }
 
 /// Terrain tile vertices: fixed-size slots in device-local chunks of POOL_CHUNK tiles, added as
-/// tiles become resident (up to `cap`), freed slots reused. (Their BLASes live in the AS heap.)
+/// tiles become resident (up to `cap`), freed slots reused lowest first, so the tiles pack into the
+/// first chunks and a chunk left empty (the camera moved far away) is given back (trim). (Their
+/// BLASes live in the AS heap.)
 struct TilePool {
-    vtx: Vec<Buffer>,
+    vtx: Vec<Option<Buffer>>,
     vslot: u64,
-    free: Vec<u32>,
+    free: std::collections::BTreeSet<u32>,
     cap: u32,
 }
 
@@ -96,20 +100,51 @@ const POOL_CHUNK: u32 = 512;
 
 impl TilePool {
     fn new(vtx_bytes: u64, cap: u32) -> Self {
-        TilePool { vtx: Vec::new(), vslot: vtx_bytes.div_ceil(256) * 256, free: Vec::new(), cap }
+        TilePool { vtx: Vec::new(), vslot: vtx_bytes.div_ceil(256) * 256, free: Default::default(), cap }
     }
-    /// A free slot (adding a chunk when all are taken), or None at capacity.
+    fn chunks(&self) -> usize {
+        self.vtx.iter().filter(|c| c.is_some()).count()
+    }
+    /// The lowest free slot (adding a chunk when all are taken), or None at capacity.
     fn alloc(&mut self, gpu: &Gpu) -> Result<Option<u32>> {
-        let have = self.vtx.len() as u32 * POOL_CHUNK;
-        if self.free.is_empty() && have < self.cap {
+        if self.free.is_empty() && (self.chunks() as u32) * POOL_CHUNK < self.cap {
             let vu = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR | vk::BufferUsageFlags::TRANSFER_DST;
-            self.vtx.push(gpu.create_buffer(self.vslot * POOL_CHUNK as u64, vu, MemoryLocation::GpuOnly, "terrain vertex pool")?);
-            self.free.extend((have..have + POOL_CHUNK).rev());
+            let buf = gpu.create_buffer(self.vslot * POOL_CHUNK as u64, vu, MemoryLocation::GpuOnly, "terrain vertex pool")?;
+            let c = match self.vtx.iter().position(|c| c.is_none()) {
+                Some(c) => {
+                    self.vtx[c] = Some(buf);
+                    c
+                }
+                None => {
+                    self.vtx.push(Some(buf));
+                    self.vtx.len() - 1
+                }
+            } as u32;
+            self.free.extend(c * POOL_CHUNK..(c + 1) * POOL_CHUNK);
         }
-        Ok(self.free.pop())
+        Ok(self.free.pop_first())
+    }
+    fn release(&mut self, slot: u32) {
+        self.free.insert(slot);
     }
     fn vtx(&self, i: u32) -> (&Buffer, u64) {
-        (&self.vtx[(i / POOL_CHUNK) as usize], (i % POOL_CHUNK) as u64 * self.vslot)
+        (self.vtx[(i / POOL_CHUNK) as usize].as_ref().expect("live pool chunk"), (i % POOL_CHUNK) as u64 * self.vslot)
+    }
+    /// Give back empty chunks beyond `spare` (after the fence: no frame in flight uses them).
+    fn trim(&mut self, gpu: &Gpu, spare: usize) {
+        let mut empty: Vec<usize> = (0..self.vtx.len())
+            .filter(|&c| self.vtx[c].is_some() && self.free.range(c as u32 * POOL_CHUNK..(c as u32 + 1) * POOL_CHUNK).count() == POOL_CHUNK as usize)
+            .collect();
+        // keep the lowest empty chunks (the next tiles go there), give back the highest
+        empty.reverse();
+        for &c in empty.iter().take(empty.len().saturating_sub(spare)) {
+            if let Some(mut b) = self.vtx[c].take() {
+                gpu.destroy_buffer(&mut b);
+            }
+            for s in c as u32 * POOL_CHUNK..(c as u32 + 1) * POOL_CHUNK {
+                self.free.remove(&s);
+            }
+        }
     }
 }
 
@@ -123,11 +158,16 @@ struct HeapSlot {
 
 /// Acceleration structure storage for the streamed BLASes (terrain and trees): size classes
 /// 1/8 octave apart (~9%: compacted BLASes vary in size) carved out of 64 MB device chunks,
-/// freed slots reused per class (no allocator calls per tile).
+/// freed slots reused per class, lowest chunk first (no allocator calls per tile). A chunk whose
+/// slots are all free again is given back (trim), so the heap shrinks after the camera moves on.
 struct AsHeap {
-    chunks: Vec<Buffer>,
+    chunks: Vec<Option<Buffer>>,
+    /// live slots per chunk
+    live: Vec<u32>,
+    /// the chunk new slots are cut from, and how far
+    cur: usize,
     bump: u64,
-    free: Vec<Vec<(usize, u64)>>,
+    free: Vec<std::collections::BTreeSet<(usize, u64)>>,
 }
 
 const AS_CHUNK: u64 = 64 << 20;
@@ -136,7 +176,7 @@ const AS_CLASSES: usize = 96; // 4 KB .. 16 MB
 
 impl AsHeap {
     fn new() -> Self {
-        AsHeap { chunks: Vec::new(), bump: AS_CHUNK, free: vec![Vec::new(); AS_CLASSES] }
+        AsHeap { chunks: Vec::new(), live: Vec::new(), cur: usize::MAX, bump: AS_CHUNK, free: vec![Default::default(); AS_CLASSES] }
     }
     /// The class of a size, and that class's size (a multiple of 256: AS offsets must be).
     fn class_of(size: u64) -> (usize, u64) {
@@ -147,19 +187,57 @@ impl AsHeap {
     }
     fn alloc(&mut self, gpu: &Gpu, size: u64) -> Result<HeapSlot> {
         let (class, csize) = Self::class_of(size);
-        if let Some((chunk, offset)) = self.free[class].pop() {
+        if let Some((chunk, offset)) = self.free[class].pop_first() {
+            self.live[chunk] += 1;
             return Ok(HeapSlot { class, chunk, offset });
         }
         if self.bump + csize > AS_CHUNK {
-            self.chunks.push(gpu.create_buffer(AS_CHUNK, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "blas heap")?);
+            let buf = gpu.create_buffer(AS_CHUNK, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "blas heap")?;
+            self.cur = match self.chunks.iter().position(|c| c.is_none()) {
+                Some(c) => {
+                    self.chunks[c] = Some(buf);
+                    self.live[c] = 0;
+                    c
+                }
+                None => {
+                    self.chunks.push(Some(buf));
+                    self.live.push(0);
+                    self.chunks.len() - 1
+                }
+            };
             self.bump = 0;
         }
-        let s = HeapSlot { class, chunk: self.chunks.len() - 1, offset: self.bump };
+        let s = HeapSlot { class, chunk: self.cur, offset: self.bump };
         self.bump += csize;
+        self.live[self.cur] += 1;
         Ok(s)
     }
     fn release(&mut self, s: HeapSlot) {
-        self.free[s.class].push((s.chunk, s.offset));
+        self.live[s.chunk] -= 1;
+        self.free[s.class].insert((s.chunk, s.offset));
+    }
+    fn raw(&self, chunk: usize) -> vk::Buffer {
+        self.chunks[chunk].as_ref().expect("live AS heap chunk").raw
+    }
+    fn chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|c| c.is_some()).count()
+    }
+    /// Give back chunks with no live slot, beyond `spare` of them (after the fence, once the
+    /// BLASes in them are destroyed).
+    fn trim(&mut self, gpu: &Gpu, spare: usize) {
+        let empty: Vec<usize> = (0..self.chunks.len()).filter(|&c| c != self.cur && self.chunks[c].is_some() && self.live[c] == 0).collect();
+        if empty.len() <= spare {
+            return;
+        }
+        let gone: std::collections::HashSet<usize> = empty.iter().rev().take(empty.len() - spare).copied().collect();
+        for &c in &gone {
+            if let Some(mut b) = self.chunks[c].take() {
+                gpu.destroy_buffer(&mut b);
+            }
+        }
+        for f in &mut self.free {
+            f.retain(|(c, _)| !gone.contains(c));
+        }
     }
 }
 
@@ -417,6 +495,8 @@ pub fn heading(frame: DMat3, dir: DVec3) -> f64 {
 
 pub struct GlobeScene {
     pub terrain: Arc<Terrain>,
+    /// animation time (s) for the ocean: main.rs State.clock (a fixed step per frame in a tour)
+    pub clock: f64,
     tiles: HashMap<TileId, TileGpu>,
     pending: HashSet<TileId>,
     queue: Queue,
@@ -520,7 +600,7 @@ impl GlobeScene {
         for _ in 0..12 * POOL_CHUNK {
             first.extend(pool.alloc(gpu)?);
         }
-        pool.free.extend(first.into_iter().rev());
+        pool.free.extend(first);
         let staging = gpu.create_buffer(
             STAGING,
             vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
@@ -587,6 +667,7 @@ impl GlobeScene {
             tree_backlog: VecDeque::new(),
             elev_tex,
             ocean: super::ocean::Ocean::spawn(),
+            clock: 0.0,
             ocean_tex: ocean_images(gpu)?,
             ocean_stats: [[0.0; 4]; 3],
             ubo,
@@ -810,7 +891,7 @@ impl GlobeScene {
             };
             let Some(old_heap) = current else { continue };
             let heap = self.as_heap.alloc(gpu, size)?;
-            let (dst, addr) = accel::create_accel_in(gpu, self.as_heap.chunks[heap.chunk].raw, heap.offset, size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
+            let (dst, addr) = accel::create_accel_in(gpu, self.as_heap.raw(heap.chunk), heap.offset, size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
             self.ops.push(Op::Compact { src: raw, dst });
             self.retire.push((raw, old_heap));
             if terrain {
@@ -882,7 +963,7 @@ impl GlobeScene {
             let src = self.stage(bytes).unwrap();
             let heap = self.as_heap.alloc(gpu, self.blas_size)?;
             let (blas, blas_addr) =
-                accel::create_accel_in(gpu, self.as_heap.chunks[heap.chunk].raw, heap.offset, self.blas_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
+                accel::create_accel_in(gpu, self.as_heap.raw(heap.chunk), heap.offset, self.blas_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
             let (vbuf, off) = self.pool.vtx(slot);
             let vtx_addr = vbuf.addr + off;
             self.ops.push(Op::Copy { src, dst: vbuf.raw, dst_off: off, size: bytes.len() as u64 });
@@ -927,7 +1008,7 @@ impl GlobeScene {
             let src_a = self.stage(bytemuck::cast_slice(&t.aabbs)).unwrap();
             self.ops.push(Op::Copy { src: src_r, dst: self.plants.raw, dst_off: base as u64 * PLANT_REC_BYTES, size: n as u64 * PLANT_REC_BYTES });
             let hs = self.as_heap.alloc(gpu, as_size)?;
-            let (blas, addr) = accel::create_accel_in(gpu, self.as_heap.chunks[hs.chunk].raw, hs.offset, as_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
+            let (blas, addr) = accel::create_accel_in(gpu, self.as_heap.raw(hs.chunk), hs.offset, as_size, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)?;
             // the build reads the AABBs straight from staging (only BLAS build input: no copy kept)
             self.ops.push(Op::Trees { aabbs: self.staging.addr + src_a, count: n as u32, dst: blas, scratch });
             self.built.push((false, t.id, blas));
@@ -938,6 +1019,18 @@ impl GlobeScene {
     }
 
     fn evict(&mut self, gpu: &Gpu) {
+        // tiles nothing has drawn for STALE_FRAMES (the camera moved on: a jump, or a long
+        // flight) go whatever the cache holds, so their memory is given back
+        if self.frame > STALE_FRAMES && self.frame % 30 == 0 {
+            let stale: Vec<TileId> = self.tiles.iter().filter(|(id, t)| id.level > 2 && t.last_used + STALE_FRAMES < self.frame).map(|(id, _)| *id).collect();
+            for id in stale {
+                if let Some(t) = self.tiles.remove(&id) {
+                    unsafe { gpu.accel_fn.destroy_acceleration_structure(t.blas, None) };
+                    self.as_heap.release(t.heap);
+                    self.pool.release(t.slot);
+                }
+            }
+        }
         if self.tiles.len() <= CACHE_TILES {
             return;
         }
@@ -954,7 +1047,7 @@ impl GlobeScene {
             if let Some(t) = self.tiles.remove(&id) {
                 unsafe { gpu.accel_fn.destroy_acceleration_structure(t.blas, None) };
                 self.as_heap.release(t.heap);
-                self.pool.free.push(t.slot);
+                self.pool.release(t.slot);
             }
         }
     }
@@ -990,7 +1083,7 @@ impl GlobeScene {
         let lead = if lead.length() > MAX_LEAD { lead * (MAX_LEAD / lead.length()) } else { lead };
         let ahead = (lead.length() > MIN_LEAD).then(|| cam + lead);
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
-        self.ocean.post(sea_state(cam));
+        self.ocean.post(sea_state(cam), self.clock as f32);
         self.range = forest::tree_range(eye);
         let mut near = forest::under_tiles(cam);
         near.extend(forest::tiles_near(cam, self.range));
@@ -1207,6 +1300,10 @@ impl GlobeScene {
         self.evict_trees(gpu, &keep);
         // (evicted tiles are gone before their compaction would be recorded)
         self.compact(gpu)?;
+        if self.frame % 30 == 0 {
+            self.as_heap.trim(gpu, 2);
+            self.pool.trim(gpu, 1);
+        }
         self.upload(gpu)?;
         self.upload_trees(gpu)?;
         self.keep = keep;
@@ -1228,6 +1325,26 @@ impl GlobeScene {
         }
     }
 
+    /// Distance (m) from the camera (ECEF) to the nearest plant of each variant within `radius`
+    /// (finest tree and understory tiles; `out` keeps its value where a variant is not near).
+    pub fn variants_near(&self, cam: DVec3, radius: f64, out: &mut [f32]) {
+        let edge = 0.5 * std::f64::consts::PI * R_EARTH / (1u64 << forest::TREE_LEVEL) as f64;
+        let ground = cam.normalize() * R_EARTH;
+        for (id, t) in &self.trees {
+            if t.recs.is_empty() || !self.keep.contains(id) || (t.center - ground).length() > radius + edge {
+                continue;
+            }
+            for r in &t.recs {
+                let v = (r[12] & 0xFF) as usize;
+                let p = t.center + DVec3::new(f32::from_bits(r[3]) as f64, f32::from_bits(r[7]) as f64, f32::from_bits(r[11]) as f64);
+                let d = (p - cam).length() as f32;
+                if v < out.len() && d < out[v] {
+                    out[v] = d;
+                }
+            }
+        }
+    }
+
     pub fn write_globals(&mut self, g: &GlobeGlobals) {
         self.ubo.mapped()[..std::mem::size_of::<GlobeGlobals>()].copy_from_slice(bytemuck::bytes_of(g));
     }
@@ -1237,12 +1354,12 @@ impl GlobeScene {
         format!(
             "globe: {} terrain tiles resident ({} vertex pool chunks, {:.0} MB), {} drawn; {} tree tiles, {} trees drawn; BLAS heap (terrain + trees, compacted) {} MB",
             self.tiles.len(),
-            self.pool.vtx.len(),
-            (self.pool.vtx.len() as u64 * POOL_CHUNK as u64 * self.pool.vslot) as f64 / 1e6,
+            self.pool.chunks(),
+            (self.pool.chunks() as u64 * POOL_CHUNK as u64 * self.pool.vslot) as f64 / 1e6,
             self.drawn,
             self.trees.len(),
             self.trees_drawn,
-            self.as_heap.chunks.len() as u64 * (AS_CHUNK >> 20)
+            self.as_heap.chunk_count() as u64 * (AS_CHUNK >> 20)
         ) + &{
             let w = |k: usize, i: usize| WORK[k][i].load(std::sync::atomic::Ordering::Relaxed) as f64;
             format!(

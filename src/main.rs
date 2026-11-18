@@ -5,6 +5,7 @@
 //! a baked parallax octahedral impostor.
 
 mod accel;
+mod atlas;
 mod asset;
 mod bc7;
 mod catalog;
@@ -14,6 +15,7 @@ mod erosion;
 mod flypath;
 mod globe;
 mod textures;
+mod tour;
 mod gpu;
 mod renderer;
 mod world;
@@ -68,6 +70,12 @@ struct Args {
     validation: bool,
     vsync: bool,
     gallery: bool,
+    /// `--tour file`: a scripted globe camera tour for recording (tour.rs)
+    tour: Option<String>,
+    /// `--tour-pace ms`: shortest time each tour frame stays on screen. The tour advances a fixed
+    /// 1/60 s per frame, so with a pace above 16.7 ms it plays slower than real time and every
+    /// frame is captured by a 60 fps recorder at least once (tools/tour_post.py drops the repeats).
+    tour_pace: f64,
     bench_move: f32,
     fly: bool,
     fly_speed: f32,
@@ -116,6 +124,8 @@ fn parse_args() -> Args {
         validation: std::env::var("SI_VALIDATION").is_ok(),
         vsync: false,
         gallery: false,
+        tour: None,
+        tour_pace: 1000.0 / 60.0,
         bench_move: 0.0,
         fly: false,
         fly_speed: 13.0,
@@ -235,6 +245,8 @@ fn parse_args() -> Args {
                 a.vsync = true;
                 i -= 1;
             }
+            "--tour" => a.tour = Some(next),
+            "--tour-pace" => a.tour_pace = next.parse().unwrap_or(1000.0 / 60.0),
             "--gallery" => {
                 a.gallery = true;
                 i -= 1;
@@ -305,6 +317,32 @@ struct State {
     geo: Option<Geo>,
     /// globe: frames a capture waited for streaming
     settle: u32,
+    /// `--tour`: the scripted camera tour in progress
+    tour: Option<TourRun>,
+    /// seconds of animation since the start (cloud evolution and drift)
+    clock: f64,
+}
+
+/// A `--tour` in progress: the shot being loaded (black, waiting for streaming) or played.
+struct TourRun {
+    shots: Vec<tour::Shot>,
+    idx: usize,
+    path: Option<tour::Path>,
+    phase: TourPhase,
+    /// this shot's frames, and those that missed the 60 fps deadline
+    frames: u32,
+    late: u32,
+    /// SI_TOUR_STILLS: save stills at the start, middle and end of each shot (for checking framing)
+    stills: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TourPhase {
+    /// frames held at the shot's first key, and how many of them in a row had nothing streaming
+    Load { frames: u32, quiet: u32 },
+    Play { t: f64 },
+    /// black after the last shot, then exit
+    End { frames: u32 },
 }
 
 /// Globe camera: position in float64 Earth-centred coordinates; the renderer's world is the
@@ -378,6 +416,14 @@ impl App {
         for sp in &cat.species {
             let hs: Vec<String> = sp.variants.clone().map(|v| format!("{:.1}", cat.variants[v].height)).collect();
             println!("  {:<24} {:?} heights [{}] m", sp.name, sp.kind, hs.join(", "));
+            if std::env::var("SI_PARTS").is_ok() {
+                for v in sp.variants.clone() {
+                    let t = &pack.trees[v];
+                    let uniq: std::collections::HashSet<u32> = t.parts.iter().map(|p| p.mesh).collect();
+                    let utris: u64 = uniq.iter().map(|m| pack.meshes[*m as usize].tri_count() as u64).sum();
+                    println!("      {:<40} {:>5} parts, {:>3} meshes, {:>7} unique tris, {:>8} expanded", t.name, t.parts.len(), uniq.len(), utris, t.expanded_tris(&pack.meshes));
+                }
+            }
         }
         let (mut pack, mut cat) = (pack, cat);
         let globe_terrain = if a.globe { Some(std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?)) } else { None };
@@ -470,7 +516,15 @@ impl App {
             haze: a.haze,
             geo,
             settle: 0,
+            tour: None,
+            clock: 0.0,
         };
+        if let Some(path) = &a.tour {
+            let shots = tour::load(path)?;
+            let total: f64 = shots.iter().map(|s| s.secs).sum();
+            println!("Tour: {} shots, {:.0} s of footage", shots.len(), total);
+            state.tour = Some(TourRun { shots, idx: 0, path: None, phase: TourPhase::Load { frames: 0, quiet: 0 }, frames: 0, late: 0, stills: std::env::var("SI_TOUR_STILLS").is_ok() });
+        }
         if std::env::var("SI_FOREST_MAP").is_ok() {
             // Coarse tree-count map, 50 m cells over [-700, 700]^2, north (-Z) at the top.
             let cell = 50.0;
@@ -553,15 +607,126 @@ impl App {
                 return Ok(());
             }
         }
+        // tour playback: an even 60 fps for the recorder (the loading frames run flat out)
+        if matches!(s.tour.as_ref().map(|t| t.phase), Some(TourPhase::Play { .. })) {
+            let due = s.last + std::time::Duration::from_secs_f64(self.args.tour_pace / 1000.0);
+            loop {
+                let left = due.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                if left > std::time::Duration::from_micros(1500) {
+                    std::thread::sleep(left - std::time::Duration::from_micros(1000));
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
         let now = Instant::now();
         let raw_dt = (now - s.last).as_secs_f32();
-        let dt = raw_dt.min(0.1);
+        // a tour steps a fixed 1/60 s per frame (smooth motion in the recording however long a frame takes)
+        let dt = if s.tour.is_some() { 1.0 / 60.0 } else { raw_dt.min(0.1) };
         s.last = now;
         if s.rendered >= 5 {
             s.frame_times.push(raw_dt * 1000.0);
         }
         if s.rendered == 5 && views.is_empty() {
             s.r.profile = Default::default(); // exclude warm-up frames
+        }
+
+        s.clock += dt as f64;
+
+        // ---- scripted tour: the camera, the clock and the fade come from the shot list
+        let mut tour_reset = false;
+        if let (Some(tr), Some(geo), Some(scene)) = (s.tour.as_mut(), s.geo.as_mut(), &s.r.globe) {
+            let mut fade = 0.0f32;
+            let mut place = None;
+            match tr.phase {
+                TourPhase::Load { frames, quiet } => {
+                    let shot = &tr.shots[tr.idx];
+                    if frames == 0 {
+                        tr.path = Some(tour::Path::new(shot, &scene.terrain));
+                        geo.time = shot.utc();
+                        geo.rate = 0.0;
+                        if let Some(c) = shot.cover {
+                            self.args.cloud_cover = c;
+                        }
+                        s.exposure = 2.2 * 2f32.powf(shot.ev);
+                        tour_reset = true;
+                        println!("tour: loading shot {} '{}' ({:.0} s)", tr.idx + 1, shot.title, s.clock);
+                    }
+                    place = Some(0.0);
+                    let quiet = if scene.busy() || s.r.atlases_pending() { 0 } else { quiet + 1 };
+                    let frames = frames + 1;
+                    tr.phase = if (quiet >= 45 && frames >= 120) || frames >= 4000 {
+                        if frames >= 4000 {
+                            println!("tour: still streaming, starting anyway: {}", scene.busy_detail());
+                        }
+                        println!("tour: play shot {} '{}' | {} | {} ({:.0} s)", tr.idx + 1, shot.title, shot.caption, shot.secs, s.clock);
+                        TourPhase::Play { t: 0.0 }
+                    } else {
+                        TourPhase::Load { frames, quiet }
+                    };
+                }
+                TourPhase::Play { t } => {
+                    let shot = &tr.shots[tr.idx];
+                    let t = t + dt as f64;
+                    tr.frames += 1;
+                    if raw_dt as f64 > self.args.tour_pace / 1000.0 + 0.002 {
+                        tr.late += 1;
+                    }
+                    if tr.stills && [0.85, shot.secs * 0.5, shot.secs - 0.85].iter().any(|&m| t >= m && t - (dt as f64) < m) {
+                        s.capture_next = true;
+                    }
+                    fade = tour::fade(t, shot.secs, 0.8);
+                    place = Some((t / shot.secs).min(1.0));
+                    tr.phase = if t >= shot.secs {
+                        println!("tour: shot {} done: {} frames, {} late ({:.1}%)", tr.idx + 1, tr.frames, tr.late, 100.0 * tr.late as f64 / tr.frames.max(1) as f64);
+                        if std::env::var("SI_MEM").is_ok() {
+                            let (base, full, n) = s.r.atlas_memory();
+                            println!("impostor atlases: base {:.2} GB, full {:.2} GB ({n} variants)", base as f64 / 1e9, full as f64 / 1e9);
+                            print!("{}", s.r.gpu.memory_report());
+                            println!("{}", scene.stats_line());
+                        }
+                        tr.frames = 0;
+                        tr.late = 0;
+                        tr.idx += 1;
+                        if tr.idx < tr.shots.len() {
+                            TourPhase::Load { frames: 0, quiet: 0 }
+                        } else {
+                            println!("tour: done ({:.0} s)", s.clock);
+                            TourPhase::End { frames: 0 }
+                        }
+                    } else {
+                        TourPhase::Play { t }
+                    };
+                }
+                TourPhase::End { frames } => {
+                    if frames > 60 {
+                        el.exit();
+                    }
+                    tr.phase = TourPhase::End { frames: frames + 1 };
+                }
+            }
+            if let (Some(f), Some(path)) = (place, tr.path.as_ref()) {
+                let (ecef, heading, pitch) = path.at(f, &scene.terrain);
+                geo.ecef = ecef;
+                geo.frame = globe::scene::frame_at(ecef);
+                s.cam.pos = Vec3::ZERO;
+                s.cam.yaw = heading.to_radians() as f32;
+                s.cam.pitch = pitch.to_radians() as f32;
+                s.yaw_target = s.cam.yaw;
+                s.pitch_target = s.cam.pitch;
+                s.vel = Vec3::ZERO;
+            }
+            if tour_reset {
+                geo.prev = None;
+            }
+            s.r.fade = fade;
+        }
+        if tour_reset {
+            s.prev_cam = None;
+            s.r.reset_taa();
         }
 
         // ---- manual fly-cam input (any input takes over from the automatic path)
@@ -751,21 +916,24 @@ impl App {
             prev_right: prev[1],
             prev_up: prev[2],
             prev_fwd: prev[3],
-            extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() % 3600.0).unwrap_or(0.0)) as f32],
+            extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (s.clock % 3600.0) as f32],
             planet,
             moon,
             sun_true,
             earth,
             // z: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
             ocean: [[0.0; 4]; 3],
-            cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, 0.0],
+            cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
         // globe: a view is only captured once its terrain and trees have streamed in
-        let settling = self.args.bench_move == 0.0 && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
+        let settling = self.args.bench_move == 0.0 && s.tour.is_none() && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
         let capture = capture && !settling;
+        if let Some(gs) = s.r.globe.as_mut() {
+            gs.clock = s.clock;
+        }
         let (stats, img) = s.r.render(&g, s.cam.pos, s.lod, capture)?;
         s.frame = s.frame.wrapping_add(1);
         if settling && shot_due {

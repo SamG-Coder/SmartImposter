@@ -1,0 +1,54 @@
+# Showcase tour: ~5 min, 10 long, slow aerial takes over the forests (see src/tour.rs).
+# Record: smart_imposter --globe --fullscreen --tour tours/showcase.txt --tour-pace 40
+# (OBS at 60 fps), then: python tools/tour_post.py <recording> tours/showcase.txt <out.mp4>
+# shot <seconds> <local solar hour> [cover=] [date=] [ev=] | title | caption
+# key lat,lon,height above ground (m),heading,pitch
+shot 31 16.5 cover=0.25 ev=0.3 | The Matterhorn | Valais, Switzerland
+key 46.020000,7.750000,55,235,-7
+key 46.019279,7.748516,60,233,-7
+key 46.018557,7.747033,68,230,-6
+
+shot 30 17.5 cover=0.25 | Black Forest | Baden-Württemberg, Germany
+key 48.300000,8.250000,55,0,-18
+key 48.301163,8.250153,55,3,-17
+key 48.302327,8.250306,58,8,-15
+
+shot 30 9.0 cover=0.2 | Aokigahara | Yamanashi, Japan
+key 35.470000,138.620000,70,140,-8
+key 35.469105,138.620922,72,141,-7
+key 35.468211,138.621843,75,143,-6
+
+shot 30 9.0 cover=0.25 | Himalaya | Solukhumbu, Nepal
+key 27.750000,86.700000,70,0,-12
+key 27.751067,86.700170,72,4,-11
+key 27.752135,86.700339,76,8,-10
+
+shot 30 17.5 cover=0.2 | Tuscany | Siena, Italy
+key 43.300000,11.300000,60,90,-12
+key 43.300000,11.301481,62,88,-11
+key 43.300000,11.302962,65,85,-10
+
+shot 30 9.0 cover=0.1 | Western Ghats | Tamil Nadu, India
+key 10.200000,77.000000,70,0,-15
+key 10.201078,77.000000,72,3,-14
+key 10.202156,77.000000,75,6,-13
+
+shot 30 9.5 cover=0.2 | Sea of Trees | Below Mount Fuji, Japan
+key 35.480000,138.600000,40,200,-20
+key 35.479071,138.599585,40,196,-19
+key 35.478143,138.599170,42,190,-17
+
+shot 30 18.0 cover=0.15 | Sonoran Desert | Arizona, USA
+key 32.250000,-111.050000,25,60,-10
+key 32.250404,-111.049172,24,62,-9
+key 32.250808,-111.048344,26,66,-8
+
+shot 30 16.5 cover=0.2 date=2026-09-21 | Woodland | New South Wales, Australia
+key -35.300000,149.000000,40,90,-10
+key -35.300000,149.000991,40,92,-9
+key -35.300000,149.001981,42,96,-8
+
+shot 31 17.0 cover=0.3 | Lake Como | 
+key 45.990000,9.262000,60,250,-12
+key 45.989478,9.259935,260,250,-12
+key 45.987481,9.252037,1150,248,-14

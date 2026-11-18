@@ -135,6 +135,9 @@ pub fn under_tiles(cam: DVec3) -> Vec<(f64, TileId)> {
     let edge = 0.5 * std::f64::consts::PI * R_EARTH / cells as f64;
     let k = (UNDER_RADIUS / edge).ceil() as i64 + 1;
     let mut out = Vec::new();
+    if std::env::var("SI_NO_UNDER").is_ok() {
+        return out; // profiling: no understory
+    }
     for y in cy - k..=cy + k {
         for x in cx - k..=cx + k {
             if x < 0 || y < 0 || x >= cells as i64 || y >= cells as i64 {
