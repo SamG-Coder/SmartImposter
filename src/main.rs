@@ -599,7 +599,15 @@ impl App {
             }
         }
         let (fwd, right, up) = s.cam.basis();
-        if self.args.bench_move != 0.0 {
+        if let (true, Some(geo), Some(scene)) = (self.args.bench_move != 0.0, s.geo.as_mut(), &s.r.globe) {
+            // Globe fly-through benchmark: along the heading at a constant height above the ground.
+            let rot = globe::scene::frame_at(geo.ecef);
+            let ground = globe::tiles::ground_radius(&scene.terrain, geo.ecef);
+            let above = geo.ecef.length() - ground;
+            let dir = rot.transpose() * Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero().as_dvec3();
+            let p = geo.ecef + dir * self.args.bench_move as f64;
+            geo.ecef = p.normalize() * (globe::tiles::ground_radius(&scene.terrain, p) + above);
+        } else if self.args.bench_move != 0.0 {
             // Keep the initial height above the terrain while moving (walk / fly benchmarks).
             let above = s.cam.pos.y - s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z);
             s.cam.pos += Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero() * self.args.bench_move;
@@ -674,7 +682,7 @@ impl App {
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
         // globe: a view is only captured once its terrain and trees have streamed in
-        let settling = s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
+        let settling = self.args.bench_move == 0.0 && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
         let capture = capture && !settling;
         let (stats, img) = s.r.render(&g, s.cam.pos, s.lod, capture)?;
         s.frame = s.frame.wrapping_add(1);
@@ -704,15 +712,21 @@ impl App {
                     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     let avg = t.iter().sum::<f32>() / t.len() as f32;
                     println!(
-                        "timing over {} frames: avg {:.2} ms ({:.0} fps), median {:.2} ms, p95 {:.2} ms",
+                        "timing over {} frames: avg {:.2} ms ({:.0} fps), median {:.2} ms, p95 {:.2} ms, p99 {:.2} ms, max {:.2} ms, frames > 33 ms: {}",
                         t.len(),
                         avg,
                         1000.0 / avg,
                         t[t.len() / 2],
-                        t[(t.len() * 95 / 100).min(t.len() - 1)]
+                        t[(t.len() * 95 / 100).min(t.len() - 1)],
+                        t[(t.len() * 99 / 100).min(t.len() - 1)],
+                        t[t.len() - 1],
+                        t.iter().filter(|&&x| x > 33.3).count()
                     );
                 }
                 println!("{}", s.r.profile.line());
+                if let Some(scene) = &s.r.globe {
+                    println!("{}", scene.stats_line());
+                }
                 println!(
                     "stats: near trees {}, TLAS instances {}, camera --cam {:.2},{:.2},{:.2},{:.1},{:.1}",
                     stats.near_trees,

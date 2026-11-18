@@ -398,10 +398,24 @@ cost at DLAA; DLSS-RR Quality halves the frame time for a slightly softer image.
 The plan for the whole planet at true scale is in [docs/EARTH_PLAN.md](docs/EARTH_PLAN.md). Built
 so far:
 
-- **`--globe`: the planet at 1:1.** A cube-sphere quadtree of terrain tiles from orbit down to ~5 m
-  cells, each tile its own BLAS built on worker threads and streamed in as you fly. Positions are
-  float64 on the CPU and camera-relative float32 on the GPU, so it holds still from orbit to
-  standing height. A single-scattering atmosphere (Rayleigh + Mie) works from the ground to space.
+- **`--globe`: the planet at 1:1, in the same renderer.** A cube-sphere quadtree of terrain tiles
+  from orbit down to ~5 m cells, streamed in as you fly. Positions are float64 on the CPU and
+  camera-relative float32 on the GPU, so it holds still from orbit to standing height. The globe is
+  a mode of the main renderer, so it keeps the same path tracing, DLSS Ray Reconstruction / TAA,
+  AO, mesh LOD band and see-through water. A single-scattering atmosphere (Rayleigh + Mie) gives
+  the sky, sunlight, sky light and aerial perspective from the ground to space.
+  - Trees to the horizon: tree tiles out to the visible horizon (`sqrt(2Rh)` from the camera
+    height, plus a ridge allowance). Every tree is placed within 6 km; coarser tiles further out
+    keep 1/4^k of the trees at their true size, and the terrain shader adds the canopy colour of
+    the ones left out. Near the camera the trees switch to meshes through the usual LOD band, and
+    grass, ferns and shrubs grow from the 20 m land cover within 700 m.
+  - Streaming without hitches: one pool of worker threads builds terrain tiles (first) and grows
+    tree tiles. Their vertex copies and BLAS builds are recorded into the frame's own command
+    buffer, with no GPU waits. Storage is pooled and device-local: fixed slots for terrain
+    vertices and BLASes, one plant record / AABB buffer, and size-class slabs for tree BLASes.
+    Tile selection, instance lists and mesh LOD run while the previous frame is still on the GPU.
+    A tree tile that is being replaced by a finer or coarser one stays until its replacement is
+    in, so the forest never shows bare patches.
   - Elevation: NOAA ETOPO 2022 (60″, global, land and seafloor), Copernicus GLO-30 (30 m) where its
     tiles are present, blended at the edges. The whole ETOPO grid also lives on the GPU for
     per-pixel coastlines and relief far away.
@@ -412,8 +426,7 @@ so far:
   (with the Earth's curvature), heights from GLO-30 / ETOPO, lakes and rivers from WorldCover,
   streams from a priority-flood drainage of the real 30 m heights, and the forest grown only where
   WorldCover has tree cover. Altitude zones shift with latitude.
-- **Enter** on the globe lands at the place below (site mode). **M** in site mode returns to the
-  globe above the same spot.
+- **M** in site mode returns to the globe above the same spot.
 
 **Data (free, not included).** Put the files under `assets/earth/`:
 
@@ -427,9 +440,20 @@ Each is decoded once and cached next to the source. The globe runs with ETOPO al
 elevation and land cover only exist where you downloaded tiles (the Alps, 45–47° N, 6–11° E, in
 development).
 
-**Still to do** (see the plan): trees on the globe itself (per-tile growth with hierarchical
-canopy LOD baked from the real trees), the plant library per biome (free Quixel species, see the
-plan's asset list), ocean waves, clouds and seasons.
+Streaming on an RTX 5080 at 1920x1080, DLSS-RR Quality, `--bench-move` over 900 frames:
+
+| Run | avg | p99 | max | frames > 33 ms |
+|---|---|---|---|---|
+| Flight at 300 m over Lake Como, 4 m/frame | 7.3 ms | 9.5 ms | 12.3 ms | 0 |
+| Walk on an alpine slope, 0.3 m/frame | 6.3 ms | 10.2 ms | 11.2 ms | 0 |
+| Flight at 1500 m, 15 m/frame | 7.1 ms | 11.0 ms | 15.5 ms | 0 |
+
+Earlier, with synchronous per-tile uploads, the same runs had p99 64–68 ms and maxima of 76–110 ms.
+A cold view streams in fully in ~1.8 s after the first frame (was 4.3 s).
+
+**Still to do** (see the plan): the plant library per biome (free Quixel species, see the plan's
+asset list; the globe uses the Alpine forest's species everywhere), ocean waves, clouds and
+seasons.
 
 ## Getting started
 
@@ -522,7 +546,7 @@ cargo run --release
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
-| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--sun lat,lon] [--exposure 0.4]` | the 1:1 globe; `--views` takes the same five numbers per view |
+| `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--sun azimuth,elevation]` | the 1:1 globe; `--views` takes the same five numbers per view; `--bench-move m` flies along the heading at constant height |
 
 | Environment | Meaning |
 |---|---|
@@ -556,7 +580,7 @@ cargo run --release
 | `-` `=` | exposure |
 | O | AO rays per pixel |
 | P | print the camera as `--cam` (globe: as `--at`) |
-| M (site mode) / Enter (globe) | switch between the forest scene of a real place and the globe |
+| M (site mode) | back to the globe above the same place |
 | F11 / F12 | fullscreen / screenshot |
 
 ## Tools
@@ -587,15 +611,16 @@ src/
   textures.rs  parallel PNG decode, per-species normalisation, GPU mip generation
   world.rs     terrain (eroded or a real site), forest succession, biome scatter, ground masks
   erosion.rs   uplift + stream-power erosion, priority flood, drainage, river polylines
-  globe/       the 1:1 Earth: app (camera, controls), render (tile BLAS streaming, pipeline),
-               tiles (cube-sphere quadtree, tile meshes), etopo / dem / landcover (data readers)
+  globe/       the 1:1 Earth as a mode of the renderer: scene (streaming, pooled GPU storage,
+               BLAS builds in the frame, instances), tiles (cube-sphere quadtree, tile meshes),
+               forest (tree and understory tiles), etopo / dem / landcover (data readers)
   flypath.rs   arc-length parameterised Catmull-Rom showcase path
 native/
   dlss_shim.cpp  thin C ABI over the NGX Vulkan Ray Reconstruction API
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rgen  globe.rchit  globe.rmiss  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl)
+  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl, atmosphere.glsl)
 ```
 
 ## Limitations
@@ -608,9 +633,10 @@ shaders/
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
-- **Globe:** no trees on the globe yet (land cover only), Copernicus tiles above 50° latitude
-  (narrower tiles) are skipped, the ground colour without land cover data is a latitude stand-in,
-  and the ocean has no waves. Site mode uses the forest scene's lowland species everywhere.
+- **Globe:** one species set everywhere (the Alpine forest's), Copernicus tiles above 50°
+  latitude (narrower tiles) are skipped, the ground colour without land cover data is a latitude
+  stand-in, and the ocean has no waves. Site mode uses the forest scene's lowland species
+  everywhere. Terrain pools take ~1–2 GB of VRAM in a typical view.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 

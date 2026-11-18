@@ -211,6 +211,10 @@ pub struct Profile {
     pub cpu_record: f64,
     pub cpu_wait: f64,
     pub frames: u32,
+    /// globe mode, CPU ms: terrain uploads, tree uploads, tree tile list, terrain select +
+    /// instances, mesh LOD + plant state (sums and worst single frame)
+    pub globe: [f64; 5],
+    pub globe_max: [f64; 5],
 }
 
 impl Profile {
@@ -231,7 +235,15 @@ impl Profile {
             self.cpu_record / n,
             self.cpu_wait / n,
             self.frames
-        )
+        ) + &if self.globe_max.iter().any(|&m| m > 0.0) {
+            let n = self.frames.max(1) as f64;
+            let names = ["terrain upload", "tree upload", "tree tiles", "select+instances", "mesh LOD"];
+            let parts: Vec<String> = (0..5).map(|i| format!("{} {:.2} (max {:.1})", names[i], self.globe[i] / n, self.globe_max[i])).collect();
+            format!("
+globe cpu ms: {}", parts.join(" | "))
+        } else {
+            String::new()
+        }
     }
 }
 
@@ -1977,51 +1989,23 @@ impl Renderer {
         }
         let globals = &g;
         let t_lod = Instant::now();
-        // Globe mode: the instances come from the streamed scene after the fence (below).
+        // Globe mode: the instances come from the streamed scene (below).
         let stats = if self.globe.is_some() { FrameStats::default() } else { self.update_instances(cam, lod, g.lod_params[0])? };
         self.profile.cpu_lod += t_lod.elapsed().as_secs_f64() * 1000.0;
-        let d = self.gpu.device.clone();
-        let t_wait = Instant::now();
-        unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
-        self.profile.cpu_wait += t_wait.elapsed().as_secs_f64() * 1000.0;
-        if self.queries_pending {
-            // Previous frame's GPU timestamps (its fence has signalled).
-            let mut ts = [0u64; 5];
-            if unsafe { d.get_query_pool_results(self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64) }.is_ok() {
-                let ms = self.gpu.timestamp_period as f64 * 1e-6;
-                for k in 0..4 {
-                    self.profile.gpu[k] += ts[k + 1].saturating_sub(ts[k]) as f64 * ms;
-                }
-                self.profile.frames += 1;
-            }
-            self.queries_pending = false;
-        }
-        let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {
-            Ok((i, _)) => i,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.need_resize = true;
-                return Ok((FrameStats::default(), None));
-            }
-            Err(e) => return Err(e.into()),
-        };
-        unsafe { d.reset_fences(&[self.fence])? };
-
-        if let (Some(scene), Some((ecef, rot, mut gg))) = (self.globe.as_mut(), self.globe_view) {
-            // Terrain and tree tiles around the camera, placed in the camera frame every frame.
-            let t0 = Instant::now();
-            scene.update(&self.gpu, ecef)?;
-            let t1 = Instant::now();
+        // Globe mode: the CPU half of streaming (tile choice, worker requests, TLAS instances, mesh
+        // LOD) overlaps the previous frame's GPU work; uploads follow the fence.
+        let mut globe_states = std::collections::HashMap::new();
+        let mut globe_cpu = [0.0f64; 3];
+        if let (Some(scene), Some((ecef, rot, _))) = (self.globe.as_mut(), self.globe_view) {
             self.insts.clear();
-            scene.instances(ecef, rot, &mut self.insts);
-            if std::env::var("SI_TREE_STATS").is_ok() && (self.lod_frame % 60 == 0 || (t1 - t0).as_secs_f64() > 0.005) {
-                println!("globe cpu: update {:.2} ms, instances {:.2} ms", (t1 - t0).as_secs_f64() * 1e3, t1.elapsed().as_secs_f64() * 1e3);
-            }
+            let p = scene.prepare(ecef, rot, &mut self.insts);
             self.lod_frame = self.lod_frame.wrapping_add(1);
             self.inst_data.clear();
             self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
             // Mesh LOD as in the forest scene: trees near the camera get their mesh parts as
             // instances (dissolving against the impostor inside the band).
             let mut states = std::collections::HashMap::new();
+            let t2 = Instant::now();
             if lod > 0.0 {
                 let band = g.lod_params[0];
                 let reach = ((lod + band) * self.max_lod_scale + 4.0) as f64;
@@ -2054,6 +2038,39 @@ impl Renderer {
                     }
                 });
             }
+            globe_cpu = [p[0], p[1], t2.elapsed().as_secs_f64() * 1e3];
+            globe_states = states;
+        }
+        let d = self.gpu.device.clone();
+        let t_wait = Instant::now();
+        unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
+        self.profile.cpu_wait += t_wait.elapsed().as_secs_f64() * 1000.0;
+        if self.queries_pending {
+            // Previous frame's GPU timestamps (its fence has signalled).
+            let mut ts = [0u64; 5];
+            if unsafe { d.get_query_pool_results(self.query_pool, 0, &mut ts, vk::QueryResultFlags::TYPE_64) }.is_ok() {
+                let ms = self.gpu.timestamp_period as f64 * 1e-6;
+                for k in 0..4 {
+                    self.profile.gpu[k] += ts[k + 1].saturating_sub(ts[k]) as f64 * ms;
+                }
+                self.profile.frames += 1;
+            }
+            self.queries_pending = false;
+        }
+        let idx = match unsafe { self.gpu.swapchain_fn.acquire_next_image(self.swap.raw, u64::MAX, self.acquire_sem, vk::Fence::null()) } {
+            Ok((i, _)) => i,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.need_resize = true;
+                return Ok((FrameStats::default(), None));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        unsafe { d.reset_fences(&[self.fence])? };
+
+        if let (Some(scene), Some((_, _, mut gg))) = (self.globe.as_mut(), self.globe_view) {
+            // uploads and BLAS builds of finished tiles (recorded for this frame), tile table
+            let up = scene.update(&self.gpu)?;
+            let states = std::mem::take(&mut globe_states);
             {
                 // per-plant LOD state for impostor.rint (dissolve / skip where the mesh draws)
                 let st: &mut [u32] = bytemuck::cast_slice_mut(scene.plant_state.mapped());
@@ -2068,6 +2085,10 @@ impl Renderer {
             }
             self.globe_states = states;
             self.near_count = self.globe_states.len();
+            for (i, v) in [up[0], up[1], globe_cpu[0], globe_cpu[1], globe_cpu[2]].into_iter().enumerate() {
+                self.profile.globe[i] += v;
+                self.profile.globe_max[i] = self.profile.globe_max[i].max(v);
+            }
             let a = scene.index_addr();
             gg.addr = [a as u32, (a >> 32) as u32, 0, 0];
             gg.params[1] = self.lod_frame as f32;
@@ -2097,6 +2118,10 @@ impl Renderer {
             let qp = self.query_pool;
             d.cmd_reset_query_pool(cb, qp, 0, 5);
             d.cmd_write_timestamp2(cb, vk::PipelineStageFlags2::TOP_OF_PIPE, qp, 0);
+            if let Some(scene) = self.globe.as_mut() {
+                // this frame's streamed tiles: copies and BLAS builds before the TLAS build
+                scene.record(&self.gpu, cb);
+            }
             if self.tlas_dirty {
                 self.tlas.cmd_build(&self.gpu, cb, self.insts.len() as u32);
                 self.tlas_dirty = false;

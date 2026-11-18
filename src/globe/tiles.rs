@@ -36,6 +36,9 @@ impl TileId {
     pub fn root(face: u8) -> Self {
         TileId { face, level: 0, x: 0, y: 0 }
     }
+    pub fn parent(&self) -> Option<TileId> {
+        (self.level > 0).then(|| TileId { face: self.face, level: self.level - 1, x: self.x / 2, y: self.y / 2 })
+    }
     pub fn children(&self) -> [TileId; 4] {
         let (l, x, y) = (self.level + 1, self.x * 2, self.y * 2);
         [

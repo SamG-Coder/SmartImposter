@@ -51,6 +51,48 @@ fn create_accel(gpu: &Gpu, ty: vk::AccelerationStructureTypeKHR, size: u64) -> R
     }
 }
 
+/// An acceleration structure placed in an existing buffer (pooled storage): only the AS object is
+/// created; `offset` must be a multiple of 256.
+pub fn create_accel_in(gpu: &Gpu, buffer: vk::Buffer, offset: u64, size: u64, ty: vk::AccelerationStructureTypeKHR) -> Result<(vk::AccelerationStructureKHR, u64)> {
+    unsafe {
+        let raw = gpu.accel_fn.create_acceleration_structure(
+            &vk::AccelerationStructureCreateInfoKHR::default().buffer(buffer).offset(offset).size(size).ty(ty),
+            None,
+        )?;
+        let addr = gpu
+            .accel_fn
+            .get_acceleration_structure_device_address(&vk::AccelerationStructureDeviceAddressInfoKHR::default().acceleration_structure(raw));
+        Ok((raw, addr))
+    }
+}
+
+/// BLAS build sizes (storage, scratch) for one geometry.
+pub fn blas_sizes(gpu: &Gpu, g: &vk::AccelerationStructureGeometryKHR, count: u32) -> (u64, u64) {
+    let gs = [*g];
+    let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .geometries(&gs);
+    let mut size = vk::AccelerationStructureBuildSizesInfoKHR::default();
+    unsafe { gpu.accel_fn.get_acceleration_structure_build_sizes(vk::AccelerationStructureBuildTypeKHR::DEVICE, &info, &[count], &mut size) };
+    (size.acceleration_structure_size, size.build_scratch_size)
+}
+
+/// Record one BLAS build into `cb` (no waiting): geometry, primitive count, target, scratch address.
+pub fn cmd_build_blas(gpu: &Gpu, cb: vk::CommandBuffer, g: &vk::AccelerationStructureGeometryKHR, count: u32, dst: vk::AccelerationStructureKHR, scratch: u64) {
+    let gs = [*g];
+    let info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+        .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL)
+        .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+        .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+        .dst_acceleration_structure(dst)
+        .geometries(&gs)
+        .scratch_data(vk::DeviceOrHostAddressKHR { device_address: scratch });
+    let range = [vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(count)];
+    unsafe { gpu.accel_fn.cmd_build_acceleration_structures(cb, &[info], &[&range[..]]) };
+}
+
 pub fn destroy_accel(gpu: &Gpu, a: &mut Accel) {
     unsafe { gpu.accel_fn.destroy_acceleration_structure(a.raw, None) };
     gpu.destroy_buffer(&mut a.buf);
