@@ -8,6 +8,7 @@ mod accel;
 mod asset;
 mod catalog;
 mod dlss;
+mod erosion;
 mod flypath;
 mod textures;
 mod gpu;
@@ -47,6 +48,8 @@ struct Args {
     lod2_band: f32,
     spacing: f32,
     radius: f32,
+    /// Aerial perspective strength (1 = clear day, 0 = off).
+    haze: f32,
     dump_atlas: Option<String>,
     validation: bool,
     vsync: bool,
@@ -82,7 +85,8 @@ fn parse_args() -> Args {
         lod_band: 12.0,
         lod2_band: 24.0,
         spacing: 7.0,
-        radius: 1400.0,
+        radius: 8000.0,
+        haze: 1.0,
         dump_atlas: None,
         validation: std::env::var("SI_VALIDATION").is_ok(),
         vsync: false,
@@ -144,7 +148,8 @@ fn parse_args() -> Args {
             "--lod-band" => a.lod_band = next.parse().unwrap_or(12.0),
             "--lod2-band" => a.lod2_band = next.parse().unwrap_or(24.0),
             "--spacing" => a.spacing = next.parse().unwrap_or(7.0),
-            "--radius" => a.radius = next.parse().unwrap_or(1400.0),
+            "--radius" => a.radius = next.parse().unwrap_or(8000.0),
+            "--haze" => a.haze = next.parse().unwrap_or(1.0),
             "--dump-atlas" => a.dump_atlas = Some(next),
             "--bench-move" => a.bench_move = next.parse().unwrap_or(0.3),
             "--fly-speed" => a.fly_speed = next.parse().unwrap_or(13.0),
@@ -244,6 +249,7 @@ struct State {
     cinematic: bool,
     /// Last DLSS mode, restored by L.
     dlss_last: usize,
+    haze: f32,
 }
 
 struct App {
@@ -292,10 +298,11 @@ impl App {
             let hs: Vec<String> = sp.variants.clone().map(|v| format!("{:.1}", cat.variants[v].height)).collect();
             println!("  {:<24} {:?} heights [{}] m", sp.name, sp.kind, hs.join(", "));
         }
+        let (mut pack, mut cat) = (pack, cat);
         let world = if a.gallery {
             world::World::gallery(&pack.trees, &cat)
         } else {
-            world::World::generate(&pack.trees, &cat, 3072.0, 1024, a.spacing, a.radius)
+            world::World::generate(&pack.trees, &cat, a.radius)
         };
         println!("World: {} trees, terrain {} tris ({:.2}s)", world.trees.len(), world.terrain.tri_count(), t.elapsed().as_secs_f32());
 
@@ -354,6 +361,7 @@ impl App {
             base_speed: 10.0,
             cinematic: false,
             dlss_last: a.dlss.unwrap_or(1),
+            haze: a.haze,
         };
         if std::env::var("SI_FOREST_MAP").is_ok() {
             // Coarse tree-count map, 50 m cells over [-700, 700]^2, north (-Z) at the top.
@@ -547,6 +555,7 @@ impl App {
             prev_right: prev[1],
             prev_up: prev[2],
             prev_fwd: prev[3],
+            extra: [s.haze, s.r.world.forest_radius, 0.0, 0.0],
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -658,6 +667,7 @@ impl App {
             KeyCode::KeyC => s.cinematic = !s.cinematic,
             KeyCode::KeyT => s.r.taa_enabled = !s.r.taa_enabled,
             KeyCode::KeyH => s.r.sharpness = if s.r.sharpness >= 0.99 { 0.0 } else { (s.r.sharpness + 0.25).min(1.0) },
+            KeyCode::KeyG => s.haze = if s.haze > 0.0 { 0.0 } else { 1.0 },
             KeyCode::KeyL => {
                 let next = if s.r.dlss_mode().is_some() { None } else { Some(s.dlss_last) };
                 if let Err(e) = s.r.set_dlss(next) {

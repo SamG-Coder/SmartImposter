@@ -255,17 +255,27 @@ pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<(Vec<Ima
 }
 
 /// Ground layers: albedo (sRGB), normal, ORM per layer, in catalog order.
-pub fn load_ground(gpu: &Gpu, ground: &[crate::catalog::GroundMaterial]) -> Result<Vec<Image>> {
+pub fn load_ground(gpu: &Gpu, ground: &[Option<crate::catalog::GroundMaterial>]) -> Result<Vec<Image>> {
     let mut jobs = Vec::new();
     for g in ground {
-        jobs.push(Job { path: Some(g.albedo.clone()), format: vk::Format::R8G8B8A8_SRGB, fill: [0; 4] });
-        jobs.push(Job { path: Some(g.normal.clone()), format: vk::Format::R8G8B8A8_UNORM, fill: [0; 4] });
-        jobs.push(Job { path: Some(g.orm.clone()), format: vk::Format::R8G8B8A8_UNORM, fill: [0; 4] });
+        // Missing layers keep their slots (1x1 placeholders): the shader indexes layers by position.
+        let p = |f: fn(&crate::catalog::GroundMaterial) -> &PathBuf| g.as_ref().map(|g| f(g).clone());
+        jobs.push(Job { path: p(|g| &g.albedo), format: vk::Format::R8G8B8A8_SRGB, fill: [100, 100, 100, 255] });
+        jobs.push(Job { path: p(|g| &g.normal), format: vk::Format::R8G8B8A8_UNORM, fill: [128, 128, 255, 255] });
+        jobs.push(Job { path: p(|g| &g.orm), format: vk::Format::R8G8B8A8_UNORM, fill: [255, 200, 0, 255] });
     }
     if jobs.is_empty() {
         jobs.push(Job { path: None, format: vk::Format::R8G8B8A8_SRGB, fill: [60, 60, 40, 255] });
     } else {
-        println!("Ground layers: {}", ground.iter().map(|g| g.name.as_str()).collect::<Vec<_>>().join(", "));
+        println!(
+            "Ground layers: {}",
+            crate::catalog::GROUND_LAYERS
+                .iter()
+                .zip(ground)
+                .map(|(n, g)| if g.is_some() { n.to_string() } else { format!("({n} missing: procedural)") })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(load_jobs(gpu, &jobs, tex_max())?.0)
 }

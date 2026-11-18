@@ -26,7 +26,7 @@ pub const MAX_SPECIES: usize = 16;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
-pub const MAX_GROUND_TEX: usize = 16;
+pub const MAX_GROUND_TEX: usize = 40;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -45,6 +45,8 @@ pub struct Globals {
     pub prev_right: [f32; 4],
     pub prev_up: [f32; 4],
     pub prev_fwd: [f32; 4],
+    /// x aerial perspective strength (1 = clear day, 0 = off)
+    pub extra: [f32; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -75,7 +77,6 @@ const INST_VARIANT_SHIFT: u32 = 25;
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Lod {
-    Culled, // beyond the variant's draw distance (small plants)
     Impostor,
     Both, // inside the mesh <-> impostor band: both copies in the TLAS, shaders dissolve
     Mesh,
@@ -310,6 +311,26 @@ pub struct Renderer {
     /// Write the first baked atlas as PNGs with this prefix (debugging).
     pub dump_prefix: Option<String>,
     lod_state: Vec<Lod>,
+    /// Plants (world.trees indices) currently in Mesh / Both state.
+    active: Vec<u32>,
+    /// Per plant: last LOD frame it was examined (dedupe of the candidate list).
+    visited: Vec<u32>,
+    lod_frame: u32,
+    /// Spatial grid of the plants for the near-camera LOD query.
+    grid: PlantGrid,
+    max_lod_scale: f32,
+    /// Plant record index (cluster order) of every world.trees entry.
+    rec_of: Vec<u32>,
+    /// Per plant record: object->world and variant/seed (binding 23); LOD state (binding 24).
+    plant_rec: Buffer,
+    plant_state: Buffer,
+    state_writes: Vec<(u32, u32)>,
+    /// Cluster BLASes (one AABB per plant) and their AABB buffer.
+    _cluster_blas: Vec<Accel>,
+    _cluster_aabbs: Buffer,
+    /// TLAS instances that never change: terrain and the plant clusters.
+    static_insts: Vec<vk::AccelerationStructureInstanceKHR>,
+    static_inst_data: Vec<InstInfo>,
     insts: Vec<vk::AccelerationStructureInstanceKHR>,
     inst_data: Vec<InstInfo>,
     inst_info: Buffer,
@@ -489,16 +510,20 @@ impl Renderer {
         let dlss_mode = if dlss_ok { dlss_mode } else { None };
         let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog)?;
         let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground)?;
-        let ground_layers = catalog.ground.len() as u32;
+        // bit per scanned ground layer present (tri.rchit uses procedural stand-ins for the others)
+        let ground_layers = catalog.ground.iter().enumerate().map(|(i, g)| (g.is_some() as u32) << i).sum::<u32>();
         {
             // biome mask in the last ground slot (see World::ground_mask)
             let t = Instant::now();
-            const MASK_RES: usize = 1024;
-            let mask = world.ground_mask(&pack.trees, &catalog, MASK_RES);
-            while ground_tex.len() < MAX_GROUND_TEX - 1 {
+            const MASK_RES: usize = crate::world::COVER_RES;
+            let mask = world.ground_mask(&pack.trees, &catalog);
+            while ground_tex.len() < MAX_GROUND_TEX - 2 {
                 ground_tex.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
             }
-            ground_tex.truncate(MAX_GROUND_TEX - 1);
+            ground_tex.truncate(MAX_GROUND_TEX - 2);
+            const FAR_RES: u32 = 2048;
+            let far = world.far_mask(FAR_RES as usize);
+            ground_tex.push(crate::textures::upload_with_mips(&gpu, FAR_RES, FAR_RES, &far, vk::Format::R8G8B8A8_UNORM, "far ground mask")?);
             let m = MASK_RES as u32;
             ground_tex.push(crate::textures::upload_with_mips(&gpu, m, m, &mask, vk::Format::R8G8B8A8_UNORM, "ground mask")?);
             println!("Ground mask {MASK_RES}^2 in {:.2}s", t.elapsed().as_secs_f32());
@@ -574,6 +599,7 @@ impl Renderer {
             let (lo, hi) = (t.bmin - pad, t.bmax + pad);
             let c = (t.bmin + t.bmax) * 0.5;
             let r = (t.bmax - t.bmin).length() * 0.5;
+            // Forest tiles are seen from > 1 km only: fixed 256 px frames (~0.6 m texels).
             let res = imp.res_for(r / vi.texel_scale, vi.lod_scale);
             let mips = atlas_mips(res);
             imp_infos.push(ImpostorInfo {
@@ -697,6 +723,9 @@ impl Renderer {
             b(19, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
             b(20, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
             b(21, vk::DescriptorType::STORAGE_IMAGE, 1, rt_all),
+            // plant records and per-plant LOD state (impostor clusters)
+            b(23, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            b(24, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -759,7 +788,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR, descriptor_count: 2 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 64 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 4 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
                 descriptor_count: 2 * (4 * nvar + 4 * MAX_SPECIES as u32 + MAX_GROUND_TEX as u32),
@@ -849,7 +878,8 @@ impl Renderer {
                 .unwrap()
         };
 
-        let est = world.trees.len() as u32 + 400_000;
+        let est = 600_000u32;
+        let world_trees_len = world.trees.len();
         let tlas = Tlas::new(&gpu, est)?;
         let inst_info = Self::create_inst_info(&gpu, tlas.capacity)?;
 
@@ -866,7 +896,9 @@ impl Renderer {
         let query_pool = unsafe {
             gpu.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(5), None)?
         };
-        let lod_state = vec![Lod::Culled; world.trees.len()];
+        let lod_state = vec![Lod::Impostor; world.trees.len()];
+        let (clusters, max_lod_scale) = Self::build_clusters(&gpu, &world, &pack, &catalog, blas[pack.meshes.len()].addr)?;
+        let grid = PlantGrid::new(&world);
 
         let mut r = Renderer {
             gpu,
@@ -938,6 +970,19 @@ impl Renderer {
             imp,
             dump_prefix: std::env::var("SI_DUMP_ATLAS").ok(),
             lod_state,
+            active: Vec::new(),
+            visited: vec![0; world_trees_len],
+            lod_frame: 0,
+            grid,
+            max_lod_scale,
+            rec_of: clusters.rec_of,
+            plant_rec: clusters.rec,
+            plant_state: clusters.state,
+            state_writes: Vec::new(),
+            _cluster_blas: clusters.blas,
+            _cluster_aabbs: clusters.aabbs,
+            static_insts: clusters.insts,
+            static_inst_data: clusters.inst_data,
             insts: Vec::new(),
             inst_data: Vec::new(),
             inst_info,
@@ -958,6 +1003,87 @@ impl Renderer {
         r.bake_impostors()?;
         println!("Renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
         Ok(r)
+    }
+
+    /// Group the plants into CLUSTER x CLUSTER m cells, one AABB BLAS per cell with one box per
+    /// plant (its world bounds), and write the plant records in cluster order. The TLAS gets one
+    /// instance per cluster (custom index = first record of the cluster) plus the terrain.
+    fn build_clusters(gpu: &Gpu, world: &World, pack: &TreePack, catalog: &Catalog, terrain_blas: u64) -> Result<(Clusters, f32)> {
+        const CLUSTER: f32 = 192.0;
+        let t0 = Instant::now();
+        let n = world.trees.len();
+        let key = |p: Vec3| (((p.z / CLUSTER).floor() as i32) as i64) << 32 | (((p.x / CLUSTER).floor() as i32) as u32 as i64);
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        order.sort_by_key(|&i| key(world.trees[i as usize].center));
+        let mut rec_of = vec![0u32; n];
+        let mut recs: Vec<PlantRecGpu> = Vec::with_capacity(n);
+        let mut aabbs: Vec<[f32; 6]> = Vec::with_capacity(n);
+        let mut ranges: Vec<(u32, u32)> = Vec::new(); // (first record, count)
+        let mut last_key = None;
+        for (k, &i) in order.iter().enumerate() {
+            let t = &world.trees[i as usize];
+            rec_of[i as usize] = k as u32;
+            let kk = key(t.center);
+            if last_key != Some(kk) {
+                ranges.push((k as u32, 0));
+                last_key = Some(kk);
+            }
+            ranges.last_mut().unwrap().1 += 1;
+            let c = t.xform.matrix3;
+            let o = t.xform.translation;
+            recs.push(PlantRecGpu {
+                rows: [
+                    c.x_axis.x, c.y_axis.x, c.z_axis.x, o.x, //
+                    c.x_axis.y, c.y_axis.y, c.z_axis.y, o.y, //
+                    c.x_axis.z, c.y_axis.z, c.z_axis.z, o.z,
+                ],
+                data: t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8),
+                pad: [0; 3],
+            });
+            let asset = &pack.trees[t.variant as usize];
+            let (lo, hi) = (asset.bmin - Vec3::splat(0.05), asset.bmax + Vec3::splat(0.05));
+            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+            for corner in 0..8 {
+                let v = Vec3::new(
+                    if corner & 1 == 0 { lo.x } else { hi.x },
+                    if corner & 2 == 0 { lo.y } else { hi.y },
+                    if corner & 4 == 0 { lo.z } else { hi.z },
+                );
+                let w = t.xform.transform_point3(v);
+                mn = mn.min(w);
+                mx = mx.max(w);
+            }
+            aabbs.push([mn.x, mn.y, mn.z, mx.x, mx.y, mx.z]);
+        }
+        let aabb_buf = gpu.upload_buffer(
+            bytemuck::cast_slice(&aabbs),
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            "plant aabbs",
+        )?;
+        let geoms: Vec<_> = ranges.iter().map(|&(first, count)| (accel::aabb_geometry(aabb_buf.addr + first as u64 * 24), count)).collect();
+        let blas = accel::build_blases(gpu, &geoms)?;
+        let rec = gpu.upload_buffer(bytemuck::cast_slice(&recs), vk::BufferUsageFlags::STORAGE_BUFFER, "plant records")?;
+        let mut state = gpu.create_buffer((n.max(1) * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "plant state")?;
+        state.mapped().fill(0);
+        let terrain_id = pack.meshes.len();
+        let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+        let mut insts = vec![accel::make_instance(&glam::Affine3A::IDENTITY, terrain_id as u32, 1, 0, mesh_flags, terrain_blas)];
+        let mut inst_data = vec![InstInfo { center: [0.0, -1e9, 0.0], data: 0 }];
+        for (ci, &(first, _)) in ranges.iter().enumerate() {
+            // mask bit 1: impostors; hit record 1: impostor intersection + closest hit
+            insts.push(accel::make_instance(
+                &glam::Affine3A::IDENTITY,
+                first,
+                2,
+                1,
+                vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE,
+                blas[ci].addr,
+            ));
+            inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
+        }
+        let max_ls = catalog.variants.iter().map(|v| v.lod_scale).fold(0.0f32, f32::max);
+        println!("Impostor clusters: {} plants in {} cluster BLASes ({:.2}s)", n, ranges.len(), t0.elapsed().as_secs_f32());
+        Ok((Clusters { rec_of, rec, state, blas, aabbs: aabb_buf, insts, inst_data }, max_ls))
     }
 
     fn create_inst_info(gpu: &Gpu, capacity: u32) -> Result<Buffer> {
@@ -1046,6 +1172,8 @@ impl Renderer {
         let imps = buf(&self.imp_info);
         let inst_info = buf(&self.inst_info);
         let species = buf(&self.species_buf);
+        let plant_rec = buf(&self.plant_rec);
+        let plant_state = buf(&self.plant_state);
         let tex = |list: &[Image], n: usize| -> Vec<vk::DescriptorImageInfo> {
             (0..n)
                 .map(|i| {
@@ -1091,6 +1219,8 @@ impl Renderer {
             w(14, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&normal),
             w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&species),
             w(16, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ground_tex),
+            w(23, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&plant_rec),
+            w(24, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&plant_state),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -1398,109 +1528,102 @@ impl Renderer {
         Ok(())
     }
 
-    /// Per plant: culled, mesh only, impostor only, or both while inside the mesh <-> impostor
-    /// band (the shaders then dissolve between the two copies). LOD distances scale with the
-    /// variant's size (`lod_scale`); small plants also have a draw distance. Rebuilds the TLAS
-    /// only when a plant changes state.
+    /// Every plant is always an impostor primitive of its cluster BLAS (static). Plants near the
+    /// camera additionally get mesh instances: mesh only, or both while inside the mesh <-> impostor
+    /// band (the shaders then dissolve between the two copies). Only plants in grid cells within
+    /// reach of the largest mesh distance are examined; the TLAS (clusters + terrain + near meshes)
+    /// is rebuilt only when a plant changes state.
     fn update_instances(&mut self, cam: Vec3, lod: f32, band: f32) -> Result<FrameStats> {
         let t_begin = Instant::now();
         let mut changed = self.first_update;
         self.first_update = false;
-        let mut near = 0;
-        for (i, t) in self.world.trees.iter().enumerate() {
-            let vi = &self.catalog.variants[t.variant as usize];
-            let ls = vi.lod_scale;
+        self.lod_frame = self.lod_frame.wrapping_add(1);
+        let stamp = self.lod_frame;
+        // Candidates: currently active plants plus every plant in reach.
+        let mut cand: Vec<u32> = std::mem::take(&mut self.active);
+        for &i in &cand {
+            self.visited[i as usize] = stamp;
+        }
+        if lod > 0.0 {
+            let reach = (lod + band) * self.max_lod_scale + 4.0;
+            let g = &self.grid;
+            let to = |v: f32| (((v + g.half) / g.cell).floor() as isize).clamp(0, g.n as isize - 1) as usize;
+            for j in to(cam.z - reach)..=to(cam.z + reach) {
+                for i in to(cam.x - reach)..=to(cam.x + reach) {
+                    for &p in &g.cells[j * g.n + i] {
+                        if self.visited[p as usize] != stamp {
+                            self.visited[p as usize] = stamp;
+                            cand.push(p);
+                        }
+                    }
+                }
+            }
+        }
+        let mut active = Vec::new();
+        for &pi in &cand {
+            let i = pi as usize;
+            let t = &self.world.trees[i];
+            let ls = self.catalog.variants[t.variant as usize].lod_scale;
             // The shader fade is exactly 1 below a and exactly 0 above b, so "mesh only" /
             // "impostor only" are safe there; the hysteresis just keeps "both" a little longer.
             let (a, b) = if lod <= 0.0 { (-1.0, -1.0) } else { ((lod - band * 0.5) * ls, (lod + band * 0.5) * ls) };
             let (h1, h2) = (0.5 * ls, 2.0 * ls);
             let d = t.center.distance(cam);
             let cur = self.lod_state[i];
-            let next = if vi.cull > 0.0 && (d > vi.cull + 3.0 || (cur == Lod::Culled && d > vi.cull)) {
-                Lod::Culled
-            } else {
-                match cur {
-                    Lod::Culled if d < a => Lod::Mesh,
-                    Lod::Culled if d > b => Lod::Impostor,
-                    Lod::Culled => Lod::Both,
-                    Lod::Mesh if d > a - h1 => Lod::Both,
-                    Lod::Impostor if d < b + h1 => Lod::Both,
-                    Lod::Both if d < a - h2 => Lod::Mesh,
-                    Lod::Both if d > b + h2 => Lod::Impostor,
-                    s => s,
-                }
+            let next = match cur {
+                Lod::Mesh if d > a - h1 => Lod::Both,
+                Lod::Impostor if d < b + h1 => Lod::Both,
+                Lod::Both if d < a - h2 => Lod::Mesh,
+                Lod::Both if d > b + h2 => Lod::Impostor,
+                s => s,
             };
             if next != cur {
                 self.lod_state[i] = next;
                 changed = true;
+                let flag = match next {
+                    Lod::Impostor => 0u32,
+                    Lod::Both => 1,
+                    Lod::Mesh => 2,
+                };
+                self.state_writes.push((self.rec_of[i], flag));
             }
-            near += matches!(next, Lod::Mesh | Lod::Both) as usize;
+            if next != Lod::Impostor {
+                active.push(pi);
+            }
         }
-        self.near_count = near;
+        active.sort_unstable();
+        self.near_count = active.len();
+        self.active = active;
         let t_states = Instant::now();
         self.profile.cpu_lod_parts[0] += (t_states - t_begin).as_secs_f64() * 1000.0;
         if changed {
             let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
-            // Band plants: not opaque, so the dissolve any-hit runs (hit record 2).
+            // Band plants and alpha-tested cards: not opaque, so tri.rahit runs (hit record 2).
             let band_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
-            let imp_flags = vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
-            let terrain_id = self.pack.meshes.len();
             self.insts.clear();
             self.inst_data.clear();
-            self.inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0 });
-            // Mask bit 0: meshes and terrain. Bits 1..7: impostors by lattice colour.
-            self.insts.push(accel::make_instance(
-                &glam::Affine3A::IDENTITY,
-                terrain_id as u32,
-                1,
-                0,
-                mesh_flags,
-                self.blas[terrain_id].addr,
-            ));
-            // Instance budget: beyond it, further plants stay impostors (protects VRAM when the
-            // LOD distance is pushed very far in a dense forest).
+            self.insts.extend_from_slice(&self.static_insts);
+            self.inst_data.extend_from_slice(&self.static_inst_data);
             const MAX_INSTANCES: usize = 8_000_000;
-            for (i, t) in self.world.trees.iter().enumerate() {
+            for &pi in &self.active {
+                let i = pi as usize;
+                let t = &self.world.trees[i];
                 let state = self.lod_state[i];
-                if state == Lod::Culled {
-                    continue;
+                let variant = &self.pack.trees[t.variant as usize];
+                if self.insts.len() + variant.parts.len() > MAX_INSTANCES {
+                    break;
                 }
                 let seed = ((t.seed as u32) & 0x1FFF) << 11;
-                let variant = &self.pack.trees[t.variant as usize];
-                // Over budget: this plant is emitted as an impostor only (its LOD state is kept,
-                // so it does not oscillate between states).
-                let state = if state != Lod::Impostor && self.insts.len() + variant.parts.len() > MAX_INSTANCES {
-                    Lod::Impostor
-                } else {
-                    state
-                };
                 let center = t.center.to_array();
-                let tree = (i as u32 & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
-                // Instance masks: bit 0 meshes + terrain, bits 1..6 impostors (lattice colour), bit 7
-                // grass (mesh and impostor), so rays can include or skip grass separately.
-                let grass = self.catalog.variants[t.variant as usize].kind == crate::catalog::Kind::Grass;
-                let (mesh_mask, imp_mask) = if grass { (0x80u8, 0x80u8) } else { (1u8, 2u8 << (t.color % 6)) };
-                if state != Lod::Impostor {
-                    let band = if state == Lod::Both { INST_HAS_MESH } else { 0 }; // tri.rahit: dissolve
-                    for p in &variant.parts {
-                        let alpha = self.catalog.mesh_alpha[p.mesh as usize];
-                        let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
-                        let m = t.xform * p.xform;
-                        self.insts.push(accel::make_instance(&m, p.mesh | seed, mesh_mask, sbt, flags, self.blas[p.mesh as usize].addr));
-                        self.inst_data.push(InstInfo { center, data: tree | band });
-                    }
-                }
-                if state != Lod::Mesh {
-                    self.insts.push(accel::make_instance(
-                        &t.xform,
-                        t.variant as u32 | ((t.color as u32) << 8) | seed,
-                        imp_mask,
-                        1,
-                        imp_flags,
-                        self.imp_blas[t.variant as usize].addr,
-                    ));
-                    let has_mesh = if state == Lod::Both { INST_HAS_MESH } else { 0 };
-                    self.inst_data.push(InstInfo { center, data: tree | has_mesh });
+                let rec = self.rec_of[i];
+                let tree = (rec & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
+                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 }; // tri.rahit: dissolve
+                for p in &variant.parts {
+                    let alpha = self.catalog.mesh_alpha[p.mesh as usize];
+                    let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
+                    let m = t.xform * p.xform;
+                    self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
+                    self.inst_data.push(InstInfo { center, data: tree | band });
                 }
             }
             if self.insts.len() > self.tlas.capacity as usize {
@@ -1529,6 +1652,12 @@ impl Renderer {
         }
         let t = Instant::now();
         self.tlas.write(&self.insts);
+        {
+            let st: &mut [u32] = bytemuck::cast_slice_mut(self.plant_state.mapped());
+            for (k, v) in self.state_writes.drain(..) {
+                st[k as usize] = v;
+            }
+        }
         let bytes: &[u8] = bytemuck::cast_slice(&self.inst_data);
         self.inst_info.mapped()[..bytes.len()].copy_from_slice(bytes);
         self.tlas_dirty = true;
@@ -1746,7 +1875,7 @@ impl Renderer {
             g.lod_params[0] = 0.0; // all impostors: no dissolve band
         }
         g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
-        g.lod_params[3] = self.ground_layers as f32; // scanned ground layers loaded (4 = full set)
+        g.lod_params[3] = self.ground_layers as f32; // bit mask of the scanned ground layers loaded
         g.params[1] = self.has_tex as u32 as f32; // material textures available
         // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
@@ -2031,5 +2160,47 @@ impl Renderer {
             None
         };
         Ok((stats, image))
+    }
+}
+
+/// Per plant record (rt.glsl PlantRec): object->world 3x4 rows, variant | seed << 8.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlantRecGpu {
+    rows: [f32; 12],
+    data: u32,
+    pad: [u32; 3],
+}
+
+struct Clusters {
+    rec_of: Vec<u32>,
+    rec: Buffer,
+    state: Buffer,
+    blas: Vec<Accel>,
+    aabbs: Buffer,
+    insts: Vec<vk::AccelerationStructureInstanceKHR>,
+    inst_data: Vec<InstInfo>,
+}
+
+/// Uniform grid of plant indices for the near-camera LOD query.
+struct PlantGrid {
+    half: f32,
+    cell: f32,
+    n: usize,
+    cells: Vec<Vec<u32>>,
+}
+
+impl PlantGrid {
+    fn new(world: &World) -> Self {
+        let cell = 32.0;
+        let half = world.trees.iter().map(|t| t.center.x.abs().max(t.center.z.abs())).fold(64.0f32, f32::max) + cell;
+        let n = ((2.0 * half / cell).ceil() as usize).max(1);
+        let mut cells = vec![Vec::new(); n * n];
+        for (i, t) in world.trees.iter().enumerate() {
+            let ix = (((t.center.x + half) / cell) as usize).min(n - 1);
+            let iz = (((t.center.z + half) / cell) as usize).min(n - 1);
+            cells[iz * n + ix].push(i as u32);
+        }
+        PlantGrid { half, cell, n, cells }
     }
 }

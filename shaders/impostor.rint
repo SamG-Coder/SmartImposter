@@ -17,7 +17,9 @@ layout(set = 0, binding = 7) uniform sampler2D depthAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 14) uniform sampler2D normalAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 6) uniform sampler2D albedoAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 11) uniform sampler2D visAtlas[MAX_VARIANTS];
-layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
+layout(set = 0, binding = 23, scalar) readonly buffer Plants { PlantRec plants[]; };
+// Per plant LOD state (renderer.rs): 0 impostor, 1 both (dissolve against the mesh), 2 mesh only.
+layout(set = 0, binding = 24, scalar) readonly buffer PlantState { uint plantState[]; };
 
 hitAttributeEXT ImpHit hit;
 
@@ -163,20 +165,27 @@ vec2 pickFrame(Ctx m, vec3 v, float xi) {
 
 void main() {
     // ---- LOD selection for this (pixel, tree): dissolve against the mesh copy, then pick the tier.
-    InstInfo ii = insts[gl_InstanceID];
-    uint tree = ii.data & 0xFFFFFFu;
-    float dTree = distance(g.camPos.xyz, ii.center);
-    uint vid = gl_InstanceCustomIndexEXT & 0xFFu; // atlas slot = plant variant
+    uint tree = gl_InstanceCustomIndexEXT + gl_PrimitiveID; // plant record
+    uint st = plantState[tree];
+    if ((st & 2u) != 0u) return; // the mesh copy draws this plant
+    PlantRec pr = plants[tree];
+    mat3 M = plantMatrix(pr);
+    float s2 = dot(M[0], M[0]); // uniform scale squared
+    mat3 Minv = transpose(M) / s2;
+    vec3 po = plantOrigin(pr);
+    uint vid = plantVariant(pr); // atlas slot = plant variant
     ImpostorInfo info = imps[vid];
+    float dTree = distance(g.camPos.xyz, M * info.centerRadius.xyz + po);
     float sc = info.lodScale; // LOD distances scale with plant size
-    if ((ii.data & 0x1000000u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree / sc)) return; // mesh copy wins
+    if ((st & 1u) != 0u && lodRand(g, tree, 1u) < meshFade(g, dTree / sc)) return; // mesh copy wins
     // Small plants dissolve away over the last 20% of their draw distance (trans.w; 0 = no limit).
     float cull = info.trans.w;
     if (cull > 0.0 && lodRand(g, tree, 3u) >= 1.0 - smoothstep(cull * 0.8, cull, dTree)) return;
     uint tier = 0u; // single atlas per variant (mips serve the far field)
 
-    vec3 o = gl_ObjectRayOriginEXT;
-    vec3 d = gl_ObjectRayDirectionEXT; // not normalised: t stays identical to world-space t
+    // Plant (object) space ray; not normalised, so t stays identical to world-space t.
+    vec3 o = Minv * (gl_WorldRayOriginEXT - po);
+    vec3 d = Minv * gl_WorldRayDirectionEXT;
 
     vec3 inv = 1.0 / d;
     vec3 ta = (info.bmin.xyz - o) * inv, tb = (info.bmax.xyz - o) * inv;
@@ -196,7 +205,7 @@ void main() {
     // Mip selection from the ray footprint at the entry point (ray cone from the camera).
     vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * t0;
     float dist = length(wp - g.camPos.xyz);
-    float worldScale = length(gl_ObjectToWorldEXT[0]);
+    float worldScale = sqrt(s2);
     float texel = 2.0 * m.R * worldScale / m.res;
     float footprint = dist * g.camFwd.w;
     // -0.75 mip bias: sharper than the footprint suggests; the extra aliasing is resolved by TAA.
@@ -206,7 +215,7 @@ void main() {
     // Stochastic coverage: one random threshold per (pixel, frame, tree). Partially covered
     // texels (foliage gaps averaged into mips) are solid with probability = coverage, which
     // reproduces the see-through and light leakage of the real leaves once frames accumulate.
-    uint seed = hash2(gl_LaunchIDEXT.xy) ^ pcg(g.iparams.z * 7919u + uint(gl_InstanceID) * 104729u);
+    uint seed = hash2(gl_LaunchIDEXT.xy) ^ pcg(g.iparams.z * 7919u + tree * 104729u);
     m.thr = mix(0.03, 0.97, rnd(seed));
 
     vec3 dn = normalize(d);

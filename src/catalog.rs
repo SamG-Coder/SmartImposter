@@ -54,8 +54,8 @@ pub struct Catalog {
     pub mesh_species: Vec<u32>,
     /// Meshes whose leaf texture alpha is an opacity mask (cards): alpha-tested in tri.rahit.
     pub mesh_alpha: Vec<bool>,
-    /// Ground layers in shader order: forest floor, mossy grass, uncut grass, dried grass.
-    pub ground: Vec<GroundMaterial>,
+    /// Ground layers in shader order (GROUND_LAYERS); None = not downloaded.
+    pub ground: Vec<Option<GroundMaterial>>,
 }
 
 impl Catalog {
@@ -166,23 +166,42 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
     Ok((pack, cat))
 }
 
+/// Ground layers in shader order (tri.rchit): Fab library folder name prefix of each Megascans
+/// surface (`<Name>-<first 8 hex digits of the Fab listing id>`).
+pub const GROUND_LAYERS: [&str; 12] = [
+    "Forest_Floor",
+    "Mossy_Grass",
+    "Uncut_Grass",
+    "Grass_Dried",
+    "Rock_Cliff-e303637d",       // https://www.fab.com/listings/e303637d-ac85-4b3b-8abd-856191b2e251
+    "Rock_Cliff-22762313",       // https://www.fab.com/listings/22762313-071f-4017-a721-b29c5a2f1a87
+    "Snow_Cliff",                // https://www.fab.com/listings/3e6971d7-95c0-4d0b-a9c0-0430758de77f
+    "Icelandic_Gravel-0524d1d9", // https://www.fab.com/listings/0524d1d9-76e1-4c43-be37-88950c7b878a
+    "Mossy_Rock-26a6b65d",       // https://www.fab.com/listings/26a6b65d-be1f-453e-94fd-183a5986b507
+    "Mossy_Riverbed-ecca0e0f",   // https://www.fab.com/listings/ecca0e0f-0ae5-4f4c-8db0-49537d799253
+    "Pebbles_Round-60ac923a",    // https://www.fab.com/listings/60ac923a-b915-40b0-92af-9748ba20c453
+    "Wet_Grass_Ground-138dc11e", // https://www.fab.com/listings/138dc11e-bdbd-41cd-8c63-6e16846d0b72
+];
+
 /// Ground surfaces from the Fab library cache (Quixel scans exported as glTF with UE textures).
-/// Override the root with SI_GROUND_DIR. Missing layers are skipped (procedural fallback).
-fn find_ground() -> Vec<GroundMaterial> {
-    let root = std::env::var("SI_GROUND_DIR").unwrap_or_else(|_| "D:/EpicVault/VaultCache/FabLibrary".into());
-    let layers = ["Forest_Floor", "Mossy_Grass", "Uncut_Grass", "Grass_Dried"];
+/// Override the root with SI_GROUND_DIR. Missing layers are None (procedural stand-in).
+fn find_ground() -> Vec<Option<GroundMaterial>> {
+    // Fab library cache: SI_GROUND_DIR at run time, else at build time (.cargo/config.toml [env]).
+    let root = std::env::var("SI_GROUND_DIR").unwrap_or_else(|_| option_env!("SI_GROUND_DIR").unwrap_or("assets/ground").into());
     let mut out = Vec::new();
-    for name in layers {
+    for name in GROUND_LAYERS {
         let Some(dir) = std::fs::read_dir(&root).ok().and_then(|rd| {
             rd.filter_map(|e| e.ok()).map(|e| e.path()).find(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(name)))
         }) else {
+            out.push(None);
             continue;
         };
         let mut files = Vec::new();
         collect_pngs(&dir, &mut files, 0);
         let pick = |suffix: &str| files.iter().find(|p| p.to_string_lossy().ends_with(suffix)).cloned();
-        if let (Some(albedo), Some(normal), Some(orm)) = (pick("_B.png"), pick("_N.png"), pick("_ORM.png")) {
-            out.push(GroundMaterial { name: name.to_string(), albedo, normal, orm });
+        match (pick("_B.png"), pick("_N.png"), pick("_ORM.png")) {
+            (Some(albedo), Some(normal), Some(orm)) => out.push(Some(GroundMaterial { name: name.to_string(), albedo, normal, orm })),
+            _ => out.push(None),
         }
     }
     out

@@ -28,6 +28,14 @@ struct ImpHit {
 
 // Custom index layout: low 8 bits mesh/variant id, bits 8..10 impostor mask colour, bits 11..23 seed.
 uint instSeed(uint ci) { return ci >> 11; }
+
+// Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs PlantRec)
+// is at gl_InstanceCustomIndexEXT + gl_PrimitiveID: object->world 3x4 (rows), variant | seed << 8.
+struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; uint pad0; uint pad1; uint pad2; };
+mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xyz)); }
+vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
+uint plantVariant(PlantRec p) { return p.data & 0xFFu; }
+uint plantSeed(PlantRec p) { return (p.data >> 8) & 0x1FFFu; }
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
 struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)

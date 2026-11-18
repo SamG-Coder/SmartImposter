@@ -8,11 +8,15 @@
 #define MAT_TERRAIN 2u
 #define FLAG_IMPOSTOR 256u
 #define FLAG_IMPOSTOR_HI 512u
+#define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
 #define MAX_VARIANTS 128 // atlas slots (one per plant variant)
 #define MAX_SPECIES 16
-#define MAX_GROUND_TEX 16 // 3 per ground layer; the last slot is the biome mask
-#define TERRAIN_SIZE 3072.0
+#define MAX_GROUND_TEX 40 // 3 per ground layer (12 layers); the last two slots are the far / near masks
+// world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
+#define NEAR_HALF 2048.0
+#define TERRAIN_HALF 60000.0
+#define TILE_FAR 18000.0
 
 // ---------------------------------------------------------------- hashing / random
 uint pcg(uint v) {

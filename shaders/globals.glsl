@@ -15,6 +15,7 @@ struct Globals {
     vec4 prevRight;
     vec4 prevUp;
     vec4 prevFwd;
+    vec4 extra;     // x aerial perspective strength (1 = clear day, 0 = off), y grown forest radius (m)
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).
