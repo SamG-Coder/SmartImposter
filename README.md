@@ -472,10 +472,11 @@ license doesn't allow redistribution, so this repository contains no assets. Get
    tools/.venv/Scripts/python tools/grass_to_mtree.py <FabLibrary>/Grass_Clumps-<id> assets/species/Grass_Clumps
    ```
    Options: `--patch 2.6` (patch diameter, m), `--patches 3` (variants), `--density 1.0`.
-5. Ground (optional): add the Fab surfaces **Forest Floor**, **Mossy Grass**, **Uncut Grass** and
-   **Grass Dried** (glTF, 2K). The engine finds them in the Fab library cache
-   (`D:/EpicVault/VaultCache/FabLibrary` by default; set `SI_GROUND_DIR`). Without them the
-   terrain is procedural.
+5. Ground (optional): add the Fab surfaces listed in `catalog.rs` `GROUND_LAYERS` (Forest Floor,
+   Mossy Grass, Uncut Grass, Grass Dried, rock cliffs, snow, gravel, riverbed, pebbles, wet grass;
+   glTF, 2K). The engine finds them in your Fab library cache: set `SI_GROUND_DIR` to it, at run
+   time or at build time in `.cargo/config.toml` (`[env]`). Missing surfaces fall back to
+   procedural stand-ins.
 
 The older single-species route (USD download → `tools/usd_to_mtree.py`, textures via
 `tools/ue_export.py`) still works: with no `assets/species` packs the engine loads
