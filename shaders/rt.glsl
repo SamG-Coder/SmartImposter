@@ -17,6 +17,7 @@ struct HitPayload {
     float sunVis; // baked self-shadowing towards the sun (impostors), 1 for meshes
     uint shadowMask; // instance mask for this hit's shadow rays (impostors exclude themselves)
     vec3 trans;   // leaf transmission colour (translucency map x species tint), 0 for opaque
+    float wdepth; // terrain under water: depth of the water over this point (m), else 0
 };
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.

@@ -81,7 +81,7 @@ impl FlyPath {
     /// World-space camera position at arc length `dist` (wraps around).
     pub fn position(&self, world: &World, dist: f32) -> Vec3 {
         let p = self.raw(self.param_at(dist));
-        Vec3::new(p.x, world.height_at(p.x, p.y) + p.z, p.y)
+        Vec3::new(p.x, world.surface_at(p.x, p.y) + p.z, p.y)
     }
 
     /// Position and smoothed look direction (looking at a point further along the path).

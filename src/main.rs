@@ -34,6 +34,8 @@ struct Args {
     width: u32,
     height: u32,
     shot: Option<String>,
+    /// A real place (`--site lat,lon`): terrain, water and forest from the Earth data.
+    site: Option<[f64; 2]>,
     /// Several cameras in one run (`--views`): x, height above ground, z, yaw, pitch.
     views: Vec<[f32; 7]>, // + optional mesh LOD distance and debug mode (-1 = unchanged)
     frames: u32,
@@ -74,6 +76,7 @@ fn parse_args() -> Args {
         height: 1080,
         shot: None,
         views: Vec::new(),
+        site: None,
         frames: 1,
         cam: None,
         lod: 50.0,
@@ -126,6 +129,12 @@ fn parse_args() -> Args {
                     .collect();
             }
             "--frames" => a.frames = next.parse().unwrap_or(1),
+            "--site" => {
+                let v: Vec<f64> = next.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+                if v.len() == 2 {
+                    a.site = Some([v[0], v[1]]);
+                }
+            }
             "--cam" => {
                 let v = floats(&next);
                 if v.len() == 5 {
@@ -300,6 +309,11 @@ impl App {
             println!("  {:<24} {:?} heights [{}] m", sp.name, sp.kind, hs.join(", "));
         }
         let (mut pack, mut cat) = (pack, cat);
+        if let Some([lat, lon]) = a.site {
+            let terrain = std::sync::Arc::new(globe::dem::Terrain::load(std::path::Path::new("assets/earth"))?);
+            world::set_site(terrain, lat, lon);
+            println!("Site: {lat:.5}, {lon:.5}");
+        }
         let world = if a.gallery {
             world::World::gallery(&pack.trees, &cat)
         } else {
@@ -322,7 +336,7 @@ impl App {
             a.ss,
             a.dlss,
         )?;
-        let start_y = r.world.height_at(0.0, 0.0) + 1.8;
+        let start_y = r.world.surface_at(0.0, 0.0) + 1.8;
         let cam = match a.cam {
             Some(c) => Camera { pos: Vec3::new(c[0], c[1], c[2]), yaw: c[3].to_radians(), pitch: c[4].to_radians(), fov_y: 60f32.to_radians() },
             None => Camera { pos: Vec3::new(0.0, start_y, 0.0), yaw: 0.0, pitch: 0.05, fov_y: 60f32.to_radians() },
@@ -414,7 +428,7 @@ impl App {
         let view = (s.rendered / shot_frames) as usize;
         if !views.is_empty() && s.rendered % shot_frames == 0 && view < views.len() {
             let v = views[view];
-            s.cam.pos = Vec3::new(v[0], s.r.world.height_at(v[0], v[2]) + v[1], v[2]);
+            s.cam.pos = Vec3::new(v[0], s.r.world.surface_at(v[0], v[2]) + v[1], v[2]);
             s.cam.yaw = v[3].to_radians();
             s.cam.pitch = v[4].to_radians();
             s.yaw_target = s.cam.yaw;
@@ -500,7 +514,7 @@ impl App {
                 s.vel = Vec3::ZERO;
             }
             s.cam.pos += s.vel * dt;
-            let ground = s.r.world.height_at(s.cam.pos.x, s.cam.pos.z) + 0.6;
+            let ground = s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z) + 0.6;
             if s.cam.pos.y < ground {
                 s.cam.pos.y = ground;
                 s.vel.y = s.vel.y.max(0.0);
@@ -509,9 +523,9 @@ impl App {
         let (fwd, right, up) = s.cam.basis();
         if self.args.bench_move != 0.0 {
             // Keep the initial height above the terrain while moving (walk / fly benchmarks).
-            let above = s.cam.pos.y - s.r.world.height_at(s.cam.pos.x, s.cam.pos.z);
+            let above = s.cam.pos.y - s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z);
             s.cam.pos += Vec3::new(fwd.x, 0.0, fwd.z).normalize_or_zero() * self.args.bench_move;
-            s.cam.pos.y = s.r.world.height_at(s.cam.pos.x, s.cam.pos.z) + above;
+            s.cam.pos.y = s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z) + above;
         }
 
         let (w, h) = s.r.extent();
@@ -556,7 +570,7 @@ impl App {
             prev_right: prev[1],
             prev_up: prev[2],
             prev_fwd: prev[3],
-            extra: [s.haze, s.r.world.forest_radius, 0.0, 0.0],
+            extra: [s.haze, s.r.world.forest_radius, world::site().map(|s| s.alt_shift()).unwrap_or(0.0), (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() % 3600.0).unwrap_or(0.0)) as f32],
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -713,6 +727,19 @@ impl App {
             KeyCode::Minus => s.exposure /= 1.15,
             KeyCode::Equal => s.exposure *= 1.15,
             KeyCode::F12 => s.capture_next = true,
+            KeyCode::KeyM => {
+                // back to the globe, above this place
+                if let (Some(site), Ok(exe)) = (world::site(), std::env::current_exe()) {
+                    let (lat, lon) = site.lat_lon(s.cam.pos.x, s.cam.pos.z);
+                    let alt = (s.cam.pos.y - s.r.world.surface_at(s.cam.pos.x, s.cam.pos.z)).max(2.0);
+                    let size = s.window.inner_size();
+                    let at = format!("{lat:.6},{lon:.6},{alt:.1},{:.1},{:.1}", s.cam.yaw.to_degrees(), s.cam.pitch.to_degrees());
+                    let _ = std::process::Command::new(exe)
+                        .args(["--globe", "--at", &at, "--size", &format!("{}x{}", size.width, size.height)])
+                        .spawn();
+                    el.exit();
+                }
+            }
             KeyCode::KeyF => {
                 s.fly_on = !s.fly_on;
                 s.vel = Vec3::ZERO;

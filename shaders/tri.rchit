@@ -100,7 +100,8 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     float slope = 1.0 - n.y;
 
     // ---- mountains: true altitude (the terrain carries the Earth's curvature)
-    float alt = p.y + dot(p.xz, p.xz) / (2.0 * 6371000.0);
+    // true altitude, shifted so the zones fit a real place's latitude (world.rs Site::alt_shift)
+    float alt = p.y + dot(p.xz, p.xz) / (2.0 * 6371000.0) - g.extra.z;
     float nR = fbmN(p.xz * 0.004 + 7.0, 3);
     // Altitude zones (world.rs treeline ~1250-1450 m): forest and meadows below, alpine meadow,
     // scree and rock above, snow on the summits. Rock where it is too steep for soil to stay
@@ -322,23 +323,20 @@ void main() {
         vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
         float spread = g.camFwd.w;
         uint layerMask = uint(g.lodParams.w); // scanned ground layers present (bit per layer)
-        // River data from the terrain mesh UVs (world.rs): x = water, y = bank proximity.
+        // Water data from the terrain mesh UVs (world.rs): x = water depth over the bed (m), y = bank
+        // proximity.
         Vec2Ref RV = Vec2Ref(m.uv);
         vec2 riv = RV.v[tri.x] * b.x + RV.v[tri.y] * b.y + RV.v[tri.z] * b.z;
         if ((layerMask & 15u) == 15u && spread > 0.0) groundMaterial(wp, n, gl_HitTEXT * spread, layerMask, riv.y, albedo, ao);
         else albedo = terrainAlbedo(wp, n);
-        if (riv.x > 0.5) {
-            // River surface: dark water body with small static ripples; main.rgen adds the
-            // ray-traced reflection and the sun glint.
-            vec2 q = wp.xz;
-            float e = 0.12;
-            float h0 = 0.02 * vnoise(q * 1.3) + 0.007 * vnoise(q * 4.1 + 3.7);
-            float hx = 0.02 * vnoise((q + vec2(e, 0.0)) * 1.3) + 0.007 * vnoise((q + vec2(e, 0.0)) * 4.1 + 3.7);
-            float hz = 0.02 * vnoise((q + vec2(0.0, e)) * 1.3) + 0.007 * vnoise((q + vec2(0.0, e)) * 4.1 + 3.7);
-            n = normalize(vec3(-(hx - h0) / e, 1.0, -(hz - h0) / e));
-            albedo = vec3(0.016, 0.026, 0.024);
-            ao = 1.0;
-            extraFlags = FLAG_WATER;
+        if (riv.x > 0.01) {
+            // Under water: this is the bed (pebbles / mud from the bank layers, wet and dark);
+            // main.rgen puts the water surface above it (refraction, absorption, flow, foam).
+            albedo *= 0.55;
+            pl.wdepth = riv.x;
+        } else {
+            // wet banks just above the water line
+            albedo *= mix(1.0, 0.62, smoothstep(0.86, 1.0, riv.y));
         }
     } else if (textured) {
         Vec2Ref UV = Vec2Ref(m.uv);

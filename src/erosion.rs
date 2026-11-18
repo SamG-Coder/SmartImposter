@@ -84,6 +84,10 @@ pub struct Erosion {
     seg_grid: Vec<Vec<(u32, u32)>>, // (polyline, segment start index)
     seg_cell: f32,
     seg_n: usize,
+    /// rivers start at this drainage area (m^2)
+    river_area: f32,
+    /// meander the river lines (generated terrain); off for real elevation data
+    meander: bool,
 }
 
 fn uplift_at(x: f32, z: f32) -> f32 {
@@ -176,7 +180,19 @@ impl Erosion {
                 uplift[j * N + i] = uplift_at(i as f32 * cell - half, j as f32 * cell - half);
             }
         }
-        let mut e = Erosion { half, cell, h, area, uplift, rivers: Vec::new(), seg_grid: Vec::new(), seg_cell: 400.0, seg_n: 0 };
+        let mut e = Erosion {
+            half,
+            cell,
+            h,
+            area,
+            uplift,
+            rivers: Vec::new(),
+            seg_grid: Vec::new(),
+            seg_cell: 400.0,
+            seg_n: 0,
+            river_area: RIVER_AREA,
+            meander: true,
+        };
         e.extract_rivers(&parent);
         println!(
             "Erosion terrain: {}x{} cells of {:.0} m, {} river polylines ({:.2}s)",
@@ -188,6 +204,38 @@ impl Erosion {
         );
         e
     }
+
+    /// Drainage of a given heightfield (N x N samples over +-half, row-major, z rows): every cell
+    /// drains to the map edge (priority flood), flow accumulation, and the river network of the
+    /// cells draining more than `river_area` m^2. For real elevation data: the streams follow the
+    /// actual valley bottoms.
+    pub fn from_heights(half: f32, h: Vec<f32>, river_area: f32) -> Self {
+        let t0 = std::time::Instant::now();
+        let cell = 2.0 * half / (N - 1) as f32;
+        let mut filled = h.clone();
+        let mut parent = vec![u32::MAX; N * N];
+        let mut order = Vec::with_capacity(N * N);
+        flood(&mut filled, &mut parent, &mut order);
+        let area = accumulate(&parent, &order, cell * cell);
+        let mut e = Erosion {
+            half,
+            cell,
+            h,
+            area,
+            uplift: vec![0.0; N * N],
+            rivers: Vec::new(),
+            seg_grid: Vec::new(),
+            seg_cell: 200.0,
+            seg_n: 0,
+            river_area,
+            meander: false,
+        };
+        e.extract_rivers(&parent);
+        println!("Drainage: {}x{} cells of {:.0} m, {} streams and rivers ({:.2}s)", N, N, cell, e.rivers.len(), t0.elapsed().as_secs_f32());
+        e
+    }
+
+    pub const GRID: usize = N;
 
     fn simulate(half: f32, cell: f32) -> Vec<f32> {
         let n = N;
@@ -251,7 +299,8 @@ impl Erosion {
     fn extract_rivers(&mut self, parent: &[u32]) {
         let n = N;
         let pos = |i: usize| i as f32 * self.cell - self.half;
-        let is_river = |c: usize| self.area[c] >= RIVER_AREA;
+        let river_area = self.river_area;
+        let is_river = |c: usize| self.area[c] >= river_area;
         // sources: river cells without a river upstream neighbour draining into them
         let mut has_up = vec![false; n * n];
         for c in 0..n * n {
@@ -288,6 +337,7 @@ impl Erosion {
             }
         }
         // smooth (Chaikin x3), meander a little, monotone water level downstream
+        let meander = self.meander;
         for pts in &mut lines {
             for _ in 0..3 {
                 let mut out = vec![pts[0]];
@@ -307,6 +357,9 @@ impl Erosion {
                 *pts = out;
             }
             for k in 1..pts.len() - 1 {
+                if !meander {
+                    break;
+                }
                 let (a, b) = (pts[k - 1], pts[k + 1]);
                 let (dx, dz) = (b.x - a.x, b.z - a.z);
                 let l = (dx * dx + dz * dz).sqrt().max(1e-3);

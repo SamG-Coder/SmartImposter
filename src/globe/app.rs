@@ -3,7 +3,8 @@
 //!
 //! Controls: right mouse (hold) or left click (capture, Esc releases) to look; WASD move;
 //! Space / E up, Q / C down; Shift x5, Ctrl x0.2; wheel = speed. Speed follows the height above
-//! the ground. Arrow keys move the sun. F12 screenshot. 1 / 2 / 0 debug views. -/= exposure.
+//! the ground. Arrow keys move the sun. F12 screenshot. 1 / 2 / 3 / 0 debug views. -/= exposure.
+//! Enter lands: the forest scene of the place below (site mode).
 
 use super::dem::Terrain;
 use super::render::{GlobeGlobals, GlobeRenderer};
@@ -317,6 +318,18 @@ impl App {
             KeyCode::Minus => s.exposure /= 1.15,
             KeyCode::Equal => s.exposure *= 1.15,
             KeyCode::F12 => s.capture_next = true,
+            KeyCode::Enter => {
+                // land: open the forest scene of this place (site mode) and close the globe
+                let (lat, lon) = lat_lon(s.cam.pos);
+                let size = s.window.inner_size();
+                if let Ok(exe) = std::env::current_exe() {
+                    println!("Landing at {lat:.5}, {lon:.5}");
+                    let _ = std::process::Command::new(exe)
+                        .args(["--site", &format!("{lat:.6},{lon:.6}"), "--size", &format!("{}x{}", size.width, size.height)])
+                        .spawn();
+                    el.exit();
+                }
+            }
             KeyCode::KeyP => {
                 let (lat, lon) = lat_lon(s.cam.pos);
                 let alt = s.cam.pos.length() - tiles::ground_radius(&s.etopo, s.cam.pos);

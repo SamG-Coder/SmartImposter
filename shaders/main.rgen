@@ -101,6 +101,7 @@ void main() {
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
+    pl.wdepth = 0.0;
 #ifdef SER
     // Shader Execution Reordering (RTX 40/50): traverse, then regroup the threads by what they
     // hit (ground, textured leaves, impostors, sky) before running the closest-hit / miss shader,
@@ -212,7 +213,10 @@ void main() {
             ao *= 1.0 - occ / float(g.iparams.w);
         }
         bool glossy = (pl.flags & FLAG_GLOSSY) != 0u;
-        bool water = (pl.flags & FLAG_WATER) != 0u;
+        // The hit is the bed under a water surface the ray crossed first (camera above it)?
+        float wd = pl.wdepth;
+        float tSurf = (wd > 0.0 && dir.y < -1e-4) ? (p.y + wd - org.y) / dir.y : -1.0;
+        bool water = tSurf > 0.0 && tSurf < pl.t;
         gbN = nDir;
         gbAlb = alb;
         gbRough = water ? 0.05 : glossy ? (imp ? 0.6 : 0.35) : 1.0;
@@ -223,9 +227,30 @@ void main() {
         col = direct + alb * amb * ao;
 
         if (water && dbg == 0u) {
-            // Water: Fresnel mix of the dark water body and a ray-traced reflection (sky, trees,
-            // hills; lit by the sun with a traced shadow and the haze over the reflected path),
-            // plus a sharp sun glint.
+            // Water surface over the bed (Unreal-style river shading): refraction of the lit bed
+            // with depth absorption (Beer-Lambert) and in-scattering, flowing ripples, foam where
+            // it is shallow, a ray-traced reflection by Fresnel, and the sun glint.
+            vec3 ps = org + dir * tSurf;
+            float under = pl.t - tSurf;                // view path through the water
+            float sunPath = wd / max(L.y, 0.08);       // sunlight down to the bed
+            const vec3 SIGMA = vec3(0.42, 0.10, 0.075); // clear, slightly green water (1/m)
+            vec3 Tv = exp(-SIGMA * under);
+            vec3 Ts = exp(-SIGMA * sunPath);
+            vec3 inscat = vec3(0.012, 0.035, 0.032) * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
+            vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
+            // flowing ripples: two octaves drifting at different speeds and directions
+            float tm = g.extra.w;
+            vec2 q = ps.xz;
+            float e = 0.08;
+            #define RIPPLE(Q) (0.022 * vnoise((Q) * 1.1 + vec2(0.55, 0.2) * tm) + 0.009 * vnoise((Q) * 3.3 - vec2(0.3, 0.75) * tm) + 0.004 * vnoise((Q) * 8.0 + vec2(0.9, 0.4) * tm))
+            float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
+            n = normalize(vec3(-(hx - h0) / e, 1.0, -(hz - h0) / e));
+            nDir = n;
+            // foam and white water where it is shallow at the shore
+            float foam = smoothstep(0.14, 0.02, wd) * smoothstep(0.35, 0.75, vnoise(q * 2.2 + vec2(0.4, 0.3) * tm) * 0.6 + vnoise(q * 7.0) * 0.4);
+            p = ps;
+            pl.t = tSurf;
+            col = refr;
             float tHit = pl.t;
             vec3 R = reflect(dir, n);
             R = normalize(vec3(R.x, max(R.y, 0.01), R.z));
@@ -255,6 +280,11 @@ void main() {
             vec3 H = normalize(L - dir);
             float glint = pow(max(dot(n, H), 0.0), 900.0) * 120.0;
             col = mix(col, refl, F) + E * glint * F * sh;
+            vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
+            col = mix(col, foamCol, foam * 0.7);
+            gbN = n;
+            gbAlb = mix(vec3(0.02, 0.04, 0.04), vec3(0.75), foam);
+            gbRough = 0.05;
             gbSpec = F;
             pl.t = tHit;
         }

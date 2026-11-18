@@ -43,6 +43,8 @@ pub struct World {
     heights: Vec<f32>,
     /// Per vertex: in the river channel (0..1) and proximity to the water (0..1).
     water: Vec<f32>,
+    /// Per vertex: water depth over the bed (m).
+    depth: Vec<f32>,
     bank: Vec<f32>,
     /// Canopy cover of the simulated trees, COVER_RES^2 over +-NEAR_HALF (0 for the gallery).
     cover: Vec<f32>,
@@ -145,14 +147,141 @@ fn land() -> &'static Land {
     })
 }
 
+// --------------------------------------------------------------------------- real places
+
+/// A real place on Earth (`--site lat,lon`): the world is the local tangent plane there (x east,
+/// -z north, y up, with the Earth's curvature), heights from Copernicus GLO-30 / ETOPO and lakes,
+/// rivers and forest from ESA WorldCover (globe/dem.rs, globe/landcover.rs) instead of the
+/// erosion simulation.
+pub struct Site {
+    terrain: std::sync::Arc<crate::globe::dem::Terrain>,
+    pub lat: f64,
+    pub lon: f64,
+    up: glam::DVec3,
+    east: glam::DVec3,
+    north: glam::DVec3,
+    /// streams and rivers from the real heights (30 m grid over +-15 km)
+    drainage: Option<Erosion>,
+}
+
+static SITE: OnceLock<Site> = OnceLock::new();
+
+pub fn set_site(terrain: std::sync::Arc<crate::globe::dem::Terrain>, lat: f64, lon: f64) {
+    let up = crate::globe::tiles::dir_from_lat_lon(lat, lon);
+    let east = glam::DVec3::Z.cross(up).normalize();
+    let north = up.cross(east);
+    let mut s = Site { terrain, lat, lon, up, east, north, drainage: None };
+    // drainage of the real terrain around the site: the small streams the land cover map misses
+    let half = 15_360.0;
+    let n = Erosion::GRID;
+    let cell = 2.0 * half / (n - 1) as f32;
+    let mut h = vec![0f32; n * n];
+    par_rows(n, n, &mut h, |j, row| {
+        for (i, v) in row.iter_mut().enumerate() {
+            let (_, la, lo) = s.geo(i as f32 * cell - half, j as f32 * cell - half);
+            *v = s.terrain.height(la, lo).max(0.0);
+        }
+    });
+    s.drainage = Some(Erosion::from_heights(half, h, 3.0e6));
+    let _ = SITE.set(s);
+}
+
+pub fn site() -> Option<&'static Site> {
+    SITE.get()
+}
+
+impl Site {
+    /// Direction from the Earth's centre under local (x, z), and its latitude / longitude.
+    fn geo(&self, x: f32, z: f32) -> (glam::DVec3, f64, f64) {
+        let d = (self.up * EARTH_RADIUS as f64 + self.east * x as f64 - self.north * z as f64).normalize();
+        let (lat, lon) = crate::globe::tiles::lat_lon(d);
+        (d, lat, lon)
+    }
+
+    /// Latitude / longitude under local (x, z).
+    pub fn lat_lon(&self, x: f32, z: f32) -> (f64, f64) {
+        let (_, lat, lon) = self.geo(x, z);
+        (lat, lon)
+    }
+
+    /// Water fraction (0..1) from the 20 m land cover, bilinear so shores are smooth.
+    fn water(&self, lat: f64, lon: f64) -> f32 {
+        let c = &self.terrain.cover;
+        let step = 1.0 / 6000.0; // 20 m cells (landcover.rs)
+        let (fy, fx) = (lat / step - 0.5, lon / step - 0.5);
+        let (y0, x0) = (fy.floor(), fx.floor());
+        let (ty, tx) = ((fy - y0) as f32, (fx - x0) as f32);
+        let at = |dy: f64, dx: f64| (c.class((y0 + dy + 0.5) * step, (x0 + dx + 0.5) * step) == 80) as u32 as f32;
+        let a = at(0.0, 0.0) + (at(0.0, 1.0) - at(0.0, 0.0)) * tx;
+        let b = at(1.0, 0.0) + (at(1.0, 1.0) - at(1.0, 0.0)) * tx;
+        a + (b - a) * ty
+    }
+
+    /// Bed height (local y, with the curvature), water fraction, bank proximity and water depth.
+    fn sample(&self, x: f32, z: f32) -> (f32, f32, f32, f32) {
+        let (d, lat, lon) = self.geo(x, z);
+        let h = self.terrain.height(lat, lon).max(0.0) as f64;
+        let y = (EARTH_RADIUS as f64 + h) * d.dot(self.up) - EARTH_RADIUS as f64;
+        let water = self.water(lat, lon);
+        // bank: water within ~50 m
+        let mut bank = water;
+        let m = 1.0 / 111_320.0;
+        for (k, r) in [(0.6f32, 25.0), (0.3, 55.0)] {
+            for (a, b) in [(1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+                bank = bank.max(k * self.water(lat + a * r * m, lon + b * r * m / lat.to_radians().cos()));
+            }
+        }
+        // lakes (the DEM holds their flat surface): a bed shelving down from the shore
+        let y = y as f32;
+        let lake_depth = (0.25 + 5.0 * smoothstep(0.5, 1.0, water)) * smoothstep(0.02, 0.5, water);
+        let (mut y, mut water, mut bank, mut depth) = (y - lake_depth, water, bank, lake_depth);
+        if let Some((dist, w, level, _)) = self.drainage.as_ref().and_then(|e| e.river(x, z)) {
+            // a channel cut into the real valley floor along the drainage line: banks down to the
+            // water surface, the bed below it
+            let curv = (x * x + z * z) / (2.0 * EARTH_RADIUS);
+            let surf = (level - curv).min(y + depth) - 0.35;
+            let top = surf + (y - surf) * smoothstep(w - 1.0, w + 4.0, dist);
+            let bed = top - (0.35 + 0.05 * w).min(2.5) * (1.0 - (dist / w).powi(2)).max(0.0);
+            if bed < y {
+                depth = depth.max(surf - bed);
+                y = bed;
+            } else {
+                y = top.min(y);
+            }
+            water = water.max(1.0 - smoothstep(w - 1.5, w + 0.5, dist));
+            bank = bank.max((1.0 - smoothstep(w, w + 12.0 + 1.5 * w, dist)) * 0.9);
+        }
+        (y, water, bank, depth.max(0.0))
+    }
+
+    /// Tree cover fraction (0..1) over ~60 m around the point.
+    fn tree_cover(&self, x: f32, z: f32) -> f32 {
+        let (_, lat, lon) = self.geo(x, z);
+        self.terrain.cover.fractions(lat, lon, 60.0).map(|f| f[crate::globe::landcover::TREE]).unwrap_or(0.0)
+    }
+
+    /// Mountain zone shift (m): the forest scene's altitude zones (treeline ~1350 m, snow ~1700 m)
+    /// are set for the generated landscape; real ranges at lower latitudes sit higher.
+    pub fn alt_shift(&self) -> f32 {
+        (900.0 - 60.0 * (self.lat.abs() as f32 - 46.0)).clamp(0.0, 1800.0)
+    }
+}
+
 /// Mountain-ness (0..1) from the tectonic uplift field.
 fn mountain_n(x: f32, z: f32) -> f32 {
+    if let Some(s) = site() {
+        let (_, lat, lon) = s.geo(x, z);
+        return smoothstep(1800.0, 2800.0, s.terrain.height(lat, lon));
+    }
     let l = land();
     smoothstep(0.35, 1.1, l.e.uplift(x + l.sx, z + l.sz))
 }
 
 /// Topographic wetness (0..1) from the simulated drainage: valley bottoms wet, ridges dry.
 fn twi(x: f32, z: f32) -> f32 {
+    if site().is_some() {
+        return 0.3;
+    }
     let l = land();
     l.e.wetness(x + l.sx, z + l.sz)
 }
@@ -160,7 +289,7 @@ fn twi(x: f32, z: f32) -> f32 {
 /// Raw terrain height, water (0..1) and bank proximity (0..1). The eroded heightfield (bicubic),
 /// small-scale relief the 141 m simulation grid cannot hold, and the river channels carved along
 /// the drainage network: flat floodplains, banks, and a water surface that only falls downstream.
-fn raw_sample(l: &Land, x: f32, z: f32) -> (f32, f32, f32) {
+fn raw_sample(l: &Land, x: f32, z: f32) -> (f32, f32, f32, f32) {
     let (sx, sz) = (x + l.sx, z + l.sz);
     let e = &l.e;
     let mtn = smoothstep(0.35, 1.1, e.uplift(sx, sz));
@@ -171,7 +300,7 @@ fn raw_sample(l: &Land, x: f32, z: f32) -> (f32, f32, f32) {
         + (0.35 + 0.5 * mtn) * fbm(sx / 11.0, sz / 11.0, 2, 33)
         + mtn * 80.0 * (ridged(sx / 1500.0, sz / 1500.0, 5, 67) - 0.45);
     let mut h = e.height(sx, sz) + detail;
-    let (mut water, mut bank) = (0.0, 0.0);
+    let (mut water, mut bank, mut depth) = (0.0, 0.0, 0.0f32);
     if let Some((d, w, level, area)) = e.river(sx, sz) {
         // floodplain: wider for larger rivers, narrow in the mountains (gorges)
         let fw = (w * 4.0 + 25.0 + 4.0 * (area / 1.0e6).sqrt()).min(450.0) * (1.0 - 0.6 * mtn);
@@ -179,21 +308,28 @@ fn raw_sample(l: &Land, x: f32, z: f32) -> (f32, f32, f32) {
         h = floor_h + (h - floor_h) * smoothstep(w, w + fw, d);
         let surf = level - 0.3;
         h = surf + (h - surf) * smoothstep(w - 1.0, w + 5.0, d);
+        // the riverbed below the surface: deeper in the middle, deeper for bigger rivers
+        let bed = h - (0.35 + 0.05 * w).min(2.5) * (1.0 - (d / w).powi(2)).max(0.0);
+        depth = (surf - bed).max(0.0) * (d < w + 1.0) as u32 as f32;
+        h = bed;
         water = 1.0 - smoothstep(w - 1.5, w + 0.5, d);
         bank = (1.0 - smoothstep(w, w + 20.0 + 1.5 * w, d)) * (0.85 + 0.15 * smoothstep(4.0, 12.0, w));
     }
-    (h, water, bank)
+    (h, water, bank, depth)
 }
 
-/// Terrain height (with the start clearing's reduced relief and the Earth's curvature), water and
-/// bank proximity.
-pub fn terrain_sample(x: f32, z: f32) -> (f32, f32, f32) {
+/// Terrain (bed) height (with the start clearing's reduced relief and the Earth's curvature),
+/// water fraction, bank proximity and water depth over the bed.
+pub fn terrain_sample(x: f32, z: f32) -> (f32, f32, f32, f32) {
+    if let Some(s) = site() {
+        return s.sample(x, z);
+    }
     let l = land();
     let r2 = x * x + z * z;
     // The start clearing keeps a third of the local relief (around the height at the origin).
     let f = 0.35 + 0.65 * smoothstep(0.0, 250.0, r2.sqrt());
-    let (h, water, bank) = raw_sample(l, x, z);
-    (l.h0 + (h - l.h0) * f - r2 / (2.0 * EARTH_RADIUS), water, bank)
+    let (h, water, bank, depth) = raw_sample(l, x, z);
+    (l.h0 + (h - l.h0) * f - r2 / (2.0 * EARTH_RADIUS), water, bank, depth)
 }
 
 
@@ -231,6 +367,11 @@ impl World {
     pub fn forest_density(&self, x: f32, z: f32) -> f32 {
         let r2 = x * x + z * z;
         let clearing = ((r2.sqrt() - 24.0) / 10.0).clamp(0.0, 1.0);
+        if let Some(s) = site() {
+            // the forest stands where the satellite map says it does
+            let (water, _) = self.river_at(x, z);
+            return clearing * (1.0 - water) * s.tree_cover(x, z);
+        }
         let e = 20.0;
         let h = self.height_at(x, z);
         let gx = (self.height_at(x + e, z) - h) / e;
@@ -822,7 +963,7 @@ impl World {
         let xs: Vec<f32> = (0..=256).map(|i| i as f32 * 12.0 - 1536.0).collect();
         let heights = vec![0.0; xs.len() * xs.len()];
         let terrain = Self::mesh(&xs, &heights, &[], &[]);
-        World { terrain, trees: Vec::new(), xs, heights, water: Vec::new(), bank: Vec::new(), cover: Vec::new(), forest_radius: 0.0 }
+        World { terrain, trees: Vec::new(), xs, heights, water: Vec::new(), bank: Vec::new(), depth: Vec::new(), cover: Vec::new(), forest_radius: 0.0 }
     }
 
     fn build_terrain() -> Self {
@@ -842,7 +983,7 @@ impl World {
         let mut xs: Vec<f32> = half.iter().skip(1).rev().map(|v| -v).collect();
         xs.extend_from_slice(&half);
         let n = xs.len();
-        let mut samples = vec![(0.0f32, 0.0f32, 0.0f32); n * n];
+        let mut samples = vec![(0.0f32, 0.0f32, 0.0f32, 0.0f32); n * n];
         par_rows(n, n, &mut samples, |j, row| {
             for (i, s) in row.iter_mut().enumerate() {
                 *s = terrain_sample(xs[i], xs[j]);
@@ -851,8 +992,9 @@ impl World {
         let heights: Vec<f32> = samples.iter().map(|s| s.0).collect();
         let water: Vec<f32> = samples.iter().map(|s| s.1).collect();
         let bank: Vec<f32> = samples.iter().map(|s| s.2).collect();
-        let terrain = Self::mesh(&xs, &heights, &water, &bank);
-        World { terrain, trees: Vec::new(), xs, heights, water, bank, cover: Vec::new(), forest_radius: 0.0 }
+        let depth: Vec<f32> = samples.iter().map(|s| s.3).collect();
+        let terrain = Self::mesh(&xs, &heights, &depth, &bank);
+        World { terrain, trees: Vec::new(), xs, heights, water, bank, depth, cover: Vec::new(), forest_radius: 0.0 }
     }
 
     fn mesh(xs: &[f32], heights: &[f32], water: &[f32], bank: &[f32]) -> MeshData {
@@ -887,7 +1029,8 @@ impl World {
         }
         let tri_count = indices.len() / 3;
         let materials = vec![MAT_TERRAIN; (tri_count + 3) / 4 * 4];
-        // UV channel carries the river data to the terrain shader: u = water, v = bank proximity.
+        // UV channel carries the water data to the terrain shader: u = water depth over the bed
+        // (m), v = bank proximity.
         let mut uvs = vec![0.0; n * n * 2];
         if !water.is_empty() {
             for k in 0..n * n {
@@ -991,6 +1134,16 @@ impl World {
             }
         });
         px
+    }
+
+    /// Height of the ground or, over water, of the water surface (for the camera).
+    pub fn surface_at(&self, x: f32, z: f32) -> f32 {
+        let h = self.height_at(x, z);
+        if self.depth.is_empty() {
+            h
+        } else {
+            h + self.interp(&self.depth, x, z)
+        }
     }
 
     /// Height of the triangulated terrain surface (matches the mesh exactly).
