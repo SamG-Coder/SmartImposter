@@ -11,7 +11,9 @@
 //! key 46.00,9.27,250,190,-6
 //! ```
 //!
-//! `shot <seconds> <local solar hour> [cover=<cloud cover>] [date=<UTC date>] | title | caption`,
+//! `shot <seconds> <local solar hour> [cover=<cloud cover>] [date=<UTC date>] [ev=<stops>] | title | caption`,
+//! (`ev`: exposure compensation in stops, e.g. +1.5 under a forest canopy, as a camera operator
+//! would open up for the shade),
 //! then two or more `key lat,lon,height above ground (m),heading (deg),pitch (deg)` lines (one key
 //! holds the camera still). Keys are spread evenly over the shot; the flight eases in and out.
 
@@ -37,6 +39,8 @@ pub struct Shot {
     pub hour: f64,
     pub date: String,
     pub cover: Option<f32>,
+    /// exposure compensation (stops)
+    pub ev: f32,
     pub keys: Vec<Key>,
 }
 
@@ -70,12 +74,14 @@ pub fn load(path: &str) -> Result<Vec<Shot>> {
                 hour: words[1].parse().with_context(err)?,
                 date: "2026-06-21".into(),
                 cover: None,
+                ev: 0.0,
                 keys: Vec::new(),
             };
             for w in &words[2..] {
                 match w.split_once('=') {
                     Some(("cover", v)) => shot.cover = Some(v.parse().with_context(err)?),
                     Some(("date", v)) => shot.date = v.to_string(),
+                    Some(("ev", v)) => shot.ev = v.trim_start_matches('+').parse().with_context(err)?,
                     _ => bail!("{}: unknown option {w}", err()),
                 }
             }

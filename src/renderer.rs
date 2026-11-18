@@ -783,7 +783,7 @@ impl Renderer {
                 k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
             });
             let key = mesh_key.u64(res as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
-            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name), base, full: None, loading: false, wanted: 0 };
+            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name, key), base, full: None, loading: false, wanted: 0 };
             atlas_bytes += full.full_bytes();
             raw_bytes += (size as u64 * size as u64 * 16) * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
             atlases.push(full);
@@ -1730,6 +1730,7 @@ impl Renderer {
     /// Every variant's base atlas from the cache; outside the globe (one small forest, every
     /// variant in view) the full atlases too.
     fn load_base_atlases(&mut self, t_all: Instant) -> Result<()> {
+        crate::atlas::prune(&self.atlases.iter().map(|a| a.path.clone()).collect::<Vec<_>>());
         let mut bytes = 0u64;
         for v in 0..self.atlases.len() {
             let a = &self.atlases[v];

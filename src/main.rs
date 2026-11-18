@@ -651,6 +651,7 @@ impl App {
                         if let Some(c) = shot.cover {
                             self.args.cloud_cover = c;
                         }
+                        s.exposure = 2.2 * 2f32.powf(shot.ev);
                         tour_reset = true;
                         println!("tour: loading shot {} '{}' ({:.0} s)", tr.idx + 1, shot.title, s.clock);
                     }

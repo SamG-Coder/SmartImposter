@@ -63,9 +63,23 @@ pub fn stream_bytes(grid: u32, res: u32, mips: u32) -> u64 {
     layout(grid, res, mips).iter().map(|r| r.bytes).sum()
 }
 
-pub fn path_for(name: &str) -> PathBuf {
+/// The cache file of a bake: its name and key (variants may share a name; a changed bake gets a
+/// new file, see `prune`).
+pub fn path_for(name: &str, key: u64) -> PathBuf {
     let clean: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
-    Path::new(DIR).join(format!("{clean}.bc"))
+    Path::new(DIR).join(format!("{clean}-{key:016x}.bc"))
+}
+
+/// Remove cache files no current bake uses (older keys, the old name-only files).
+pub fn prune(keep: &[PathBuf]) {
+    let keep: std::collections::HashSet<&Path> = keep.iter().map(|p| p.as_path()).collect();
+    let Ok(dir) = std::fs::read_dir(DIR) else { return };
+    for e in dir.flatten() {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "bc") && !keep.contains(p.as_path()) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// FNV-1a over everything that changes a bake.
