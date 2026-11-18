@@ -242,7 +242,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[1] *= keep; w[2] *= keep; w[3] *= keep;
     // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
     // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
-    float bareFlat = w[7] + built * 0.45 * dryLand; // dry towns: on the local soil
+    float bareFlat = w[7];
     // bare ground at sea level is a beach: sand, whatever the biome
     if (sea && bed == 0.0) { w[12] += bareFlat * 0.85; w[7] = bareFlat * 0.15; bareFlat = 0.0; }
     w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
@@ -318,6 +318,8 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
             }
             c *= GAIN[l];
             if (l == 7) c = mix(c, vec3(dot(c, vec3(0.33))), 0.7) * 1.1; // grey the reddish gravel scan
+            // the arid soil scan is a saturated brick red: dusty red-brown earth instead
+            if (l == 14) c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))) * vec3(1.25, 0.95, 0.7), 0.55) * 0.85;
         }
         alb += c * wk;
         nxy += nn * wk;
@@ -509,5 +511,6 @@ void main() {
         if (dot(cross(up, pl.wtan), Tv) < 0.0) pl.wtan *= 2.0;
         pl.trans = vec3(uvm, sd);
         pl.wlevel = max(-above, 0.0);
+        pl.wfloor = max(-elevAt(elevUV(upE), 0.0), 0.0);
     }
 }

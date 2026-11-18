@@ -74,6 +74,9 @@ struct Args {
     ss: f32,
     fullscreen: bool,
     no_taa: bool,
+    /// globe: volumetric clouds (`--clouds on|off`, key U) and their cover (`--cloud-cover 0..1`)
+    clouds: bool,
+    cloud_cover: f32,
     /// globe: thin distant trees smoothly with distance (no density step at tree tile edges,
     /// ~0.3-0.5 ms) instead of one density per tile (`--tree-thinning smooth|stepped`, key N)
     smooth_thin: bool,
@@ -120,6 +123,8 @@ fn parse_args() -> Args {
         fullscreen: false,
         no_taa: false,
         smooth_thin: true,
+        clouds: true,
+        cloud_cover: 0.45,
         dlss: Some(1),
         sharpen: 0.5,
     };
@@ -215,6 +220,8 @@ fn parse_args() -> Args {
                 i -= 1;
             }
             "--tree-thinning" => a.smooth_thin = next != "stepped",
+            "--clouds" => a.clouds = next != "off",
+            "--cloud-cover" => a.cloud_cover = next.parse().unwrap_or(0.45),
             "--fullscreen" => {
                 a.fullscreen = true;
                 i -= 1;
@@ -272,6 +279,7 @@ struct State {
     sun_el: f32,
     exposure: f32,
     smooth_thin: bool,
+    clouds: bool,
     fps_time: Instant,
     fps_frames: u32,
     shot_counter: u32,
@@ -440,6 +448,7 @@ impl App {
             sun_el: a.sun[1],
             exposure: 2.2,
             smooth_thin: a.smooth_thin,
+            clouds: a.clouds,
             fps_time: Instant::now(),
             fps_frames: 0,
             shot_counter: 0,
@@ -677,11 +686,16 @@ impl App {
         s.prev_cam = Some(cam_now);
         let mut sun = sun;
         let mut planet = [0.0f32; 4];
+        let mut earth = [[0.0f32; 4]; 3];
         let (mut sun_w, mut moon, mut sun_true) = (4.6f32, [0.0f32; 4], [0.0f32, 0.0, 0.0, 1.0]);
         if let Some(geo) = s.geo.as_mut() {
             // globe: previous camera and the sun in this frame's coordinates, planet centre
             let rot = geo.frame;
             let rt = rot.transpose();
+            for (k, row) in earth.iter_mut().enumerate() {
+                let r = rt.row(k);
+                *row = [r.x as f32, r.y as f32, r.z as f32, 0.0];
+            }
             let now_e = [geo.ecef, rt * right.as_dvec3(), rt * up.as_dvec3(), rt * fwd.as_dvec3()];
             let p = geo.prev.unwrap_or(now_e);
             let v = |d: DVec3| (rot * d).as_vec3();
@@ -725,8 +739,7 @@ impl App {
             cam_up: cam_now[2],
             cam_fwd: cam_now[3],
             sun_dir: [sun.x, sun.y, sun.z, sun_w],
-            // y: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
-            params: [now.elapsed().as_secs_f32(), if s.smooth_thin { 1.0 } else { 0.0 }, s.exposure, 4.0],
+            params: [now.elapsed().as_secs_f32(), 0.0, s.exposure, 4.0],
             iparams: [s.accum, s.debug, s.frame, s.ao_rays],
             lod_params: [self.args.lod_band, s.lod2, self.args.lod2_band, 0.0],
             prev_pos: prev[0],
@@ -737,6 +750,10 @@ impl App {
             planet,
             moon,
             sun_true,
+            earth,
+            // z: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
+            ocean: [[0.0; 4]; 3],
+            cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, 0.0],
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -885,6 +902,10 @@ impl App {
             }
             KeyCode::KeyC => s.cinematic = !s.cinematic,
             KeyCode::KeyT => s.r.taa_enabled = !s.r.taa_enabled,
+            KeyCode::KeyU => {
+                s.clouds = !s.clouds;
+                println!("clouds: {}", if s.clouds { "on" } else { "off" });
+            }
             KeyCode::KeyN => {
                 s.smooth_thin = !s.smooth_thin;
                 println!("tree thinning: {}", if s.smooth_thin { "smooth" } else { "stepped (per tile)" });

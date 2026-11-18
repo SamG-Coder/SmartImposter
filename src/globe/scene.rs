@@ -166,10 +166,92 @@ impl AsHeap {
 /// GPU work recorded into the frame's command buffer (renderer.rs, before the TLAS build).
 enum Op {
     Copy { src: u64, dst: vk::Buffer, dst_off: u64, size: u64 },
+    /// the ocean wave textures (all mips of one image) from staging
+    Image { src: u64, img: vk::Image },
     Terrain { vtx: u64, dst: vk::AccelerationStructureKHR, scratch: u64 },
     Trees { aabbs: u64, count: u32, dst: vk::AccelerationStructureKHR, scratch: u64 },
     /// copy a BLAS built in an earlier frame to its compacted size
     Compact { src: vk::AccelerationStructureKHR, dst: vk::AccelerationStructureKHR },
+}
+
+/// The ocean wave textures (ocean.rs: A and B per cascade), RGBA16F with mips, ready to sample.
+fn ocean_images(gpu: &Gpu) -> Result<Vec<Image>> {
+    use super::ocean::{CASCADES, MIPS, N};
+    let mut v = Vec::new();
+    for k in 0..CASCADES * 2 {
+        v.push(gpu.create_image(N as u32, N as u32, MIPS as u32, vk::Format::R16G16B16A16_SFLOAT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST, &format!("ocean {k}"))?);
+    }
+    let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: MIPS as u32, base_array_layer: 0, layer_count: 1 };
+    gpu.one_time(|cb| {
+        let b: Vec<_> = v
+            .iter()
+            .map(|i: &Image| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::NONE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(i.raw)
+                    .subresource_range(range)
+            })
+            .collect();
+        unsafe { gpu.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
+        for i in &v {
+            unsafe {
+                gpu.device.cmd_clear_color_image(cb, i.raw, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.0; 4] }, &[range]);
+            }
+        }
+        let b: Vec<_> = v
+            .iter()
+            .map(|i: &Image| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+                    .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(i.raw)
+                    .subresource_range(range)
+            })
+            .collect();
+        unsafe { gpu.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b)) };
+    })?;
+    Ok(v)
+}
+
+/// The sea state under the camera (ocean.rs): the climatological wind there, in the patch
+/// coordinates (the cube face's u, v: the texture coordinates the water shading uses), a swell
+/// from a little off the wind, an open-sea fetch.
+fn sea_state(cam: DVec3) -> super::ocean::SeaState {
+    let d = cam.normalize();
+    let (lat, lon) = tiles::lat_lon(d);
+    let (wind, en) = super::ocean::wind_at(lat, lon);
+    let (face, u, v) = forest::dir_to_face_uv(d);
+    let e = 1e-6;
+    let tu = (tiles::face_dir(face, u + e, v) - tiles::face_dir(face, u - e, v)).normalize();
+    let tv = (tiles::face_dir(face, u, v + e) - tiles::face_dir(face, u, v - e)).normalize();
+    let east = DVec3::Z.cross(d).normalize_or(DVec3::X);
+    let north = d.cross(east);
+    let to_patch = |a: [f32; 2]| {
+        let w = east * a[0] as f64 + north * a[1] as f64;
+        let p = glam::DVec2::new(w.dot(tu), w.dot(tv)).normalize_or(glam::DVec2::X);
+        [p.x as f32, p.y as f32]
+    };
+    let ang = (en[1] as f64).atan2(en[0] as f64) + 0.5;
+    super::ocean::SeaState {
+        wind,
+        dir: to_patch(en),
+        fetch: 300_000.0,
+        swell_hs: 0.5 + 0.09 * wind,
+        swell_t: 9.0 + 0.25 * wind,
+        swell_dir: to_patch([ang.cos() as f32, ang.sin() as f32]),
+    }
 }
 
 /// Most BLAS builds per frame whose compacted size is queried.
@@ -369,6 +451,11 @@ pub struct GlobeScene {
     tree_backlog: VecDeque<TreeTile>,
     /// The whole ETOPO grid (R16_SNORM, mips) for per-pixel coastlines / relief far away.
     pub elev_tex: Image,
+    /// ocean waves (ocean.rs): the simulation thread, its textures (A, B per cascade), and the
+    /// statistics of the frame they hold (Globals.ocean*)
+    ocean: super::ocean::Ocean,
+    pub ocean_tex: Vec<Image>,
+    ocean_stats: [[f32; 4]; 3],
     /// globe.rchit globals (binding 30) and terrain tile table (binding 31)
     pub ubo: Buffer,
     pub table: Buffer,
@@ -499,6 +586,9 @@ impl GlobeScene {
             backlog: VecDeque::new(),
             tree_backlog: VecDeque::new(),
             elev_tex,
+            ocean: super::ocean::Ocean::spawn(),
+            ocean_tex: ocean_images(gpu)?,
+            ocean_stats: [[0.0; 4]; 3],
             ubo,
             table,
             plants,
@@ -565,12 +655,80 @@ impl GlobeScene {
 
     /// Record this frame's uploads and BLAS builds (copies, then builds, with the barriers the TLAS
     /// build and the shaders need). Called by the renderer before the TLAS build.
+    /// The ocean statistics for Globals.ocean0..2 (main.rgen).
+    pub fn ocean_globals(&self) -> [[f32; 4]; 3] {
+        self.ocean_stats
+    }
+
     pub fn record(&mut self, gpu: &Gpu, cb: vk::CommandBuffer) {
         if self.ops.is_empty() {
             return;
         }
         let d = &gpu.device;
         let staging = self.staging.raw;
+        // ocean textures: shader-read -> transfer, every mip from staging, back to shader-read
+        let images: Vec<(u64, vk::Image)> = self.ops.iter().filter_map(|o| if let Op::Image { src, img } = o { Some((*src, *img)) } else { None }).collect();
+        if !images.is_empty() {
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: super::ocean::MIPS as u32, base_array_layer: 0, layer_count: 1 };
+            let barrier = |img: vk::Image, old, new, sa, da, ss, ds| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(ss)
+                    .src_access_mask(sa)
+                    .dst_stage_mask(ds)
+                    .dst_access_mask(da)
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(img)
+                    .subresource_range(range)
+            };
+            let to_dst: Vec<_> = images
+                .iter()
+                .map(|(_, img)| {
+                    barrier(
+                        *img,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                        vk::PipelineStageFlags2::TRANSFER,
+                    )
+                })
+                .collect();
+            unsafe { d.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&to_dst)) };
+            for (src, img) in &images {
+                let mut off = *src;
+                let mut regions = Vec::new();
+                for m in 0..super::ocean::MIPS as u32 {
+                    let n = (super::ocean::N as u32 >> m).max(1);
+                    regions.push(vk::BufferImageCopy {
+                        buffer_offset: off,
+                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: m, base_array_layer: 0, layer_count: 1 },
+                        image_extent: vk::Extent3D { width: n, height: n, depth: 1 },
+                        ..Default::default()
+                    });
+                    off += (n * n * 8) as u64;
+                }
+                unsafe { d.cmd_copy_buffer_to_image(cb, staging, *img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &regions) };
+            }
+            let to_read: Vec<_> = images
+                .iter()
+                .map(|(_, img)| {
+                    barrier(
+                        *img,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        vk::AccessFlags2::TRANSFER_WRITE,
+                        vk::AccessFlags2::SHADER_READ,
+                        vk::PipelineStageFlags2::TRANSFER,
+                        vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
+                    )
+                })
+                .collect();
+            unsafe { d.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&to_read)) };
+        }
         for op in &self.ops {
             if let Op::Copy { src, dst, dst_off, size } = op {
                 unsafe { d.cmd_copy_buffer(cb, staging, *dst, &[vk::BufferCopy { src_offset: *src, dst_offset: *dst_off, size: *size }]) };
@@ -590,7 +748,7 @@ impl GlobeScene {
                     accel::cmd_build_blas(gpu, cb, &terrain_geometry(*vtx, self.idx.addr, nverts), self.tri_count, *dst, *scratch);
                 }
                 Op::Trees { aabbs, count, dst, scratch } => accel::cmd_build_blas(gpu, cb, &accel::aabb_geometry(*aabbs), *count, *dst, *scratch),
-                Op::Copy { .. } | Op::Compact { .. } => {}
+                Op::Copy { .. } | Op::Compact { .. } | Op::Image { .. } => {}
             }
         }
         gpu.memory_barrier(
@@ -832,6 +990,7 @@ impl GlobeScene {
         let lead = if lead.length() > MAX_LEAD { lead * (MAX_LEAD / lead.length()) } else { lead };
         let ahead = (lead.length() > MIN_LEAD).then(|| cam + lead);
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
+        self.ocean.post(sea_state(cam));
         self.range = forest::tree_range(eye);
         let mut near = forest::under_tiles(cam);
         near.extend(forest::tiles_near(cam, self.range));
@@ -992,6 +1151,20 @@ impl GlobeScene {
     /// uploaded here are drawn from the next frame on. Returns CPU ms: terrain, trees.
     pub fn update(&mut self, gpu: &Gpu) -> Result<[f64; 2]> {
         self.begin_frame();
+        // the newest ocean frame: its textures into the frame's staging, copied in record()
+        if let Some(f) = self.ocean.take() {
+            for (k, data) in f.tex.iter().enumerate() {
+                if let Some(src) = self.stage(bytemuck::cast_slice(data)) {
+                    self.ops.push(Op::Image { src, img: self.ocean_tex[k].raw });
+                }
+            }
+            let s = f.state;
+            self.ocean_stats = [
+                [s.wind, f.residual, f.amplitude, super::ocean::CHOP],
+                [s.dir[0], s.dir[1], f.coverage, 1.0],
+                f.slope_var,
+            ];
+        }
         self.table.mapped()[..self.table_cpu.len() * 8].copy_from_slice(bytemuck::cast_slice(&self.table_cpu));
         while self.backlog.len() < UPLOADS_PER_FRAME {
             match self.done_rx.try_recv() {

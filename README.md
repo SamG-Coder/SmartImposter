@@ -419,6 +419,42 @@ so far:
       different levels meet with a visible density step from high up. (Measured at Lake Como,
       2560x1392 DLSS Quality: smooth 11.28 ms, stepped 11.32 ms average, within run-to-run
       noise.)
+  - Clouds (`shaders/clouds.glsl`): a volumetric cumulus layer 1.5-4.2 km above sea level,
+    fixed to the Earth and drifting with the wind. Cover comes from ~600 km weather systems,
+    ~40 km cells and ~8 km clusters, with fewer clouds over the subtropical deserts and more at
+    the equator. Ray marched along every primary ray and the water reflection rays (light marched
+    towards the sun, forward and back scattering, a multiple-scattering floor, sky ambient, the
+    air in front of a cloud hazing it). Every lit point marches once more towards the sun for the
+    cloud shadows on the ground, and the sky light dims under the cover. About 2.7 ms at
+    2560x1392 (Lake Como, 14.0 vs 11.3 ms); `--clouds off` or key U turns them off.
+  - Atmosphere: ozone absorption, and samples packed towards the eye with each one dimmed only to
+    its own middle, so the horizon is pale and hazy rather than a brown band.
+  - The sea (`src/globe/ocean.rs`, `shaders/main.rgen`), built the way film and game oceans are
+    (Tessendorf, "Simulating Ocean Water"):
+    - Waves from a measured spectrum: JONSWAP wind sea plus a narrower swell, directional
+      spreading, deep-water dispersion. Four FFT cascades (1024, 256, 64, 16 m patches, 128^2)
+      on a background thread (~5 ms a step, overlapped), with choppy displacement (sharp crests,
+      round troughs), slopes and the Jacobian, uploaded each frame as RGBA16F textures with mips.
+    - Wind by region: trade winds, calm doldrums, westerlies (strongest in the Southern Ocean),
+      polar easterlies, varied by weather patterns; the spectrum follows the camera's place.
+    - Real wave geometry within 1.5 km: every view ray is marched through the slab the waves
+      fill and stops on the height field (bisection-refined), so crests hide the troughs behind
+      them and the skyline is made of waves; further out the cascades are normal detail.
+    - Roughness from physics: what the mips average away plus the Cox-Munk slope variance below
+      the finest cascade (0.003 + 0.00512 U) drives the reflection blur and a Beckmann sun
+      glitter, so the glitter path widens with the wind as over the real sea.
+    - Whitecaps where the crests fold (lowest Jacobian), steered so their area matches the
+      measured coverage for the wind (Monahan: 3.84e-6 U^3.41, ~1% at 10 m/s), fading over a few
+      seconds, drawn as dense fresh foam with streaks trailing downwind.
+    - Water colour by floor depth: clear deep blue over the open ocean (pure water absorbs red,
+      barely blue), greener over the shelf; light glows through thin crests when the sun is
+      behind them (after the Atlas GDC 2019 water BSDF); waves die out as the bottom shoals.
+    - No repeating patches (stochastic tiling): each cascade is laid out on hex cells ~1.5
+      patches across, every cell at a random offset and turned up to +-25 degrees about the
+      wind, three cells blended per point (variance-preserving, slopes and displacements turned
+      back); amplitudes rise and fall in wave groups, and the whitecaps cluster with them.
+    - Cost at sea level (2560x1392, DLSS Quality): ~10.4 ms a frame with clouds.
+    Lakes keep their own calmer wind ripples.
   - Streaming without hitches: one pool of worker threads builds terrain tiles (first) and grows
     tree tiles. Their vertex copies and BLAS builds are recorded into the frame's own command
     buffer, with no GPU waits. Storage is pooled and device-local: fixed slots for terrain
@@ -599,6 +635,7 @@ cargo run --release
 | `--imp-texel 0.055 --imp-res 448 --imp-grid 12` | impostor texel size (m), maximum frame resolution, views per side |
 | `--spacing 7 --radius 1400` | canopy tree spacing and forest radius |
 | `--sharpen 0.5`, `--no-taa` | post-processing |
+| `--clouds on\|off`, `--cloud-cover 0.45` | globe: volumetric clouds and how much of the sky they cover (0-1, before the weather systems and latitude belts); key U toggles them |
 | `--tree-thinning smooth\|stepped` | globe: how distant trees thin out (see [Trees to the horizon](#the-earth-a-11-globe-and-real-places)); key N toggles it |
 | `--shot out.png --frames N --cam x,y,z,yaw,pitch` | render N frames, save, print timings and the GPU profile, exit |
 | `--views "x,h,z,yaw,pitch[,lod,debug];..."` | several cameras in one run (h above ground), one screenshot each |
@@ -637,6 +674,7 @@ cargo run --release
 | K | supersampling 1x / 1.5x / 2x (TAA path) |
 | T | TAA on/off |
 | N (globe) | distant tree thinning: smooth (default) / stepped per tile |
+| U (globe) | volumetric clouds on/off |
 | H | sharpening strength |
 | Arrow keys | sun azimuth / elevation |
 | `-` `=` | exposure |

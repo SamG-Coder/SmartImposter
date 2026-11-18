@@ -10,6 +10,82 @@ layout(set = 0, binding = 0) uniform accelerationStructureEXT tlas;
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D depthImg;
 layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D curImg;
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+#include "clouds.glsl"
+
+// ---- the sea's waves (globe/ocean.rs): CASCADES FFT patches, texture A = (Dx, h, Dz, foam),
+// B = (dh/dx, dh/dz, dDx/dx, dDz/dz) per cascade, in patch coordinates along the water's (u, v)
+layout(set = 0, binding = 33) uniform sampler2D oceanTex[8];
+const float OSIZE[4] = float[4](1024.0, 256.0, 64.0, 16.0);
+bool oceanOn() { return g.planet.w > 0.5 && g.ocean1.w > 0.5; }
+// mip for a pixel footprint pxM (m): 128 texels per patch
+float oLod(int c, float pxM) { return max(log2(pxM * 128.0 / OSIZE[c]), 0.0); }
+// No repeating patches (stochastic tiling, as hexTile in globe.rchit does for the ground): each
+// cascade is laid out on hex cells ~1.5 patches across; every cell vertex places the patch at a
+// random offset and turned up to +-25 degrees about the wind, and the three vertices around a
+// point are blended (weights sharpened, variance-preserving: the fields are zero-mean, a plain
+// mix would flatten the sea). Slopes and displacements are turned back into the patch frame.
+// Wave groups: each cascade's amplitude also rises and falls over ~1-2 patches; whitecaps follow.
+// The layout is set once per pixel (oWeights): it varies over hundreds of metres.
+mat2 oRot[12];
+vec2 oOff[12];
+vec4 oW3[4];   // xyz vertex weights (normalised), w variance-preserving gain
+vec4 oGrp = vec4(1.0);
+void oWeights(vec2 q) {
+    for (int c = 0; c < 4; ++c) {
+        vec2 st = q / (OSIZE[c] * 1.5);
+        vec2 sk = vec2(st.x, -0.57735027 * st.x + 1.15470054 * st.y);
+        vec2 base = floor(sk);
+        vec3 t = vec3(fract(sk), 0.0);
+        t.z = 1.0 - t.x - t.y;
+        float sg = step(0.0, -t.z), s2 = 2.0 * sg - 1.0;
+        vec3 w = vec3(-t.z * s2, sg - t.y * s2, sg - t.x * s2);
+        vec2 v[3] = vec2[3](base + vec2(sg, sg), base + vec2(sg, 1.0 - sg), base + vec2(1.0 - sg, sg));
+        w = w * w * w;
+        w /= w.x + w.y + w.z;
+        oW3[c] = vec4(w, inversesqrt(dot(w, w)));
+        for (int i = 0; i < 3; ++i) {
+            uint r = hash2(uvec2(ivec2(v[i]) + 32768) ^ uvec2(uint(c) * 7919u));
+            float ang = (float(r & 0xFFFFu) / 65535.0 - 0.5) * 0.87;
+            oRot[c * 3 + i] = mat2(cos(ang), sin(ang), -sin(ang), cos(ang));
+            oOff[c * 3 + i] = vec2(float((r >> 16) & 0xFFu), float(r >> 24)) / 256.0;
+        }
+        oGrp[c] = 0.6 + 0.8 * vnoise(q / (OSIZE[c] * 1.31) + float(c) * 11.7 + 3.1);
+    }
+}
+vec4 oSample(int k, int c, vec2 q, float lod, bool isA) {
+    vec2 uv = q / OSIZE[c];
+    vec4 m = vec4(0.0);
+    float f = 0.0;
+    for (int i = 0; i < 3; ++i) {
+        float w = oW3[c][i];
+        if (w < 0.01) continue;
+        mat2 R = oRot[c * 3 + i];
+        vec4 v = textureLod(oceanTex[k], R * uv + oOff[c * 3 + i], lod);
+        // vectors (A: displacement xz; B: slope xy) back from the turned patch
+        if (isA) v.xz = transpose(R) * v.xz; else v.xy = transpose(R) * v.xy;
+        m += v * w;
+        f += (isA ? v.w : 0.0) * w;
+    }
+    m *= oW3[c].w * oGrp[c];
+    if (isA) m.w = f * smoothstep(0.7, 1.3, oGrp[c]);
+    return m;
+}
+vec4 oA(int c, vec2 q, float lod) { return oSample(2 * c, c, q, lod, true); }
+vec4 oB(int c, vec2 q, float lod) { return oSample(2 * c + 1, c, q, lod, false); }
+// The undisplaced point whose choppy displacement lands on q (two fixed-point steps).
+vec2 oUndisplace(vec2 q, vec4 amp, vec4 lod) {
+    vec2 x = q;
+    for (int i = 0; i < 2; ++i) {
+        vec2 d = oA(0, x, lod.x).xz * amp.x + oA(1, x, lod.y).xz * amp.y + oA(2, x, lod.z).xz * amp.z;
+        x = q - d;
+    }
+    return x;
+}
+// Wave height above the mean level at q (cascades 0-2: the finest is surface detail only).
+float oHeight(vec2 q, vec4 amp, vec4 lod) {
+    vec2 x = oUndisplace(q, amp, lod);
+    return oA(0, x, lod.x).y * amp.x + oA(1, x, lod.y).y * amp.y + oA(2, x, lod.z).y * amp.z;
+}
 // DLSS Ray Reconstruction G-buffer (written when g.lodParams.z > 0.5)
 layout(set = 0, binding = 17, r32f) uniform writeonly image2D viewzImg;
 layout(set = 0, binding = 18, rg16f) uniform writeonly image2D motionImg;
@@ -137,6 +213,7 @@ void main() {
     pl.trans = vec3(0.0);
     pl.wdepth = 0.0;
     pl.wlevel = 0.0;
+    pl.wfloor = 0.0;
 #ifdef SER
     // Shader Execution Reordering (RTX 40/50): traverse, then regroup the threads by what they
     // hit (ground, textured leaves, impostors, sky) before running the closest-hit / miss shader,
@@ -194,7 +271,7 @@ void main() {
 
         vec3 E = sunColor();
         vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
-        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L));
+        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * cloudShadow(gq, L);
         vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
         // Leaf transmission: the foliage texture's translucency map times Unreal's "Translucency Tint"
         // (veins and thick spots transmit less), so back-lit leaves glow with visible veins.
@@ -259,12 +336,56 @@ void main() {
         bool sea = (pl.flags & FLAG_SEA) != 0u;
         bool globeWater = globe() && (pl.flags & FLAG_WATER) != 0u;
         vec3 wq = pl.trans, wtan = pl.wtan; // globe water: Earth-fixed coordinates, shore distance
+        float wfloor = pl.wfloor;
+        bool seaFFT = globeWater && sea && oceanOn() && dbg == 0u;
+        float waveH = 0.0;  // height of the wave surface above the mean level at the hit (m)
+        vec4 oAmp = vec4(1.0);
         if (globeWater) {
             // the hit is the ground under the flat water surface, wlevel below it
             float cosV = max(dot(-dir, normalize(gq)), 0.02);
             tSurf = max(pl.t - pl.wlevel / cosV, pl.t * 0.5);
             wd = max(wd, 0.02);
             under = wd / max(cosV, 0.05);
+            if (seaFFT) {
+                // the waves feel the bottom near the shore: long ones die out first
+                float dep = max(wfloor, wd);
+                oAmp = vec4(smoothstep(0.0, 25.0, dep), smoothstep(0.0, 8.0, dep), smoothstep(0.0, 2.0, dep), smoothstep(0.0, 0.4, dep));
+                // Real wave geometry: march the ray through the slab the waves fill (+-A around
+                // the mean level) against the height field, first crossing refined by bisection.
+                // Crests hide the troughs behind them at grazing angles; within 1.5 km.
+                float A = g.ocean0.z * max(max(oAmp.x, oAmp.y), oAmp.z);
+                if (tSurf < 1500.0 && A > 0.05) {
+                    float vS = length(wtan) > 1.5 ? -1.0 : 1.0;
+                    vec3 tn = normalize(wtan), vn = cross(normalize(gq), tn) * vS;
+                    vec2 dq = vec2(dot(dir, tn), dot(dir, vn));
+                    float tA = max(tSurf - A / cosV, 0.0), tB = min(tSurf + A / cosV, pl.t);
+                    float pxM = tSurf * 2.0 * g.camUp.w / float(size.y) / max(cosV, 0.15);
+                    vec4 lod = vec4(oLod(0, pxM), oLod(1, pxM), oLod(2, pxM), 0.0);
+                    vec2 qA = wq.xy + (tA - pl.t) * dq; // (wq is at the bed point, t = pl.t)
+                    oWeights(wq.xy + (tSurf - pl.t) * dq);
+                    // (the 64 m cascade's centimetre waves only shape the silhouette up close)
+                    vec4 mAmp = vec4(oAmp.xy, oAmp.z * smoothstep(150.0, 60.0, tSurf), 0.0);
+                    const int STEPS = 20;
+                    float dt = (tB - tA) / float(STEPS), j = rnd(rng);
+                    float lo = tA, hi = -1.0;
+                    for (int i = 1; i <= STEPS; ++i) {
+                        float t = tA + dt * min(float(i) - 1.0 + j + 0.001, float(STEPS));
+                        if ((tSurf - t) * cosV <= oHeight(qA + (t - tA) * dq, mAmp, lod)) {
+                            hi = t;
+                            break;
+                        }
+                        lo = t;
+                    }
+                    if (hi > 0.0) {
+                        for (int i = 0; i < 5; ++i) {
+                            float t = 0.5 * (lo + hi);
+                            if ((tSurf - t) * cosV <= oHeight(qA + (t - tA) * dq, mAmp, lod)) hi = t; else lo = t;
+                        }
+                        waveH = (tSurf - hi) * cosV;
+                        tSurf = hi;
+                    }
+                }
+            }
         } else if ((pl.flags & FLAG_WATER) != 0u && wd <= 0.0) {
             tSurf = pl.t;
             wd = 6.0; // open water: no shallows, no foam
@@ -281,6 +402,8 @@ void main() {
             // sky light: the zenith radiance over the hemisphere (as globe.rgen did)
             vec3 up = normalize(gq), Tz;
             vec3 skyZ = atmosphere(gq, up, 1e30, L, g.sunDir.w, Tz);
+            // under the clouds less sky light reaches the ground (an overcast sky is dimmer)
+            if (cloudsOn()) skyZ *= 1.0 - 0.45 * cloudCover(cloudEarth(gq));
             skyUp = skyZ * PI;
             ground = skyUp * 0.25;
             amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
@@ -295,12 +418,15 @@ void main() {
             if (under < 0.0) under = pl.t - tSurf;     // view path through the water
             float sunPath = wd / max(L.y, 0.08);       // sunlight down to the bed
             // clear, slightly green lake / river water; the sea is bluer and scatters more blue
-            vec3 SIGMA = sea ? vec3(0.45, 0.07, 0.04) : vec3(0.42, 0.10, 0.075); // 1/m
+            // the sea: clear deep blue over the open ocean (pure water absorbs red, barely blue),
+            // greener and murkier over the shelf (plankton, dissolved matter); by floor depth
+            float open = sea ? smoothstep(25.0, 200.0, wfloor) : 0.0;
+            vec3 SIGMA = sea ? mix(vec3(0.45, 0.075, 0.075), vec3(0.40, 0.055, 0.022), open) : vec3(0.42, 0.10, 0.075); // 1/m
             vec3 Tv = exp(-SIGMA * under);
             vec3 Ts = exp(-SIGMA * sunPath);
             // light scattered back out of deep water (globe: dark blue-green lakes, deep blue sea;
             // the bed shows only where it is shallow)
-            vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? vec3(0.0015, 0.006, 0.016) : vec3(0.003, 0.010, 0.010);
+            vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? mix(vec3(0.0018, 0.0075, 0.012), vec3(0.0007, 0.0032, 0.0135), open) : vec3(0.003, 0.010, 0.010);
             vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
             // flowing ripples: two octaves drifting at different speeds and directions, fixed to
@@ -313,9 +439,30 @@ void main() {
             vec2 q = globeWater ? wq.xy + vec2(dot(ps - p, wtan), dot(ps - p, wvd)) : ps.xz;
             float e = 0.08;
             #define RIPPLE(Q) (0.022 * vnoise((Q) * 1.1 + vec2(0.55, 0.2) * tm) + 0.009 * vnoise((Q) * 3.3 - vec2(0.3, 0.75) * tm) + 0.004 * vnoise((Q) * 8.0 + vec2(0.9, 0.4) * tm))
-            vec2 gr;
+            vec2 gr = vec2(0.0);
             float lostVar = 0.0; // slope variance of the ripples smaller than a pixel
-            if (globeWater) {
+            float waveFoam = 0.0;
+            if (seaFFT) {
+                // The sea from the FFT cascades at the (undisplaced) point under q: slopes of the
+                // displaced surface (dh/dx / (1 + dDx/dx)), each cascade at the mip of the pixel.
+                // What the mips average away and what lies below the finest cascade (Cox-Munk
+                // total minus the resolved) is the roughness.
+                float pxM = tSurf * 2.0 * g.camUp.w / float(size.y) / max(dot(-dir, normalize(gq)), 0.15);
+                vec4 lod = vec4(oLod(0, pxM), oLod(1, pxM), oLod(2, pxM), oLod(3, pxM));
+                oWeights(q);
+                vec2 x = oUndisplace(q, oAmp, lod);
+                vec2 s = vec2(0.0), jd = vec2(0.0);
+                for (int c = 0; c < 4; ++c) {
+                    vec4 b = oB(c, x, lod[c]) * oAmp[c];
+                    s += b.xy;
+                    jd += b.zw;
+                    lostVar += g.ocean2[c] * oAmp[c] * oAmp[c] * (1.0 - exp2(-2.0 * lod[c]));
+                }
+                gr = s / max(vec2(1.0) + jd, vec2(0.25));
+                lostVar += g.ocean0.y;
+                // whitecaps where the crests fold (ocean.rs: the coverage for the wind)
+                waveFoam = max(oA(1, x, lod.y).w * oAmp.y, oA(2, x, lod.z).w * oAmp.z);
+            } else if (globeWater) {
                 // wind waves: directional swells from 12 cm to 7 m spread around the wind, slope
                 // ~0.04 each, gusts (slow patches) varying their strength; waves smaller than a
                 // pixel are left out (no shimmer)
@@ -327,22 +474,29 @@ void main() {
                 // than a pixel are left out (no shimmer).
                 gr = vec2(0.0);
                 const float WIND = 0.7;
-                for (int i = 0; i < 8; ++i) {
+                // (10 octaves down to ~3 cm capillary ripples, crests 1.4x their spacing: choppy
+                // water, not brushed streaks)
+                for (int i = 0; i < 10; ++i) {
                     float fi = float(i);
-                    float lam = 5.0 * pow(0.55, fi);
-                    float ang = WIND + sin(fi * 2.399) * 0.45;
+                    float lam = 5.0 * pow(0.6, fi);
+                    float ang = WIND + sin(fi * 2.399) * (0.45 + 0.05 * fi);
                     vec2 d = vec2(cos(ang), sin(ang)), c = vec2(-d.y, d.x);
                     float speed = sqrt(9.81 * lam / 6.2831853);
-                    vec2 sp = vec2((dot(q, d) - speed * tm) / lam, dot(q, c) / (lam * 2.2)) + fi * 17.3;
+                    vec2 sp = vec2((dot(q, d) - speed * tm) / lam, dot(q, c) / (lam * 1.4)) + fi * 17.3;
                     vec3 nd = vnoiseD(sp);
                     float keep = 1.0 - smoothstep(lam * 0.15, lam * 0.5, pxM);
                     float slope = 0.09 * keep;
                     lostVar += 0.18 * 0.0081 * (1.0 - keep * keep);
-                    // back from the stretched frame: d/dq = d * dx / lam + c * dy / (2.2 lam)
-                    gr += (d * nd.y + c * nd.z / 2.2) * slope;
+                    // back from the stretched frame: d/dq = d * dx / lam + c * dy / (1.4 lam)
+                    gr += (d * nd.y + c * nd.z / 1.4) * slope;
                 }
                 gr *= gust;
                 lostVar *= 0.8; // the mean gust strength (gust patches would turn the glitter into blobs)
+                if (sea) {
+                    // (the sea before its first FFT frame: a stronger chop than a lake)
+                    gr *= 1.8;
+                    lostVar *= 3.2;
+                }
             } else {
                 float h0 = RIPPLE(q), hx = RIPPLE(q + vec2(e, 0.0)), hz = RIPPLE(q + vec2(0.0, e));
                 gr = vec2(hx - h0, hz - h0) / e;
@@ -357,6 +511,16 @@ void main() {
                 float band = smoothstep(-swash - 0.8, -swash * 0.4, sdW) * (1.0 - smoothstep(-0.1, 0.15, sdW));
                 float brk = smoothstep(0.42, 0.78, vnoise(q * 1.6 + vec2(0.3, 0.5) * tm) * 0.6 + vnoise(q * 5.5 - vec2(0.2, 0.4) * tm) * 0.4);
                 foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf);
+                // whitecaps (FFT sea): a breaking crest is a lace of bubbles and streaks, not a
+                // solid patch; finer near the camera, an even mix further out (mips)
+                // fresh foam on the breaking crest is dense and bright; older foam trails behind
+                // it as thin streaks drawn out along the wind
+                vec2 wd2 = g.ocean1.xy;
+                vec2 qs = vec2(dot(q, wd2), dot(q, vec2(-wd2.y, wd2.x)));
+                float lace = smoothstep(0.35, 0.8, vnoise(qs * vec2(0.8, 3.0) + tm * 0.2) * 0.6 + vnoise(qs * vec2(2.6, 8.0) - tm * 0.3) * 0.4);
+                lace = mix(lace, 0.45, smoothstep(40.0, 300.0, tSurf));
+                float fresh = smoothstep(0.7, 1.0, waveFoam);
+                foam = max(foam, waveFoam * mix(lace, 1.0, 0.7 * fresh) * 0.85);
             } else {
                 n = normalize(vec3(-gr.x, 1.0, -gr.y));
                 // foam and white water where it is shallow at the shore
@@ -366,6 +530,15 @@ void main() {
             p = ps;
             pl.t = tSurf;
             col = refr;
+            if (seaFFT) {
+                // Light through the thin wave crests (Atlas GDC 2019 water BSDF, simplified): the
+                // crests glow green-blue when the sun is behind them, a little on the faces too
+                float hn = clamp(waveH / max(g.ocean0.z, 0.2), 0.0, 1.0);
+                float back = pow(max(dot(L, dir), 0.0), 4.0) * pow(0.5 - 0.5 * dot(L, n), 3.0);
+                float face = pow(max(dot(-dir, n), 0.0), 2.0);
+                vec3 sssCol = mix(vec3(0.0, 0.07, 0.055), vec3(0.0, 0.04, 0.065), open);
+                col += sssCol * E * sh * hn * (3.0 * back + 0.12 * face);
+            }
             float tHit = pl.t;
             // the ripples smaller than a pixel still tilt the surface: one random facet per pixel
             // and frame from their slope spread (the denoiser averages them), so far water blurs
@@ -411,8 +584,24 @@ void main() {
                     refl = refl * Tr + hazeColor(R) * (1.0 - Tr);
                 }
             }
+            if (globeWater && cloudsOn()) {
+                // the clouds in the reflection (sky or far shore behind them)
+                vec4 cr = cloudMarch(p - g.planet.xyz, R, pl.t < 0.0 ? 1e30 : pl.t, 20, rnd(rng));
+                refl = refl * cr.a + cr.rgb;
+            }
             vec3 H = normalize(L - dir);
             float glint = pow(max(dot(nR, H), 0.0), 900.0) * 120.0;
+            if (seaFFT) {
+                // The sun's glitter: a Beckmann microfacet lobe whose mean square slope is the
+                // sea's unresolved slope variance (Cox-Munk): the glitter path widens with the
+                // wind as it does over the real sea. (The reflection rays skip the sun disc's
+                // share: the lobe carries it.)
+                float m2 = max(lostVar, 2e-4);
+                float NdH = max(dot(n, H), 1e-3), NdV = max(dot(n, -dir), 1e-3), c2 = NdH * NdH;
+                float D = exp((c2 - 1.0) / (c2 * m2)) / (PI * m2 * c2 * c2);
+                float Fh = 0.02 + 0.98 * pow(1.0 - max(dot(H, -dir), 0.0), 5.0);
+                glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
+            }
             col = mix(col, refl, F) + E * glint * F * sh;
             vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
             col = mix(col, foamCol, foam * 0.6);
@@ -451,6 +640,11 @@ void main() {
         vec3 T;
         vec3 S = atmosphere(-g.planet.xyz, dir, pl.t, g.sunDir.xyz, g.sunDir.w, T);
         col = col * T + S;
+    }
+    // Clouds in front of whatever the ray found (sky or ground), jittered per pixel and frame.
+    if (globe() && dbg == 0u && cloudsOn()) {
+        vec4 cl = cloudMarch(-g.planet.xyz, dir, pl.t < 0.0 ? 1e30 : pl.t, 40, rnd(rng));
+        col = col * cl.a + cl.rgb;
     } else if (pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
         vec3 beta = (vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x;
         vec3 T = exp(-beta * pl.t);

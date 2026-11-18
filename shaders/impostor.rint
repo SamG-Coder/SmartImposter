@@ -185,7 +185,7 @@ void main() {
     float cull = info.trans.w;
     if (cull > 0.0 && lodRand(g, tree, 3u) >= 1.0 - smoothstep(cull * 0.8, cull, dTree)) return;
     // Globe trees thin on smoothly with distance (rt.glsl thinLevels): no density step at tiles.
-    if (g.planet.w > 0.5 && g.params.y > 0.5) {
+    if (g.planet.w > 0.5 && g.cloud.z > 0.5) {
         float extra = thinLevels(dTree) - float(plantThin(pr));
         if (extra > 0.0 && lodRand(g, tree, 5u) >= exp2(-2.0 * extra)) return;
     }

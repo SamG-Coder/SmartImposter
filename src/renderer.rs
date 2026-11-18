@@ -23,6 +23,8 @@ macro_rules! spv {
 pub const MAX_VARIANTS: usize = 256; // PlantRec keeps the variant in 8 bits (rt.glsl plantVariant)
 /// Texture sets (4 textures each) bound as a sampler array. Must match shared.glsl.
 pub const MAX_SPECIES: usize = 64;
+/// Ocean wave textures (globe/ocean.rs: A and B per cascade), binding 33.
+const OCEAN_TEX: usize = crate::globe::ocean::CASCADES * 2;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
@@ -54,6 +56,14 @@ pub struct Globals {
     /// Globe mode: direction to the sun (camera frame); w = pre-exposure (eye adaptation: 1 by
     /// day, up to ~1e5 by moonlight), applied before the 16-bit targets. 1 outside globe mode.
     pub sun_true: [f32; 4],
+    /// Globe mode: rows of the camera frame -> Earth axes (ECEF) rotation (clouds.glsl).
+    pub earth: [[f32; 4]; 3],
+    /// Globe mode: x cloud cover (0..1), y clouds on (1) / off (0), z smooth tree thinning (1) / stepped (0).
+    pub cloud: [f32; 4],
+    /// Globe mode, the sea (globe/ocean.rs): x wind m/s, y residual slope variance, z largest wave
+    /// height m, w chop; then wind direction (patch coordinates), whitecap coverage, ocean on;
+    /// then the slope variance of each cascade.
+    pub ocean: [[f32; 4]; 3],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -763,7 +773,8 @@ impl Renderer {
             )?
         };
 
-        let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globals")?;
+        const _: () = assert!(std::mem::size_of::<Globals>() <= 512);
+        let ubo = gpu.create_buffer(512, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globals")?;
         let mat_sampler = unsafe {
             gpu.device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -820,6 +831,7 @@ impl Renderer {
             b(30, vk::DescriptorType::UNIFORM_BUFFER, 1, rt_all),
             b(31, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
             b(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
+            b(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, OCEAN_TEX as u32, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -885,7 +897,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 24 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1),
+                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1 + OCEAN_TEX as u32),
             },
         ];
         let desc_pool = unsafe {
@@ -1344,6 +1356,16 @@ impl Renderer {
             _ => unreachable!("globe bindings without resources"),
         };
         let globe_elev = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_elev).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+        let ocean_tex: Vec<vk::DescriptorImageInfo> = (0..OCEAN_TEX)
+            .map(|k| {
+                let view = match (&self.globe, &self.globe_dummy) {
+                    (Some(g), _) => g.ocean_tex[k].view,
+                    (None, Some(d)) => d.2.view,
+                    _ => unreachable!(),
+                };
+                vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            })
+            .collect();
         let tex = |list: &[Image], n: usize| -> Vec<vk::DescriptorImageInfo> {
             (0..n)
                 .map(|i| {
@@ -1394,6 +1416,7 @@ impl Renderer {
             w(30, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&globe_ubo),
             w(31, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&globe_table),
             w(32, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&globe_elev),
+            w(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ocean_tex),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -2068,6 +2091,10 @@ impl Renderer {
         } else {
             g.lod_params[2] = 0.0;
         }
+        // the sea state of the last ocean frame uploaded (globe/ocean.rs, main.rgen)
+        if let Some(scene) = self.globe.as_ref() {
+            g.ocean = scene.ocean_globals();
+        }
         let globals = &g;
         let t_lod = Instant::now();
         // Globe mode: the instances come from the streamed scene (below).
@@ -2183,8 +2210,8 @@ impl Renderer {
                 self.profile.globe_max[i] = self.profile.globe_max[i].max(v);
             }
             let a = scene.index_addr();
-            // z: smooth tree thinning on (Globals.params.y; globe.rchit's canopy colour follows it)
-            gg.addr = [a as u32, (a >> 32) as u32, (g.params[1] > 0.5) as u32, 0];
+            // z: smooth tree thinning on (Globals.cloud.z; globe.rchit's canopy colour follows it)
+            gg.addr = [a as u32, (a >> 32) as u32, (g.cloud[2] > 0.5) as u32, 0];
             gg.params[1] = self.lod_frame as f32;
             gg.params[2] = g.iparams[1] as f32;
             gg.params[3] = f32::from_bits(self.ground_layers);

@@ -6,6 +6,7 @@ pub mod dem;
 pub mod etopo;
 pub mod forest;
 pub mod landcover;
+pub mod ocean;
 pub mod scene;
 pub mod sky;
 pub mod tiles;

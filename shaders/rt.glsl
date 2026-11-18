@@ -20,6 +20,7 @@ struct HitPayload {
     float wdepth; // terrain under water: depth of the water over this point (m), else 0
     vec3 wtan;    // globe water: world direction of the first Earth-fixed coordinate (pl.trans.xy)
     float wlevel; // globe water: height of the water surface above this point (m)
+    float wfloor; // globe water: depth of the sea floor (m, ETOPO; coastal vs open-ocean water)
 };
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.

@@ -37,8 +37,13 @@ vec2 lightDepth(vec3 x, vec3 L) {
     return od;
 }
 
+// Ozone absorbs orange and red light (Chappuis band): over the long paths near the horizon it
+// keeps the sky pale blue-white instead of yellow-brown (single scattering alone yellows it).
+// Its 25 km layer is folded into the Rayleigh profile: a vertical column of ~0.03 (green).
+const vec3 BETA_O = vec3(0.650e-6, 1.881e-6, 0.085e-6) * 2.0;
+
 vec3 extinction(vec2 od) {
-    return exp(-(BETA_R * od.x + BETA_M * 1.11 * od.y));
+    return exp(-((BETA_R + BETA_O) * od.x + BETA_M * 1.11 * od.y));
 }
 
 // In-scattered light along ro + rd * [0, tmax] (ro relative to the planet centre) and the
@@ -52,16 +57,23 @@ vec3 atmosphere(vec3 ro, vec3 rd, float tmax, vec3 L, float sunI, out vec3 T) {
     vec2 gnd = raySphere(ro, rd, R_GROUND);
     if (gnd.x > 0.0) t1 = min(t1, gnd.x);
     if (t1 <= t0) return vec3(0.0);
+    // Samples packed towards the eye (t ~ u^2): a ray along the ground crosses hundreds of km of
+    // dense air, most of the light it gathers comes from the first tens of km. Each sample is
+    // dimmed by the air up to its own middle, not to the end of its step (that turned the horizon
+    // brown: a 50 km step of sea-level air holds an optical depth of ~1.6 in blue).
     const int N = 20;
-    float ds = (t1 - t0) / float(N);
+    float len = t1 - t0;
     vec2 od = vec2(0.0);
     vec3 sumR = vec3(0.0), sumM = vec3(0.0);
     for (int i = 0; i < N; ++i) {
-        vec3 x = ro + rd * (t0 + (float(i) + 0.5) * ds);
+        float ua = float(i) / float(N), ub = float(i + 1) / float(N);
+        float ta = t0 + len * ua * ua, tb = t0 + len * ub * ub;
+        float ds = tb - ta;
+        vec3 x = ro + rd * (0.5 * (ta + tb));
         float h = max(length(x) - R_GROUND, 0.0);
         vec2 d = vec2(exp(-h / H_R), exp(-h / H_M)) * ds;
+        vec3 tr = extinction(od + 0.5 * d + lightDepth(x, L));
         od += d;
-        vec3 tr = extinction(od + lightDepth(x, L));
         sumR += d.x * tr;
         sumM += d.y * tr;
     }
