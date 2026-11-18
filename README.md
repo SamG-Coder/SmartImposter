@@ -431,17 +431,22 @@ so far:
   WorldCover has tree cover. Altitude zones shift with latitude.
 - **M** in site mode returns to the globe above the same spot.
 
-**Data (free, not included).** Put the files under `assets/earth/`:
+**Data (free, not included).** `tools/fetch_earth.py` downloads it into `assets/earth/`
+(resumable: stop and restart any time; `--bbox south,west,north,east` limits it to a region):
 
-| Folder | Dataset | Files |
-|---|---|---|
-| `etopo/` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model), 60″ ice surface GeoTIFF (466 MB) | `ETOPO_2022_v1_60s_N90W180_surface.tif` |
-| `glo30/` | [Copernicus DEM GLO-30](https://registry.opendata.aws/copernicus-dem/) 1° tiles (~42 MB each, up to 50° latitude for now) | `Copernicus_DSM_COG_10_N46_00_E008_00_DEM.tif`, ... |
-| `worldcover/` | [ESA WorldCover 2021 v200](https://zenodo.org/records/7254221) 3° tiles (~107 MB each) | `ESA_WorldCover_10m_2021_v200_N45E006_Map.tif`, ... |
+| Command | Folder | Dataset | Download | On disk |
+|---|---|---|---|---|
+| (by hand) | `etopo/` | [NOAA ETOPO 2022](https://www.ncei.noaa.gov/products/etopo-global-relief-model) 60″ ice surface, `ETOPO_2022_v1_60s_N90W180_surface.tif` | 466 MB | 0.9 GB |
+| `fetch_earth.py dem` | `glo30/` | [Copernicus DEM GLO-30](https://registry.opendata.aws/copernicus-dem/), 26,450 1° tiles | ~543 GB | ~120 GB |
+| `fetch_earth.py cover` | `worldcover/` | [ESA WorldCover 2021 v200](https://registry.opendata.aws/esa-worldcover-vito/), 2,651 3° tiles | 124 GB | 124 GB |
+| `fetch_earth.py vectors` | `ecoregions/`, `hydrorivers/`, `hydrolakes/` | [RESOLVE Ecoregions 2017](https://ecoregions.appspot.com/), [HydroRIVERS / HydroLAKES](https://www.hydrosheds.org/) | 1.5 GB | 5.3 GB |
 
-Each is decoded once and cached next to the source. The globe runs with ETOPO alone; the 30 m
-elevation and land cover only exist where you downloaded tiles (the Alps, 45–47° N, 6–11° E, in
-development).
+Elevation tiles are converted to a compact `.dem` file as they arrive (half-metre int16,
+gradient-predicted, deflate: ~4.5x smaller than the GeoTIFF; `smart_imposter --convert-dem`).
+Nothing is loaded up front: the workers decode elevation tiles and 1024 x 1024 land-cover blocks
+the first time they need them and keep the recent ones in memory. Far terrain reads the land
+cover's overviews (20 m ... 600 m pixels) instead of single 10 m pixels. The globe runs with
+ETOPO alone; the 30 m elevation and land cover exist wherever their tiles are present.
 
 Streaming on an RTX 5080 at 1920x1080, DLSS-RR Quality, `--bench-move` over 900 frames:
 
@@ -590,6 +595,7 @@ cargo run --release
 
 | Script | Purpose |
 |---|---|
+| `tools/fetch_earth.py` | download the globe's data (Copernicus GLO-30, ESA WorldCover, ecoregions, rivers, lakes) into `assets/earth/`, converting the elevation tiles as they arrive |
 | `tools/ue_export_megaplants.py` | run inside Unreal: export every Megaplant's meshes, Nanite assembly hierarchy, textures and material parameters |
 | `tools/megaplant_to_mtree.py` | flatten an exported Megaplant into `.mtree` + species `.json` |
 | `tools/grass_to_mtree.py` | Megascans 3D grass (Fab glTF) → grass-patch species pack |

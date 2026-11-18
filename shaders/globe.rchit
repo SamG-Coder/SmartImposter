@@ -137,7 +137,9 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // large-scale variation so meadows and forests are not one flat colour from a distance
     alb *= mix(0.8, 1.15, nB) * mix(0.9, 1.1, nA);
     ao = mix(1.0, ao, 0.8);
-    vec3 T = normalize(cross(up, vec3(0.0, 0.0, 1.0)) + vec3(1e-4, 0.0, 0.0));
+    // east in Earth axes, into the camera frame the instance is placed in
+    vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
+    vec3 T = normalize(mat3(gl_ObjectToWorldEXT) * normalize(cross(vec3(0.0, 0.0, 1.0), upE) + vec3(1e-4, 0.0, 0.0)));
     vec3 Bt = cross(n, T);
     T = cross(Bt, n);
     n = normalize(T * nxy.x + Bt * nxy.y + n * sqrt(max(1.0 - dot(nxy, nxy), 0.05)));
@@ -188,7 +190,10 @@ void main() {
     vec3 up = normalize(p - gg.planet.xyz);
     if (dot(n, up) < 0.0) n = -n;
     vec3 ng = n;
-    float lat = degrees(asin(clamp(up.z, -1.0, 1.0)));
+    // `up` is in the camera frame (east / up / south at the camera); latitude, the elevation grid
+    // and east / north need Earth axes: the instance's inverse rotation takes it there.
+    vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
+    float lat = degrees(asin(clamp(upE.z, -1.0, 1.0)));
     bool cover = C.z > 0.5;
     bool water = cover ? B.w > 0.5 : elev < 0.0;
     bool lake = cover && water && elev > 0.5;
@@ -198,14 +203,14 @@ void main() {
     float cell = t / 160.0;
     float wTex = smoothstep(0.7, 2.0, cell / TEXEL_M);
     if (wTex > 0.0) {
-        float coslat = max(sqrt(1.0 - up.z * up.z), 0.02);
+        float coslat = max(sqrt(1.0 - upE.z * upE.z), 0.02);
         float lod = max(log2(footprint / (TEXEL_M * coslat)), 0.0);
-        vec2 uv = elevUV(up);
+        vec2 uv = elevUV(upE);
         vec2 texel = vec2(1.0 / 21600.0, 1.0 / 10800.0) * exp2(lod);
         float h0 = elevAt(uv, lod);
         float hE = elevAt(uv + vec2(texel.x, 0.0), lod), hW = elevAt(uv - vec2(texel.x, 0.0), lod);
         float hN = elevAt(uv - vec2(0.0, texel.y), lod), hS = elevAt(uv + vec2(0.0, texel.y), lod);
-        vec3 east = normalize(cross(vec3(0.0, 0.0, 1.0), up));
+        vec3 east = normalize(mat3(gl_ObjectToWorldEXT) * cross(vec3(0.0, 0.0, 1.0), upE));
         vec3 north = cross(up, east);
         float dx = 2.0 * texel.x * 2.0 * PI * R_GROUND * coslat;
         float dy = 2.0 * texel.y * PI * R_GROUND;

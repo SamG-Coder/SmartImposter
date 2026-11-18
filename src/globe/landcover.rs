@@ -1,19 +1,29 @@
-//! ESA WorldCover 2021 (10 m land cover, 11 classes) for the globe, where its 3 x 3 degree tiles
-//! are present in assets/earth/worldcover. Decoded once to 20 m (2 x 2 majority) and cached next
-//! to the tile (324 MB each).
+//! ESA WorldCover 2021 (10 m land cover, 11 classes) for the globe, wherever its 3 x 3 degree
+//! tiles are in assets/earth/worldcover (the whole planet is 2651 tiles, 124 GB).
+//!
+//! Nothing is decoded up front: each GeoTIFF's tile index is read on first use (the first 64 KB
+//! of a cloud-optimised GeoTIFF), and its 1024 x 1024 blocks are inflated on demand by the
+//! workers and kept in an LRU of RESIDENT blocks (1 MB each). Samples spread over a large area
+//! (far terrain) read the file's overviews (20 m ... ~600 m pixels) instead of single 10 m pixels.
 //!
 //! Class codes: 10 tree cover, 20 shrubland, 30 grassland, 40 cropland, 50 built-up, 60 bare /
 //! sparse vegetation, 70 snow and ice, 80 permanent water, 90 herbaceous wetland, 95 mangroves,
 //! 100 moss and lichen, 0 no data.
 
-use super::etopo::{read_tile, tiff_layout};
+use super::etopo::{read_tile, tiff_layouts, TiffLayout};
 use anyhow::{bail, Result};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
-/// 20 m cells per 3 degree tile side.
-const N: usize = 18_000;
-const PER_DEG: f64 = N as f64 / 3.0;
+/// 10 m cells per 3 degree tile side.
+const N: usize = 36_000;
+/// Block side, and the levels every WorldCover file has (10 m ... 36000 >> 6 = 562 pixels).
+const BLOCK: usize = 1024;
+const LEVELS: usize = 7;
+/// Decoded blocks kept in memory (1 MB each).
+const RESIDENT: usize = 2048;
 
 /// Class groups stored per terrain vertex (tiles.rs), in this order.
 pub const GROUPS: usize = 10;
@@ -42,11 +52,6 @@ pub fn group(class: u8) -> Option<usize> {
     })
 }
 
-pub struct LandCover {
-    /// key: (lat, lon) of the tile's south-west corner (multiples of 3); rows from the north edge
-    tiles: HashMap<(i32, i32), Vec<u8>>,
-}
-
 fn coords(name: &str) -> Option<(i32, i32)> {
     // ESA_WorldCover_10m_2021_v200_N45E006_Map.tif
     let part = name.split('_').find(|p| p.len() == 7 && (p.starts_with('N') || p.starts_with('S')))?;
@@ -57,104 +62,176 @@ fn coords(name: &str) -> Option<(i32, i32)> {
     Some((lat, lon))
 }
 
-fn decode_half(b: &[u8]) -> Result<Vec<u8>> {
-    let l = tiff_layout(b)?;
-    if l.bits != 8 || l.w != 2 * N || l.h != 2 * N || l.pred != 1 {
-        bail!("unexpected WorldCover layout {}x{} {} bits", l.w, l.h, l.bits);
+/// Read `len` bytes at `off` (positioned, so threads share the file handle).
+fn read_at(f: &std::fs::File, off: u64, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut buf = vec![0u8; len];
+    let mut done = 0;
+    while done < len {
+        #[cfg(windows)]
+        let n = std::os::windows::fs::FileExt::seek_read(f, &mut buf[done..], off + done as u64)?;
+        #[cfg(unix)]
+        let n = std::os::unix::fs::FileExt::read_at(f, &mut buf[done..], off + done as u64)?;
+        if n == 0 {
+            buf.truncate(done);
+            break;
+        }
+        done += n;
     }
-    let (tw, th) = (l.tw, l.th);
-    let tiles_x = l.w.div_ceil(tw);
-    let n_tiles = l.offs.len();
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let parts: Vec<Vec<(usize, Vec<u8>)>> = std::thread::scope(|s| {
-        let hs: Vec<_> = (0..threads)
-            .map(|k| {
-                let l = &l;
-                s.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
-                    let mut raw = vec![0u8; tw * th];
-                    let mut out = Vec::new();
-                    for t in (k..n_tiles).step_by(threads) {
-                        read_tile(l, b, t, &mut raw)?;
-                        // 2 x 2 majority (ties: the first)
-                        let mut half = vec![0u8; (tw / 2) * (th / 2)];
-                        for y in 0..th / 2 {
-                            for x in 0..tw / 2 {
-                                let c = [raw[2 * y * tw + 2 * x], raw[2 * y * tw + 2 * x + 1], raw[(2 * y + 1) * tw + 2 * x], raw[(2 * y + 1) * tw + 2 * x + 1]];
-                                let mut best = (0, c[0]);
-                                for &v in &c {
-                                    let n = c.iter().filter(|&&u| u == v).count();
-                                    if n > best.0 {
-                                        best = (n, v);
-                                    }
-                                }
-                                half[y * (tw / 2) + x] = best.1;
-                            }
-                        }
-                        out.push((t, half));
-                    }
-                    Ok(out)
-                })
-            })
-            .collect();
-        hs.into_iter().map(|h| h.join().unwrap()).collect::<Result<Vec<_>>>()
-    })?;
-    let mut img = vec![0u8; N * N];
-    let (hw, hh) = (tw / 2, th / 2);
-    for (t, half) in parts.into_iter().flatten() {
-        let (tx, ty) = ((t % tiles_x) * hw, (t / tiles_x) * hh);
-        for y in 0..hh {
-            let gy = ty + y;
-            if gy >= N {
-                break;
+    Ok(buf)
+}
+
+/// An open WorldCover GeoTIFF: its file and the block index of each level (full resolution,
+/// then the overviews).
+struct Cog {
+    file: std::fs::File,
+    levels: Vec<TiffLayout>,
+}
+
+fn open_cog(path: &Path) -> Result<Cog> {
+    let file = std::fs::File::open(path)?;
+    let mut len = 64 << 10;
+    loop {
+        let head = read_at(&file, 0, len)?;
+        match tiff_layouts(&head) {
+            Ok(levels) => {
+                let l = &levels[0];
+                // level i is N >> i square in 1024 x 1024 blocks (class_at relies on it)
+                let regular = levels.iter().enumerate().all(|(i, o)| o.w == N >> i && o.h == N >> i && o.tw == BLOCK && o.th == BLOCK);
+                if l.bits != 8 || !regular || l.pred != 1 || levels.iter().any(|o| o.bits != 8 || o.pred != 1) {
+                    bail!("unexpected WorldCover layout {}x{} {} bits", l.w, l.h, l.bits);
+                }
+                return Ok(Cog { file, levels });
             }
-            let row_len = hw.min(N.saturating_sub(tx));
-            img[gy * N + tx..gy * N + tx + row_len].copy_from_slice(&half[y * hw..y * hw + row_len]);
+            Err(_) if head.len() == len && len < 16 << 20 => len *= 4,
+            Err(e) => return Err(e),
         }
     }
-    Ok(img)
+}
+
+type Lazy<T> = Arc<(OnceLock<Option<Arc<T>>>, AtomicU64)>;
+
+thread_local! {
+    /// Each worker's last block (weak: never keeps an evicted block alive).
+    static LAST: std::cell::RefCell<((i32, i32, u32), Weak<Vec<u8>>)> = const { std::cell::RefCell::new(((i32::MIN, 0, 0), Weak::new())) };
+}
+
+pub struct LandCover {
+    /// 3 degree tiles on disk, by south-west corner
+    index: HashMap<(i32, i32), PathBuf>,
+    cogs: Mutex<HashMap<(i32, i32), Lazy<Cog>>>,
+    blocks: Mutex<HashMap<(i32, i32, u32), Lazy<Vec<u8>>>>,
+    clock: AtomicU64,
 }
 
 impl LandCover {
     pub fn load(dir: &Path) -> Result<Self> {
-        let t = std::time::Instant::now();
-        let mut tiles = HashMap::new();
+        let mut index = HashMap::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                if !name.ends_with("_Map.tif") {
-                    continue;
-                }
-                let Some(c) = coords(&name) else { continue };
-                let cache = e.path().with_extension("20m");
-                let data = match std::fs::read(&cache) {
-                    Ok(b) if b.len() == N * N => b,
-                    _ => {
-                        let b = std::fs::read(e.path())?;
-                        let img = decode_half(&b)?;
-                        let _ = std::fs::write(&cache, &img);
-                        img
+                if name.ends_with("_Map.tif") {
+                    if let Some(c) = coords(&name) {
+                        index.insert(c, e.path());
                     }
-                };
-                tiles.insert(c, data);
+                }
             }
         }
-        if !tiles.is_empty() {
-            println!("ESA WorldCover: {} tiles at 20 m ({:.1}s)", tiles.len(), t.elapsed().as_secs_f32());
+        if !index.is_empty() {
+            println!("ESA WorldCover: {} tiles indexed (10 m, decoded on demand)", index.len());
         }
-        Ok(LandCover { tiles })
+        Ok(LandCover { index, cogs: Mutex::new(HashMap::new()), blocks: Mutex::new(HashMap::new()), clock: AtomicU64::new(0) })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.tiles.is_empty()
+        self.index.is_empty()
     }
 
-    /// Class code at lat / lon (0 = no data).
+    fn cog(&self, key: (i32, i32)) -> Option<Arc<Cog>> {
+        let path = self.index.get(&key)?;
+        let slot = self.cogs.lock().unwrap().entry(key).or_insert_with(|| Arc::new((OnceLock::new(), AtomicU64::new(0)))).clone();
+        slot.0
+            .get_or_init(|| match open_cog(path) {
+                Ok(c) => Some(Arc::new(c)),
+                Err(e) => {
+                    eprintln!("WorldCover {}: {e:#}", path.display());
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// Decoded block `b` of level `level` of tile `key`.
+    fn block(&self, key: (i32, i32), level: usize, b: u32) -> Option<Arc<Vec<u8>>> {
+        let bk = (key.0, key.1, (level as u32) << 24 | b);
+        if let Some(v) = LAST.with(|l| {
+            let l = l.borrow();
+            if l.0 == bk {
+                l.1.upgrade()
+            } else {
+                None
+            }
+        }) {
+            return Some(v);
+        }
+        if !self.index.contains_key(&key) {
+            return None;
+        }
+        let slot = {
+            let mut m = self.blocks.lock().unwrap();
+            if !m.contains_key(&bk) && m.len() >= RESIDENT {
+                // drop the least recently used eighth of the decoded blocks
+                let mut old: Vec<(u64, (i32, i32, u32))> =
+                    m.iter().filter(|(_, s)| s.0.get().is_some()).map(|(k, s)| (s.1.load(Ordering::Relaxed), *k)).collect();
+                old.sort_unstable();
+                for (_, k) in old.into_iter().take(RESIDENT / 8) {
+                    m.remove(&k);
+                }
+            }
+            m.entry(bk).or_insert_with(|| Arc::new((OnceLock::new(), AtomicU64::new(0)))).clone()
+        };
+        slot.1.store(self.clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        let v = slot
+            .0
+            .get_or_init(|| {
+                let cog = self.cog(key)?;
+                let l = cog.levels.get(level)?;
+                let t = b as usize;
+                let src = read_at(&cog.file, l.offs[t], l.lens[t] as usize).ok()?;
+                // read_tile indexes the source by the layout's offsets: give it a one-tile layout
+                let one = TiffLayout { offs: vec![0], lens: vec![src.len() as u64], ..l.clone() };
+                let mut raw = vec![0u8; l.tw * l.th];
+                match read_tile(&one, &src, 0, &mut raw) {
+                    Ok(()) => Some(Arc::new(raw)),
+                    Err(e) => {
+                        eprintln!("WorldCover block {b} (level {level}) of {key:?}: {e:#}");
+                        None
+                    }
+                }
+            })
+            .clone()?;
+        LAST.with(|l| *l.borrow_mut() = (bk, Arc::downgrade(&v)));
+        Some(v)
+    }
+
+    /// Class code at lat / lon (0 = no data or no tile), full resolution.
     pub fn class(&self, lat: f64, lon: f64) -> u8 {
-        let (tlat, tlon) = ((lat / 3.0).floor() as i32 * 3, (lon / 3.0).floor() as i32 * 3);
-        let Some(t) = self.tiles.get(&(tlat, tlon)) else { return 0 };
-        let y = ((tlat as f64 + 3.0 - lat) * PER_DEG) as usize;
-        let x = ((lon - tlon as f64) * PER_DEG) as usize;
-        t[y.min(N - 1) * N + x.min(N - 1)]
+        self.class_at(lat, lon, 0)
+    }
+
+    /// Class code from level `level` (0 = 10 m, each further level halves the resolution; past
+    /// the coarsest overview the coarsest is used).
+    fn class_at(&self, lat: f64, lon: f64, level: usize) -> u8 {
+        let key = ((lat / 3.0).floor() as i32 * 3, (lon / 3.0).floor() as i32 * 3);
+        if !self.index.contains_key(&key) {
+            return 0;
+        }
+        let level = level.min(LEVELS - 1);
+        let w = N >> level;
+        let y = (((key.0 as f64 + 3.0 - lat) * w as f64 / 3.0) as usize).min(w - 1);
+        let x = (((lon - key.1 as f64) * w as f64 / 3.0) as usize).min(w - 1);
+        let b = (y / BLOCK) * w.div_ceil(BLOCK) + x / BLOCK;
+        let Some(blk) = self.block(key, level, b as u32) else { return 0 };
+        blk[(y % BLOCK) * BLOCK + x % BLOCK]
     }
 
     /// Class group at lat / lon (None = no data).
@@ -164,10 +241,13 @@ impl LandCover {
 
     /// Class fractions over a square of `size` metres around lat / lon (k x k samples).
     pub fn fractions(&self, lat: f64, lon: f64, size: f64) -> Option<[f32; GROUPS]> {
-        if self.tiles.is_empty() {
+        if self.index.is_empty() {
             return None;
         }
         let k = ((size / 20.0).ceil() as usize).clamp(1, 6);
+        // the coarsest level whose pixels are no larger than the sample spacing
+        let spacing = size / k as f64;
+        let level = ((spacing / (3.0 * 111_320.0 / N as f64)).log2().floor().max(0.0)) as usize;
         let dlat = size / 111_320.0;
         let dlon = dlat / lat.to_radians().cos().max(0.05);
         let mut f = [0f32; GROUPS];
@@ -175,7 +255,7 @@ impl LandCover {
         for j in 0..k {
             for i in 0..k {
                 let (a, b) = ((i as f64 + 0.5) / k as f64 - 0.5, (j as f64 + 0.5) / k as f64 - 0.5);
-                if let Some(g) = group(self.class(lat + b * dlat, lon + a * dlon)) {
+                if let Some(g) = group(self.class_at(lat + b * dlat, lon + a * dlon, level)) {
                     f[g] += 1.0;
                     n += 1.0;
                 }

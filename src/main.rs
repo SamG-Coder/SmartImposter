@@ -984,6 +984,11 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> Result<()> {
+    // `--convert-dem a.tif ...`: GLO-30 GeoTIFFs -> compact .dem tiles (tools/fetch_earth.py)
+    let raw: Vec<String> = std::env::args().collect();
+    if raw.get(1).map(String::as_str) == Some("--convert-dem") {
+        return globe::dem::convert_cli(&raw[2..]);
+    }
     let args = parse_args();
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
