@@ -28,15 +28,16 @@ struct Ctx {
     vec3 c;
     float R;
     float N;
-    float res;
+    vec2 res;  // texels per frame (across, up)
+    vec2 ext;  // half the frame's width and height (m)
     float lod;
     float marchLod;
     float thr;
 };
 
 vec2 atlasUV(Ctx m, vec2 cell, vec2 uv) {
-    float pad = exp2(m.lod) * 0.5 / m.res;
-    return (cell + clamp(uv, vec2(pad), vec2(1.0 - pad))) / m.N;
+    vec2 pad = exp2(m.lod) * 0.5 / m.res;
+    return (cell + clamp(uv, pad, 1.0 - pad)) / m.N;
 }
 
 bool inFrame(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0))); }
@@ -73,11 +74,11 @@ bool marchFrame(Ctx m, vec2 cell, vec3 o, vec3 d, float t0, float t1, int steps,
     vec3 f = frameDir(cell, m.N);
     vec3 r, u;
     frameBasis(f, r, u);
-    float s = 0.5 / m.R;
+    vec2 s = 0.5 / m.ext;
     vec3 q0 = o - m.c;
     // Frame-space coordinates are linear in t: S(t) = A + B t  (uv in [0,1], height in [-1,1]).
-    vec3 A = vec3(dot(q0, r) * s + 0.5, dot(q0, u) * s + 0.5, dot(q0, f) / m.R);
-    vec3 B = vec3(dot(d, r) * s, dot(d, u) * s, dot(d, f) / m.R);
+    vec3 A = vec3(dot(q0, r) * s.x + 0.5, dot(q0, u) * s.y + 0.5, dot(q0, f) / m.R);
+    vec3 B = vec3(dot(d, r) * s.x, dot(d, u) * s.y, dot(d, f) / m.R);
 
     // Primary rays: solid shell of SHELL (in units of R) behind the surface, and enough steps that
     // one step never moves more than 80% of the shell in depth (binary refinement fixes the rest).
@@ -208,13 +209,14 @@ void main() {
     m.c = info.centerRadius.xyz;
     m.R = info.centerRadius.w;
     m.N = float(info.grid);
-    m.res = float(info.res);
+    m.res = vec2(float(info.res & 0xFFFFu), float(info.res >> 16));
+    m.ext = info.frame.xy;
 
     // Mip selection from the ray footprint at the entry point (ray cone from the camera).
     vec3 wp = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * t0;
     float dist = length(wp - camO);
     float worldScale = sqrt(s2);
-    float texel = 2.0 * m.R * worldScale / m.res;
+    float texel = 2.0 * m.ext.x * worldScale / m.res.x;
     float footprint = dist * g.camFwd.w;
     // -0.75 mip bias: sharper than the footprint suggests; the extra aliasing is resolved by TAA.
     float lodExact = log2(max(footprint / texel, 1e-6));

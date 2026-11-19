@@ -627,6 +627,8 @@ impl App {
             let sz = s.window.inner_size();
             s.r.resize(sz.width, sz.height)?;
             if s.r.need_resize {
+                // (no surface to draw to: a minimised window. Wait for one without spinning.)
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 return Ok(());
             }
         }
@@ -1241,12 +1243,15 @@ impl ApplicationHandler for App {
                     el.exit();
                 }
             }
+            // (a capture run is scripted: stray keys and clicks must not change what it measures)
             WindowEvent::KeyboardInput { event, .. } => {
                 if let PhysicalKey::Code(code) = event.physical_key {
-                    self.key(code, event.state == ElementState::Pressed, event.repeat, el);
+                    if self.args.shot.is_none() || code == KeyCode::Escape {
+                        self.key(code, event.state == ElementState::Pressed, event.repeat, el);
+                    }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if self.args.shot.is_none() => {
                 if let Some(s) = self.state.as_mut() {
                     match button {
                         // Left click: capture the mouse for free look (Esc releases).

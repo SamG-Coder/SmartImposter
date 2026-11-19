@@ -33,9 +33,11 @@ struct ImpHit {
 // Custom index layout: low 8 bits mesh/variant id, bits 8..10 impostor mask colour, bits 11..23 seed.
 uint instSeed(uint ci) { return ci >> 11; }
 
-// Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs PlantRec)
-// is at gl_InstanceCustomIndexEXT + gl_PrimitiveID: object->world 3x4 (rows), variant | seed << 8.
-// 52 bytes, packed (the buffers use scalar layout): 13 million trees cost no padding
+// Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs
+// PlantRecGpu) is at gl_InstanceCustomIndexEXT + gl_PrimitiveID: object->world 3x4 (rows),
+// variant | seed << 8. 52 bytes, packed (the buffers use scalar layout). The matrix is stored as
+// it is used: impostor.rint runs for every box a ray stops at, and a more compact record (a
+// quaternion, 32 bytes) measurably slows that down for the arithmetic of unpacking it.
 struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; };
 mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xyz)); }
 vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
@@ -59,7 +61,7 @@ float thinLevels(float d) {
 }
 uint instColor(uint ci) { return (ci >> 8) & 7u; }
 
-struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha)
+struct MeshInfo { uint64_t pos; uint64_t nrm; uint64_t idx; uint64_t mat; uint64_t uv; uint texSet; uint flags; }; // flags: 1 = alpha-tested (opacity in the leaf texture alpha); >> 8: a grid mesh's vertices per side (meshTri)
 
 // Per plant variant (= atlas slot).
 struct ImpostorInfo {
@@ -68,9 +70,10 @@ struct ImpostorInfo {
     vec4 bmax;
     vec4 trans;        // rgb: mean leaf transmission colour of the species (for impostor hits)
     uint grid;         // frames per side
-    uint res;          // texels per frame side
+    uint res;          // texels per frame: across | up << 16
     uint mips;
     float lodScale;    // LOD distances scale with plant size (trees 1, shrubs/ferns smaller)
+    vec4 frame;        // xy: half the width and height of a frame (m), around the bounding sphere's centre
 };
 
 // Per species: Unreal material tints (0.5 = neutral) and translucency colour.
@@ -82,7 +85,7 @@ struct SpeciesInfo { vec4 leafTint; vec4 barkTint; vec4 transTint; };
 struct InstInfo {
     vec3 center;  // tree bounding-sphere centre (world)
     uint data;    // tree index (24 bits) | variant (bits 24..31)
-    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness
+    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness; from bit 5: which part of the plant
 };
 uint instVariant(uint data) { return data >> 24; }
 
@@ -104,3 +107,13 @@ layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Vec
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer UVec3Ref { uvec3 v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer Vec2Ref { vec2 v[]; };
 layout(buffer_reference, scalar, buffer_reference_align = 4) readonly buffer UintRef { uint v[]; };
+
+// The vertices of triangle `prim` of a mesh. A grid mesh (the forest scene's terrain, world.rs
+// World::mesh: n x n vertices, two triangles per cell, in rows) has no index buffer.
+uvec3 meshTri(MeshInfo m, uint prim) {
+    uint n = m.flags >> 8;
+    if (n == 0u) return UVec3Ref(m.idx).v[prim];
+    uint q = prim >> 1;
+    uint a = q + q / (n - 1u); // row j = q / (n - 1), vertex j n + i
+    return (prim & 1u) == 0u ? uvec3(a, a + n, a + 1u) : uvec3(a + 1u, a + n, a + n + 1u);
+}

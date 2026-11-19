@@ -17,6 +17,11 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    /// No buffer (address 0; destroying it does nothing).
+    pub fn none() -> Self {
+        Buffer { raw: vk::Buffer::null(), alloc: None, size: 0, addr: 0 }
+    }
+
     pub fn mapped(&mut self) -> &mut [u8] {
         self.alloc
             .as_mut()

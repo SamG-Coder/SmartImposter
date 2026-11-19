@@ -7,14 +7,21 @@
 //!
 //! A cache file is the bake's BC block stream for one variant: per level 0..mips the albedo
 //! (BC3), normal (BC5) and depth (BC5) atlases, then the half-resolution visibility (BC3) levels.
+//!
+//! A frame is a rectangle (`Res`: texels across and up): the square view of the plant's bounding
+//! sphere cropped to what the plant can cover in any view (renderer.rs frame_res). A tree is
+//! tall and narrow: most of the square is empty.
 
 use anyhow::{Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const DIR: &str = "assets/cache/impostors";
-const MAGIC: &[u8; 8] = b"SIIMP\0\0\x02";
-const HEADER: u64 = 8 + 8 + 4 * 4;
+const MAGIC: &[u8; 8] = b"SIIMP\0\0\x03";
+const HEADER: u64 = 8 + 8 + 5 * 4;
+
+/// Texels per frame: across and up.
+pub type Res = [u32; 2];
 
 /// Levels the base atlas drops (1/4 resolution: 1/16 of the texels).
 pub const BASE_SKIP: u32 = 2;
@@ -25,25 +32,24 @@ pub fn skip_for(mips: u32) -> u32 {
 }
 
 /// One BC block region of the stream: image (0 albedo, 1 normal, 2 depth, 3 visibility), its
-/// level in the full atlas, texels per side, byte offset and length in the stream.
+/// level in the full atlas, texels across and up, byte offset and length in the stream.
 #[derive(Clone, Copy, Debug)]
 pub struct Region {
     pub img: usize,
     pub level: u32,
-    pub size: u32,
+    pub size: [u32; 2],
     pub offset: u64,
     pub bytes: u64,
 }
 
 /// The stream layout of an atlas of `grid` x `grid` frames of `res` texels with `mips` levels
 /// (the order renderer.rs bake_impostors encodes in).
-pub fn layout(grid: u32, res: u32, mips: u32) -> Vec<Region> {
-    let size = grid * res;
+pub fn layout(grid: u32, res: Res, mips: u32) -> Vec<Region> {
     let mut out = Vec::new();
     let mut offset = 0u64;
     let mut push = |img: usize, src_level: u32, level: u32| {
-        let s = size >> src_level;
-        let bytes = (s as u64 / 4) * (s as u64 / 4) * 16;
+        let s = [(grid * res[0]) >> src_level, (grid * res[1]) >> src_level];
+        let bytes = (s[0] as u64 / 4) * (s[1] as u64 / 4) * 16;
         out.push(Region { img, level, size: s, offset, bytes });
         offset += bytes;
     };
@@ -59,7 +65,7 @@ pub fn layout(grid: u32, res: u32, mips: u32) -> Vec<Region> {
     out
 }
 
-pub fn stream_bytes(grid: u32, res: u32, mips: u32) -> u64 {
+pub fn stream_bytes(grid: u32, res: Res, mips: u32) -> u64 {
     layout(grid, res, mips).iter().map(|r| r.bytes).sum()
 }
 
@@ -104,27 +110,27 @@ impl Key {
 }
 
 /// Does `path` hold a bake with this key and shape?
-pub fn valid(path: &Path, key: u64, grid: u32, res: u32, mips: u32) -> bool {
+pub fn valid(path: &Path, key: u64, grid: u32, res: Res, mips: u32) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else { return false };
     let mut h = [0u8; HEADER as usize];
     if f.read_exact(&mut h).is_err() || &h[..8] != MAGIC {
         return false;
     }
     let u = |i: usize| u32::from_le_bytes(h[i..i + 4].try_into().unwrap());
-    let len = u(28) as u64;
+    let len = u(32) as u64;
     u64::from_le_bytes(h[8..16].try_into().unwrap()) == key
-        && (u(16), u(20), u(24)) == (grid, res, mips)
+        && (u(16), u(20), u(24), u(28)) == (grid, res[0], res[1], mips)
         && len == stream_bytes(grid, res, mips)
         && f.metadata().map(|m| m.len() == HEADER + len).unwrap_or(false)
 }
 
-pub fn write(path: &Path, key: u64, grid: u32, res: u32, mips: u32, stream: &[u8]) -> Result<()> {
+pub fn write(path: &Path, key: u64, grid: u32, res: Res, mips: u32, stream: &[u8]) -> Result<()> {
     std::fs::create_dir_all(DIR)?;
     let tmp = path.with_extension("tmp");
     let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
     f.write_all(MAGIC)?;
     f.write_all(&key.to_le_bytes())?;
-    for v in [grid, res, mips, stream.len() as u32] {
+    for v in [grid, res[0], res[1], mips, stream.len() as u32] {
         f.write_all(&v.to_le_bytes())?;
     }
     f.write_all(stream)?;
@@ -235,14 +241,15 @@ mod tests {
 
     #[test]
     fn layout_matches_the_bake_order() {
-        // 12 frames of 32 texels, 3 levels: 3 x 3 colour regions then 2 visibility levels
-        let l = layout(12, 32, 3);
+        // 12 frames of 32 x 64 texels, 3 levels: 3 x 3 colour regions then 2 visibility levels
+        let l = layout(12, [32, 64], 3);
         assert_eq!(l.len(), 3 * 3 + 2);
-        assert_eq!((l[0].img, l[0].level, l[0].size, l[0].offset), (0, 0, 384, 0));
-        assert_eq!(l[3].size, 192);
+        assert_eq!((l[0].img, l[0].level, l[0].size, l[0].offset), (0, 0, [384, 768], 0));
+        assert_eq!(l[0].bytes, 96 * 192 * 16);
+        assert_eq!(l[3].size, [192, 384]);
         let vis: Vec<_> = l.iter().filter(|r| r.img == 3).map(|r| (r.level, r.size)).collect();
-        assert_eq!(vis, vec![(0, 192), (1, 96)]);
-        assert_eq!(stream_bytes(12, 32, 3), l.iter().map(|r| r.bytes).sum::<u64>());
+        assert_eq!(vis, vec![(0, [192, 384]), (1, [96, 192])]);
+        assert_eq!(stream_bytes(12, [32, 64], 3), l.iter().map(|r| r.bytes).sum::<u64>());
         assert_eq!(skip_for(3), 1);
         assert_eq!(skip_for(7), 2);
     }
@@ -262,22 +269,23 @@ mod tests {
     #[test]
     fn cache_round_trip() {
         let p = std::env::temp_dir().join("si_atlas_test.bc");
-        let n = stream_bytes(12, 32, 3) as usize;
+        let n = stream_bytes(12, [32, 32], 3) as usize;
         let data: Vec<u8> = (0..n).map(|i| (i * 7 % 251) as u8).collect();
         let tmpdir_write = |path: &Path| -> Result<()> {
             let mut f = std::fs::File::create(path)?;
             f.write_all(MAGIC)?;
             f.write_all(&42u64.to_le_bytes())?;
-            for v in [12u32, 32, 3, n as u32] {
+            for v in [12u32, 32, 32, 3, n as u32] {
                 f.write_all(&v.to_le_bytes())?;
             }
             f.write_all(&data)?;
             Ok(())
         };
         tmpdir_write(&p).unwrap();
-        assert!(valid(&p, 42, 12, 32, 3));
-        assert!(!valid(&p, 43, 12, 32, 3));
-        let l = layout(12, 32, 3);
+        assert!(valid(&p, 42, 12, [32, 32], 3));
+        assert!(!valid(&p, 43, 12, [32, 32], 3));
+        assert!(!valid(&p, 42, 12, [32, 64], 3));
+        let l = layout(12, [32, 32], 3);
         let got = read_regions(&p, &l[3..5]).unwrap();
         let (a, b) = (l[3].offset as usize, (l[4].offset + l[4].bytes) as usize);
         assert_eq!(got, data[a..b]);

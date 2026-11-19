@@ -83,10 +83,10 @@ same GPU, with the same ray tracing pipeline, once, and cached.
   real sun and moon.
 - **Megascans grass.** Clumps are grouped into 3 m patches. Real alpha-tested cards near the
   camera, compressed impostors beyond, the ground texture past the draw distance.
-- **Compressed, cached, streamed atlases.** Each variant's atlas is sized to the plant,
-  BC-compressed on the GPU (3.25 bytes per texel instead of 16) and cached on disk. On the GPU every
-  variant keeps a small base atlas; only the variants growing near the camera stream in their full
-  one.
+- **Compressed, cached, streamed atlases.** Each variant's atlas is sized and cropped to the
+  plant, BC-compressed on the GPU (3.25 bytes per texel instead of 16) and cached on disk. The
+  forest scene loads only what grows in it; on the globe every variant keeps a small base atlas and
+  only the variants growing near the camera stream in their full one.
 - **Impostors that light like the real plant.** Traced, layered self-shadowing, plus the *normal
   spread* of the leaves or blades baked per texel. Impostor brightness is within a few percent of
   the real meshes, front-lit, back-lit and from above, for trees and grass alike.
@@ -125,19 +125,25 @@ frame's GPU work. `SI_PROF_SKIP` takes out the shadow and AO rays to see their s
 
 | View (`--at`) | GPU | GPU memory |
 |---|---|---|
-| Lake Como from 300 m (`46.05,9.25,300,200,-8`) | 16.3 ms | 8.5 GB |
-| In the treetops above Lake Como (`45.99,9.262,12,250,-4`) | 13.2 ms | 11.7 GB |
+| Lake Como from 300 m (`46.05,9.25,300,200,-8`) | 16.3 ms | 7.8 GB |
+| In the treetops above Lake Como (`45.99,9.262,12,250,-4`) | 13.2 ms | 10.4 GB |
 | Aokigahara and Mount Fuji from 70 m (`35.47,138.62,70,140,-8`) | 18.5 ms | 11.7 GB |
 | The Earth from 12,000 km (`30,5,12000000,0,-90`) | 5.5 ms | 7.1 GB |
 
 Flying at 240 m/s, 300 m over Lake Como, with everything streaming in (`--bench-move 4`, 900
 frames): average 17.2 ms, 99th percentile 21–23 ms, worst 24–37 ms over repeated runs.
 
-Startup: the forest scene grows its ~6M trees in ~23 s (the succession simulation), then the
-renderer is ready in ~5 s (texture decode, BLAS builds, impostor atlases from the cache in ~1 s);
-the globe is ready in ~3 s. The first run bakes and caches every impostor atlas (~16 s for 207
-variants) and compresses the textures. GPU memory: ~8 GB for the forest scene, 7–12 GB on the
-globe depending on the view.
+Startup: the forest scene is ready in ~8 s: the world in ~3 s (the grown forest comes from
+`assets/cache/forest`; the first run of a biome grows its ~6M trees in ~23 s, the succession
+simulation), then the renderer in ~5 s (texture decode, BLAS builds, impostor atlases from the
+cache in ~1 s). The globe is ready in ~3 s. The first run of a scene bakes and caches the impostor
+atlases it shows (~5 s for a biome's 60–90 variants, ~16 s for all 207 on the globe) and
+compresses the textures.
+
+GPU memory: 4.2 GB for the default temperate forest (1.8 GB desert, 4.7 GB boreal, 5.1 GB
+rainforest), 7–11 GB on the globe depending on the view. The forest scene loads only what grows
+in it: 62 of the 207 variants, 172 of the 517 meshes, 17 of the 52 species' textures and 12 of
+the 26 ground scans in the temperate biome.
 
 ## How it works
 
@@ -189,7 +195,18 @@ exactly the materials, and the alpha-tested cut-outs, the meshes have.
 
 Each variant's frame resolution follows its size: 5.5 cm texels for a full-size tree (scaled by
 the variant's LOD scale, since small plants switch to impostors closer; grass gets 1.6x coarser
-texels), rounded to a multiple of 32 and capped at 448 px.
+texels), rounded to a multiple of 32 and capped at 448 px for the square that shows the plant's
+whole bounding sphere.
+
+**Frames cropped to the plant.** A tree is tall and narrow: in that square 65–90% of the texels
+are empty. So the frame that is baked and kept is the square cropped, about its centre, to what
+the plant can cover in any view (`frame_res` in `src/renderer.rs`): as wide as the plant reaches
+sideways from its axis, as tall as it reaches at all, both measured on the real vertices, plus a
+margin of one texel of the coarsest mip. The rays and their random numbers are those of the square
+bake, and the crop moves in whole BC blocks of the coarsest level, so the texels and blocks that
+remain are bit for bit the square's; only the empty margins go. A poplar's 448 px square becomes
+192x448, an aspen's 352 px square 160x352. Compact plants (grass patches, shrubs, boulders) keep
+their squares.
 
 The bake writes an uncompressed scratch atlas shared by all variants. `mip.comp` builds
 coverage-weighted mips, so empty texels don't drag depth or colour towards zero. Then `bcenc.comp`
@@ -204,18 +221,22 @@ atlases:
 | visibility | BC3, half resolution | sky visibility `a + b·up`, **normal spread** (length of the averaged normal) |
 
 Texels with zero coverage are left out of the block endpoint fit, so silhouette blocks keep their
-precision. That's 3.25 bytes per texel instead of 16: all 207 variants take 7.4 GB at full
-resolution (0.6–125 MB each) instead of 36 GB.
+precision. That's 3.25 bytes per texel instead of 16: with the cropped frames all 207 variants
+take 5.5 GB at full resolution (0.6–125 MB each; 7.4 GB as squares, 27 GB uncompressed).
 
-**Baked once, streamed by need** (`src/atlas.rs`). The compressed blocks of every variant go to
+**Baked once, loaded by need** (`src/atlas.rs`). The compressed blocks of a variant go to
 `assets/cache/impostors`, keyed on the asset, the settings and the bake shaders, so later starts
-read them instead of baking (`SI_REBAKE=1` forces a bake). On the GPU every variant keeps a base
-atlas, its levels from 1/4 resolution down (0.46 GB for all 207), which is all a far impostor
-samples anyway. A variant gets its full atlas while one of its plants is close enough for the base
-atlas's texels to be bigger than a pixel, nearest first within `SI_IMPOSTOR_MB` (default 25% of
-VRAM): a loader thread reads it straight into a mapped upload buffer, and the copies are recorded
-into the frame like any other upload, so it never stalls a frame. The forest scene loads the full
-atlases of the variants that grow in it at startup.
+read them instead of baking (`SI_REBAKE=1` forces a bake). A variant is baked the first time a
+scene shows it.
+
+- **The forest scene** only ever shows the variants that grow in it (62 of the 207 in the
+  temperate biome): their full atlases are loaded at startup (1.8 GB), and nothing for the rest.
+- **The globe** can bring any species into view. Every variant keeps a base atlas on the GPU, its
+  levels from 1/4 resolution down, which is all a far impostor samples anyway. A variant gets its
+  full atlas while one of its plants is close enough for the base atlas's texels to be bigger than
+  a pixel, nearest first within `SI_IMPOSTOR_MB` (default 25% of VRAM): a loader thread reads it
+  straight into a mapped upload buffer, and the copies are recorded into the frame like any other
+  upload, so it never stalls a frame.
 
 ### 3. The intersection shader (`shaders/impostor.rint`)
 
@@ -318,6 +339,15 @@ height, plants under 6 m to 450 m. The CPU keeps a per-plant state machine with 
 rebuilds the instance list only when a plant changes state; the shaders compute the fade from the
 exact distance every frame, so the transition is continuous. An 8M-instance budget keeps very
 long mesh distances from exhausting GPU memory.
+
+**Impostor boxes in cells.** The forest scene's plants are grouped into 192 m cells, one AABB
+BLAS per cell with one box per plant, and a record per plant (its transform, variant and seed).
+2.6M of the 6.2M plants have a draw distance (hazel,
+shrubs, ferns, grass): the intersection shader drops them beyond it, so their boxes are only
+worth having near the camera. A cell's permanent BLAS holds just the plants that are never
+culled; while the camera is within the draw distance of a cell, the TLAS shows a complete BLAS of
+it instead, built inside the frame when the cell comes into reach and freed when it is left
+behind. The picture is the same, and the far cells' boxes take no memory.
 
 ### 7. Terrain, rivers, forest growth and ground
 
@@ -460,6 +490,19 @@ Tried and dropped:
 | Ground AO rays skipping grass | 17% faster from above, but the ground between blades got visibly brighter |
 | Cheaper impostor march for AO rays | no measurable gain |
 | Separate R8 opacity textures for the alpha test | no measurable gain |
+
+A later pass on the 6.2M-plant forest was about GPU memory (8.3 GB -> 4.2 GB, same image, same
+frame time): loading only what the scene shows, cropped impostor frames, cells that keep
+draw-distance plants out of the far field, no terrain index buffer. Profiling it showed where the
+ray tracing time goes: a fixed cost for every plant box a ray stops at (halving the impostor march
+steps, or the ground shading, changes nothing; shrinking the boxes by 30% saves 15%). What that
+ruled out:
+
+| Idea | Why not |
+|---|---|
+| Up to 3 stacked hull boxes per plant (thin at the trunk, wide at the crown) | these trees branch almost to the ground: no gain, +105 MB of BLAS |
+| A cylinder bound around each plant's axis instead of its turned box | crowns are not round enough: within noise |
+| A 32-byte plant record (position + scaled quaternion) instead of the 3x4 matrix | 125 MB less, but ~5% slower: the unpacking runs for every box |
 
 The remaining cost is primary rays through dense grass (any-hit invocations) and the fixed DLSS-RR
 cost at DLAA; DLSS-RR Quality halves the frame time for a slightly softer image.
@@ -629,7 +672,9 @@ GPU memory is kept in check without losing detail: textures are block-compressed
 cached (`assets/cache/tex`): colour as BC7, normal x / y as BC5, single data channels as BC4,
 >= 35 dB for almost all of them, a quarter of RGBA8 or less; static and streamed BLASes are
 compacted (the tree meshes 1.9 -> 0.7 GB); tree AABBs are build input only; plant records carry
-no padding; impostor atlases stream by need (see [Baking and compressing the
+no padding; the terrain grid's triangles are worked out in the shader (no index buffer); the
+forest scene loads only the species that grow in it; impostor frames are cropped to the plant and
+atlases stream by need (see [Baking and compressing the
 impostor](#2-baking-and-compressing-the-impostor)). Terrain tiles nothing has drawn for 4 s are
 evicted, and empty vertex pool and BLAS heap chunks are given back, so memory stays flat when the
 camera jumps across the planet. `SI_MEM=1` prints the GPU memory by allocation with the benchmark
@@ -652,8 +697,8 @@ stars, seasons in the vegetation, and wind.
 
 ### Requirements
 - A GPU with Vulkan hardware ray tracing (`VK_KHR_ray_tracing_pipeline`, `VK_KHR_acceleration_structure`). Developed on an RTX 5080 (16 GB).
-- About 8 GB of VRAM for the forest scene and 12 GB for the globe at the defaults (16 GB
-  recommended). Lower it with `SI_IMPOSTOR_MB=2000`, `--imp-res 320`, `SI_TEX_MAX=1024` or
+- About 4–5 GB of VRAM for the forest scene and 11 GB for the globe at the defaults (16 GB
+  recommended for the globe). Lower it with `SI_IMPOSTOR_MB=2000`, `--imp-res 320`, `SI_TEX_MAX=1024` or
   `--species Beech,Alder` (forest scene).
 - Rust (stable) and the [Vulkan SDK](https://vulkan.lunarg.com/), for `glslangValidator`.
 - Python 3.12 with `usd-core`, `numpy` and `pillow`, for the asset converters.
@@ -774,6 +819,7 @@ cargo run --release
 | `SI_GROUND_DIR` | Fab library cache with the ground surfaces |
 | `SI_IMPOSTOR_MB` | GPU memory for full impostor atlases (default 25% of VRAM) |
 | `SI_REBAKE` | re-bake every impostor atlas instead of reading the cache |
+| `SI_REGROW` | grow the forest again instead of reading the cache (`assets/cache/forest`) |
 | `SI_ATLAS_LOG` | log full-atlas uploads (image creation and descriptor update times) |
 | `SI_MEM` | print GPU memory by allocation with the benchmark output and after each tour shot |
 | `SI_TOUR_STILLS` | `--tour`: save three stills per shot to `shots/` |
