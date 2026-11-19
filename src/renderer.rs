@@ -29,7 +29,7 @@ const OCEAN_TEX: usize = crate::globe::ocean::CASCADES * 2;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
-pub const MAX_GROUND_TEX: usize = 80;
+pub const MAX_GROUND_TEX: usize = 81;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -69,6 +69,10 @@ pub struct Globals {
     /// Forest scene: the biome's ground map (biome.rs Preset::ground_packed), one scan index per
     /// ground slot, 4 per word.
     pub biome: [u32; 4],
+    /// Forest scene, the lawn (lawn.rs; set by the renderer): blade height (0 = no lawn), tile
+    /// edge, views (azimuths, slopes); texels per view, gutter texels, atlas levels, atlas slot;
+    /// slope of the steepest and the flattest views.
+    pub lawn: [[f32; 4]; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -135,6 +139,8 @@ struct MeshInfoGpu {
 
 /// Mesh flag: the leaf texture's alpha is an opacity mask (alpha-tested in tri.rahit).
 const MESH_ALPHA_TESTED: u32 = 1;
+/// Mesh flag: the lawn tile's blades (tri.rchit colours them itself).
+const MESH_LAWN_BLADE: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -259,6 +265,16 @@ pub struct ImpostorSettings {
     pub ao_rays: u32,
     pub ao_range: f32,
     pub vis_rays: u32,
+    /// short grass as a parallax layer over the grass ground (lawn.rs; forest scene)
+    pub lawn: bool,
+}
+
+/// The lawn on the GPU: its atlas is one more slot after the plant variants', its tile mesh one
+/// more mesh after the terrain (only the bake traces it).
+struct LawnGpu {
+    slot: usize,
+    mesh: u32,
+    tris: u32,
 }
 
 impl ImpostorSettings {
@@ -455,6 +471,9 @@ pub struct Renderer {
     ground_layers: u32,
     mat_sampler: vk::Sampler,
     has_tex: bool,
+    lawn: Option<LawnGpu>,
+    /// the lawn is drawn (key toggle; nothing happens without one)
+    pub lawn_on: bool,
     sharp_img: Image,
     sharpen_layout: vk::PipelineLayout,
     sharpen_pipe: vk::Pipeline,
@@ -549,6 +568,11 @@ pub struct Renderer {
     /// insts / inst_data changed and must be copied to the GPU buffers (upload_instances).
     upload_pending: bool,
     first_update: bool,
+    /// The lawn's real blades around the camera (lawn.rs near_radius): the tile's instances, and
+    /// where the camera was when they were placed (they are placed again once it has moved).
+    grass_insts: Vec<vk::AccelerationStructureInstanceKHR>,
+    grass_at: Vec3,
+    grass_radius: f32,
     near_count: usize,
     pub need_resize: bool,
     render_scale: f32,
@@ -719,7 +743,7 @@ impl Renderer {
         height: u32,
         pack: TreePack,
         catalog: Catalog,
-        world: World,
+        mut world: World,
         imp: ImpostorSettings,
         vsync: bool,
         validation: bool,
@@ -742,7 +766,9 @@ impl Renderer {
         };
         let dlss_mode = if dlss_ok { dlss_mode } else { None };
         let on_globe = globe.is_some();
-        let used = Used::new(&pack, &catalog, &world, on_globe);
+        let mut used = Used::new(&pack, &catalog, &world, on_globe);
+        // the lawn's square of blades (forest scene): a mesh after the terrain
+        let lawn_tile = (imp.lawn && !on_globe).then(crate::lawn::tile);
         if !on_globe {
             let n = |v: &[bool]| v.iter().filter(|&&b| b).count();
             println!(
@@ -777,6 +803,12 @@ impl Renderer {
                 ground_tex.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
             }
             ground_tex.truncate(MAX_GROUND_TEX - 2);
+            // the slot before the masks: the grass map of `--lawn auto` (World::build_grass_map)
+            if imp.lawn && !on_globe && crate::lawn::auto_short() > 0.0 {
+                world.build_grass_map(&pack.trees, &catalog);
+                let rgba: Vec<u8> = world.grass.iter().flat_map(|&v| [v, v, v, 255]).collect();
+                ground_tex[MAX_GROUND_TEX - 3] = crate::textures::upload_with_mips(&gpu, MASK_RES as u32, MASK_RES as u32, &rgba, vk::Format::R8G8B8A8_UNORM, "grass map")?;
+            }
             const FAR_RES: u32 = 2048;
             let far = world.far_mask(FAR_RES as usize, &pack.trees, &catalog);
             ground_tex.push(crate::textures::upload_with_mips(&gpu, FAR_RES, FAR_RES, &far, vk::Format::R8G8B8A8_UNORM, "far ground mask")?);
@@ -795,9 +827,11 @@ impl Renderer {
         // ---- geometry: plant meshes followed by terrain
         assert!(pack.meshes.len() < 2048, "mesh ids are 11 bits in the instance custom index");
         let mut meshes = Vec::new();
-        // (the terrain, after the plant meshes, is always shown)
+        // (the terrain, after the plant meshes, is always shown; so is the lawn tile after it)
         let shown = |i: usize| used.mesh.get(i).copied().unwrap_or(true);
-        for (i, m) in pack.meshes.iter().chain(std::iter::once(&world.terrain)).enumerate() {
+        let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).chain(lawn_tile.iter()).collect();
+        let lawn_mesh = lawn_tile.as_ref().map(|_| pack.meshes.len() + 1);
+        for (i, m) in all_meshes.iter().enumerate() {
             meshes.push(if shown(i) { upload_mesh(&gpu, m)? } else { MeshGpu::none() });
         }
         let infos: Vec<MeshInfoGpu> = meshes
@@ -805,11 +839,12 @@ impl Renderer {
             .enumerate()
             .map(|(i, m)| {
                 // a grid mesh (the terrain): its index buffer is only BLAS build input
-                let grid = if i < pack.meshes.len() { pack.meshes[i].grid } else { world.terrain.grid };
+                let grid = all_meshes[i].grid;
+                let alpha = if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 };
                 MeshInfoGpu {
                     addr: [m.pos.addr, m.nrm.addr, if grid == 0 { m.idx.addr } else { 0 }, m.mat.addr, m.uv.addr],
                     tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
-                    flags: if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 } | grid << 8,
+                    flags: alpha | if Some(i) == lawn_mesh { MESH_LAWN_BLADE } else { 0 } | grid << 8,
                 }
             })
             .collect();
@@ -836,7 +871,6 @@ impl Renderer {
             species.push(SpeciesGpu { leaf_tint: [0.5, 0.5, 0.5, 1.0], bark_tint: [0.5; 4], trans_tint: [TRANS_GAIN, TRANS_GAIN, TRANS_GAIN, 1.0] });
         }
         let species_buf = gpu.upload_buffer(bytemuck::cast_slice(&species), vk::BufferUsageFlags::STORAGE_BUFFER, "species")?;
-        let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).collect();
         let built: Vec<usize> = (0..meshes.len()).filter(|&i| shown(i)).collect();
         let geoms: Vec<_> = built
             .iter()
@@ -966,6 +1000,34 @@ impl Renderer {
             raw_bytes += (imp.grid * res[0]) as u64 * (imp.grid * res[1]) as u64 * 16 * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
             atlases.push(full);
         }
+        // The lawn: one more atlas, baked from its tile (bake_impostors) and cached like the plants'.
+        let lawn = match (&lawn_tile, lawn_mesh) {
+            (Some(tile), Some(mesh)) => {
+                use crate::lawn::{AZIMUTHS, GUTTER, RES, SLOPES, SLOPE_MAX, SLOPE_MIN};
+                #[allow(non_snake_case)]
+                let TILE = crate::lawn::tile_size();
+                let mips = atlas_mips(RES);
+                let key = crate::atlas::Key::new()
+                    .u64(bake_key)
+                    .bytes(b"lawn 4")
+                    .bytes(bytemuck::cast_slice(&[AZIMUTHS, SLOPES, RES, GUTTER, crate::lawn::height().to_bits(), TILE.to_bits(), SLOPE_MIN.to_bits(), SLOPE_MAX.to_bits()]))
+                    .bytes(bytemuck::cast_slice(&tile.positions))
+                    .get();
+                let path = crate::atlas::path_for("Lawn", key);
+                // (to the atlas code: a 4 x 4 grid of "frames", each a block of views)
+                let res = [AZIMUTHS / 4 * RES, SLOPES / 4 * RES];
+                let full = VariantAtlas { name: "Lawn".into(), grid: 4, res, mips, square: RES, crop: [0, 0], skip: 0, key, path, base: None, full: None, loading: false, upload: None, wanted: 0 };
+                // (a place in the impostor table, so every atlas has one; the shaders read the
+                // lawn's numbers from the globals)
+                imp_infos.push(ImpostorInfo { center_radius: [0.0; 4], bmin: [0.0; 4], bmax: [0.0; 4], trans: [0.0; 4], grid: 4, res: res[0] | res[1] << 16, mips, lod_scale: 1.0, frame: [0.0; 4] });
+                full_bytes += full.full_bytes();
+                atlases.push(full);
+                used.variant.push(true);
+                Some(LawnGpu { slot: atlases.len() - 1, mesh: mesh as u32, tris: tile.tri_count() })
+            }
+            _ => None,
+        };
+        assert!(atlases.len() <= MAX_VARIANTS, "no atlas slot left for the lawn");
         println!(
             "Impostor atlases: {} variants, {:.2} GB BC-compressed at full resolution (frames cropped to the plants; {:.2} GB as squares, {:.2} GB uncompressed){}",
             atlases.len(),
@@ -1276,6 +1338,8 @@ impl Renderer {
             ground_layers,
             mat_sampler,
             has_tex,
+            lawn,
+            lawn_on: true,
             sharp_img,
             sharpen_layout,
             sharpen_pipe,
@@ -1347,6 +1411,9 @@ impl Renderer {
             tlas_dirty: true,
             upload_pending: false,
             first_update: true,
+            grass_insts: Vec::new(),
+            grass_at: Vec3::splat(f32::MAX),
+            grass_radius: 0.0,
             near_count: 0,
             need_resize: false,
             render_scale,
@@ -1847,46 +1914,70 @@ impl Renderer {
             let t0 = Instant::now();
             let (res, grid, mips) = (self.atlases[v].res, self.atlases[v].grid, self.atlases[v].mips);
             let (square, crop) = (self.atlases[v].square, self.atlases[v].crop);
-            let tree = &self.pack.trees[v];
             let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
             let alpha_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
-            let insts: Vec<_> = tree
-                .parts
-                .iter()
-                .map(|p| {
-                    let alpha = self.catalog.mesh_alpha.get(p.mesh as usize).copied().unwrap_or(false);
-                    let (f, sbt) = if alpha { (alpha_flags, 2) } else { (flags, 0) };
-                    accel::make_instance(&p.xform, p.mesh, 0xFF, sbt, f, self.blas[p.mesh as usize].addr)
-                })
-                .collect();
+            // the lawn: its tile between copies of itself, so the views wrap around
+            let lawn = self.lawn.as_ref().filter(|l| l.slot == v);
+            let tree = self.pack.trees.get(v).filter(|_| lawn.is_none());
+            let insts: Vec<_> = match (lawn, tree) {
+                // (the flattest view's rays run SLOPE_MAX blade heights sideways: lawn::copies)
+                (Some(l), _) => {
+                    let c = crate::lawn::copies();
+                    (0..(2 * c + 1) * (2 * c + 1))
+                        .map(|k| {
+                            let at = Vec3::new((k % (2 * c + 1) - c) as f32, 0.0, (k / (2 * c + 1) - c) as f32) * crate::lawn::tile_size();
+                            accel::make_instance(&glam::Affine3A::from_translation(at), l.mesh, 0xFF, 0, flags, self.blas[l.mesh as usize].addr)
+                        })
+                        .collect()
+                }
+                (None, Some(tree)) => tree
+                    .parts
+                    .iter()
+                    .map(|p| {
+                        let alpha = self.catalog.mesh_alpha.get(p.mesh as usize).copied().unwrap_or(false);
+                        let (f, sbt) = if alpha { (alpha_flags, 2) } else { (flags, 0) };
+                        accel::make_instance(&p.xform, p.mesh, 0xFF, sbt, f, self.blas[p.mesh as usize].addr)
+                    })
+                    .collect(),
+                (None, None) => unreachable!("an atlas is a plant variant's or the lawn's"),
+            };
+            let (name, parts, tris) = match (lawn, tree) {
+                (Some(l), _) => ("Lawn tile".to_string(), insts.len(), insts.len() as u64 * l.tris as u64),
+                (_, Some(tree)) => (tree.name.clone(), tree.parts.len(), tree.expanded_tris(&self.pack.meshes)),
+                _ => unreachable!(),
+            };
             let mut tlas = Tlas::new(&self.gpu, insts.len() as u32)?;
             tlas.write(&insts);
             self.gpu.one_time(|cb| tlas.cmd_build(&self.gpu, cb, insts.len() as u32))?;
             self.write_set(self.bake_set, tlas.accel.raw, Some(bake_views));
 
-            let c = (tree.bmin + tree.bmax) * 0.5;
-            let r = (tree.bmax - tree.bmin).length() * 0.5;
+            // what bake.rgen gets (centre and radius of the plant; the lawn: tile edge, blade
+            // height, slope of the steepest and flattest views), the size of a bake sub-sample,
+            // the range of the occlusion rays, its mode (1 = lawn, with the gutter texels above
+            // it) and the frame's crop (the lawn: its views)
+            let (centre, sample, ao_range, mode, crop) = match tree {
+                Some(tree) => {
+                    let c = (tree.bmin + tree.bmax) * 0.5;
+                    let r = (tree.bmax - tree.bmin).length() * 0.5;
+                    // (occlusion range in metres for full-size trees; small plants a proportionally shorter one)
+                    ([c.x, c.y, c.z, r], 2.0 * r / square as f32, imp.ao_range * (r / 8.0).clamp(0.2, 1.0), 0, crop)
+                }
+                None => {
+                    use crate::lawn::{AZIMUTHS, GUTTER, RES, SLOPES, SLOPE_MAX, SLOPE_MIN};
+                #[allow(non_snake_case)]
+                let TILE = crate::lawn::tile_size();
+                    let height = crate::lawn::height();
+                    ([TILE, height, SLOPE_MIN, SLOPE_MAX], TILE / (RES - 2 * GUTTER) as f32, 2.5 * height, 1 | GUTTER << 8, [AZIMUTHS, SLOPES])
+                }
+            };
             // Bake rays are orthographic: fixed texture footprint = one bake sub-sample (negative
             // spread in tri.rchit), and the material textures switched on.
             let mut bg = Globals::default();
-            bg.cam_fwd[3] = -(2.0 * r / square as f32 / imp.ss as f32);
+            bg.cam_fwd[3] = -(sample / imp.ss as f32);
             bg.params[1] = self.has_tex as u32 as f32;
             bg.lod_params[2] = -1.0; // bake: tri.rahit only alpha-tests, no LOD dissolve
             self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&bg));
-            let mut push = BakePush {
-                center_radius: [c.x, c.y, c.z, r],
-                grid,
-                res: square,
-                frame_offset: 0,
-                ss: imp.ss,
-                ao_rays: imp.ao_rays,
-                // AO range is in metres for full-size trees; small plants get a proportionally shorter one.
-                ao_range: imp.ao_range * (r / 8.0).clamp(0.2, 1.0),
-                vis_rays: imp.vis_rays,
-                pad: 0,
-                size: res,
-                crop,
-            };
+            let mut push = BakePush { center_radius: centre, grid, res: square, frame_offset: 0, ss: imp.ss, ao_rays: imp.ao_rays, ao_range, vis_rays: imp.vis_rays, pad: mode, size: res, crop };
             for row in 0..grid {
                 push.frame_offset = row * grid;
                 self.gpu.one_time(|cb| unsafe {
@@ -1943,12 +2034,11 @@ impl Renderer {
                 }
             }
             tlas.destroy(&self.gpu);
-            let tris = tree.expanded_tris(&self.pack.meshes);
             total_tris += tris;
             println!(
                 "Baked {:<28} {:>4} parts {:>6.1}M tris -> {:>3}x{:<3} px frames (of {:>3}), {:>4}x{:<4} atlas, {:>5.1} MB, {:.2}s",
-                tree.name,
-                tree.parts.len(),
+                name,
+                parts,
                 tris as f64 / 1e6,
                 res[0],
                 res[1],
@@ -2328,6 +2418,7 @@ impl Renderer {
         for ci in build {
             self.build_near(ci)?;
         }
+        changed |= self.place_grass(cam);
         let t_states = Instant::now();
         self.profile.cpu_lod_parts[0] += (t_states - t_begin).as_secs_f64() * 1000.0;
         if changed {
@@ -2341,7 +2432,9 @@ impl Renderer {
                 (Some(f), true) => Some(cluster_instance(c.first, f.accel.addr)),
                 _ => c.far,
             }));
-            // (the terrain and the clusters have no per-instance info: tri.rahit never runs on them)
+            self.insts.extend_from_slice(&self.grass_insts);
+            // (the terrain, the clusters and the grass have no per-instance info: tri.rahit never
+            // runs on them)
             self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
             const MAX_INSTANCES: usize = 8_000_000;
             for &pi in &self.active {
@@ -2382,6 +2475,72 @@ impl Renderer {
             self.upload_pending = true;
         }
         Ok(FrameStats { near_trees: self.near_count, instances: self.insts.len() })
+    }
+
+    /// The lawn's real blades around the camera (lawn.rs): one instance of the tile's mesh per
+    /// square of the lawn's grid within reach, standing on the terrain (sheared to its slope, so
+    /// the blades stay upright), turned one of four ways (blades are whole, so any placing of a
+    /// tile joins its neighbours), as tall as the layer is there, and thinning out blade by blade
+    /// towards the edge of the circle, where the terrain shader's layer takes over (tri.rahit,
+    /// tri.rchit, lawn3.w). Placed again when the
+    /// camera has moved a quarter of a metre. Returns whether the instances changed.
+    fn place_grass(&mut self, cam: Vec3) -> bool {
+        let radius = crate::lawn::near_radius();
+        let Some(mesh) = self.lawn.as_ref().filter(|_| self.lawn_on && radius > 0.0).map(|l| l.mesh) else {
+            let had = !self.grass_insts.is_empty();
+            self.grass_insts.clear();
+            self.grass_at = Vec3::splat(f32::MAX);
+            return had;
+        };
+        // (or the radius has changed: the grass quality, key B)
+        if (cam - self.grass_at).length() < 0.25 && radius == self.grass_radius {
+            return false;
+        }
+        self.grass_at = cam;
+        self.grass_radius = radius;
+        let before = self.grass_insts.len();
+        self.grass_insts.clear();
+        // (well above the ground there are no blades to see: the layer alone)
+        if cam.y - self.world.height_at(cam.x, cam.z) > radius {
+            return before > 0;
+        }
+        let tile = crate::lawn::tile_size();
+        let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+        let thin = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
+        let addr = self.blas[mesh as usize].addr;
+        let cell = |v: f32| (v / tile).floor() as i32;
+        for j in cell(cam.z - radius)..=cell(cam.z + radius) {
+            for i in cell(cam.x - radius)..=cell(cam.x + radius) {
+                let (x, z) = ((i as f32 + 0.5) * tile, (j as f32 + 0.5) * tile);
+                let y = self.world.height_at(x, z);
+                let d = (Vec3::new(x, y, z) - cam).length();
+                if d - 0.75 * tile > radius || !self.world.grows_lawn(x, z) {
+                    continue;
+                }
+                // Towards the edge of the circle the blades go one by one (tri.rahit, which runs
+                // on the tiles that reach into that band), not shorter.
+                let band = d + 0.75 * tile > 0.5 * radius;
+                // Its height: what the layer stands at (the patches, the auto mode's grass map),
+                // which changes across a tile. The tile is as tall as its tallest place and
+                // tri.rahit trims every blade to its own: one field, no step between tiles. (A
+                // tile on even ground needs no trimming and stays opaque.)
+                let short = crate::lawn::auto_short();
+                let stands = |x: f32, z: f32| crate::lawn::patch_height(x, z) * (short + (1.0 - short) * self.world.grass_at(x, z));
+                let e = 0.5 * tile;
+                let at = [stands(x, z), stands(x - e, z - e), stands(x + e, z - e), stands(x - e, z + e), stands(x + e, z + e), stands(x - e, z), stands(x + e, z), stands(x, z - e), stands(x, z + e)];
+                let (lo, hi) = at.iter().fold((f32::MAX, 0.0f32), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                let grown = (hi * 1.04 + 0.01).min(1.0);
+                let band = band || grown - lo > 0.03;
+                let (gx, gz) = ((self.world.height_at(x + e, z) - self.world.height_at(x - e, z)) / tile, (self.world.height_at(x, z + e) - self.world.height_at(x, z - e)) / tile);
+                let h = (i as u32).wrapping_mul(0x9E37_79B9) ^ (j as u32).wrapping_mul(0x85EB_CA6B);
+                let turn = glam::Affine3A::from_rotation_y(((h >> 13) & 3) as f32 * std::f32::consts::FRAC_PI_2);
+                let shear = glam::Affine3A::from_mat3(glam::Mat3::from_cols(Vec3::new(1.0, gx, 0.0), Vec3::new(0.0, grown, 0.0), Vec3::new(0.0, gz, 1.0)));
+                let m = glam::Affine3A::from_translation(Vec3::new(x, y - 0.004, z)) * shear * turn * glam::Affine3A::from_translation(Vec3::new(-e, 0.0, -e));
+                let (f, sbt) = if band { (thin, 2) } else { (flags, 0) };
+                self.grass_insts.push(accel::make_instance(&m, mesh, 1, sbt, f, addr));
+            }
+        }
+        before > 0 || !self.grass_insts.is_empty()
     }
 
     /// Copy the instance list built by update_instances into the TLAS instance buffer and the
@@ -2623,6 +2782,20 @@ impl Renderer {
         g.lod_params[1] = 0.0; // single impostor tier (mips serve the far field)
         g.lod_params[3] = f32::from_bits(self.ground_layers); // bit mask of the scanned ground layers loaded (bits, not a value: 26 layers)
         g.params[1] = self.has_tex as u32 as f32; // material textures available
+        g.lawn = match &self.lawn {
+            Some(l) if self.lawn_on => {
+                use crate::lawn::{AZIMUTHS, GUTTER, RES, SLOPES, SLOPE_MAX, SLOPE_MIN};
+                #[allow(non_snake_case)]
+                let TILE = crate::lawn::tile_size();
+                [
+                    [crate::lawn::height(), TILE, AZIMUTHS as f32, SLOPES as f32],
+                    [RES as f32, GUTTER as f32, self.atlases[l.slot].mips as f32, l.slot as f32],
+                    [SLOPE_MIN, SLOPE_MAX, crate::world::park() as u32 as f32, crate::lawn::near_radius()],
+                    [crate::lawn::segments() as f32, crate::lawn::auto_short(), crate::lawn::patch_low(), crate::lawn::fade_distance()],
+                ]
+            }
+            _ => [[0.0; 4]; 4],
+        };
         // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
         let dlss = self.dlss_mode.is_some();

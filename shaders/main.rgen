@@ -319,9 +319,11 @@ void main() {
         // Ambient occlusion. Ground hits use long rays (30 m): the canopy overhead blocks most of
         // the sky, so the forest floor under the crowns goes properly dark, not just the 4 m around
         // trunks. Range scaled with distance keeps far terrain cheap.
-        bool terrain = mat == MAT_TERRAIN;
+        // (a lawn blade is an impostor hit, but it is the ground: the canopy overhead shades it)
+        bool lawn = (pl.flags & FLAG_LAWN) != 0u;
+        bool terrain = mat == MAT_TERRAIN || lawn;
         float aoRange = terrain ? 30.0 : g.params.w;
-        if (!imp && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
+        if ((!imp || lawn) && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
             float occ = 0.0;
             for (uint i = 0u; i < g.iparams.w; ++i) {
                 vec3 d2 = cosineSample(n, rng);

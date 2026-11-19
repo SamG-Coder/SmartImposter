@@ -324,6 +324,106 @@ material's translucency tint.
 
 ![Grass impostors vs real cards](docs/images/grass_impostor_vs_mesh.jpg)
 
+#### Lawn: short grass with no geometry (`--lawn on`, experimental)
+
+Short grass is the worst case for the patches above: it is everywhere, a few centimetres high, and
+every ray that grazes the ground stops at one patch box after another. The lawn is the impostor
+technique turned on its side, with nothing in the acceleration structures beyond the first metres
+around the camera:
+
+- **One tile of real blades** (`src/lawn.rs`: 0.42 m, ~5,300 curved, tapering blades up to 4.5 cm,
+  in clumps; `--lawn-height` sets the height) is baked once like a plant, between copies of itself
+  so the result wraps around.
+- **Views laid out for a ground cover.** A view from direction f stores, for the line along f
+  through every point of the plane of the blade tips, the height of the first blade on that line,
+  plus its colour, normal, coverage and sky visibility: a height map sheared along f. The plants'
+  hemisphere grid has only a handful of views below 20°, where a lawn is nearly always seen, and
+  smears it into streaks. So the lawn has 16 azimuths x 12 slopes, spaced geometrically in
+  cot(elevation) from 79° down to 2.4° (a standing eye sees the lawn through its own views out to
+  ~40 m): 192 views of 320 texels, one 5120x3840 atlas (85 MB).
+- **Marched in the terrain's hit shader** (`shaders/lawn.glsl`). A ray that hits lawn-covered
+  ground is backed up to the top of the blade slab and marched down through the nearest view with
+  wrap-around lookups, the same coverage-per-crossing march as `impostor.rint`. A hit moves the
+  surface up to the blade and takes its colour, normal and visibility; a miss shades the soil
+  between the blades, darkened by them.
+- **Self-shadowing** uses the view nearest the sun as a shadow map of the tile; trees still shadow
+  the lawn through the ordinary shadow ray.
+- **No rows of repeats.** One square repeated shows as lines: every clump lines up with its
+  copies along every direction of the grid. So each copy of the tile is shifted by its own random
+  amount (the tile wraps, so a shifted copy is whole), with ragged borders between copies. Blade
+  height also varies over a few metres and in tufts a foot across, the tile coordinates are bent
+  by a slow noise, and the colour follows the ground layers underneath.
+- **Thin in flat views.** A point counts as blade if it is just behind the first blade on its
+  line; in a flat view that depth is kept to one blade height along the ground, or blades seen a
+  few degrees off their view smear sideways.
+- **LOD is the mip chain.** Far lawn is a coarser level of the same atlas, fading into the ground
+  texture by 220 m.
+- **Real blades around the camera.** A layer inside the ground has parallax but no silhouette,
+  and its blades stand in front of nothing: fine for a lawn seen from standing height, flat for
+  anything taller or closer. So within a few metres of the camera the tile itself is drawn as
+  geometry: one instance of its mesh per square of the grid, sheared onto the terrain and turned
+  one of four ways. They are the same blades the layer was baked from, tinted the same way. 4 m
+  of a lawn, up to 30 m of tall grass (`--lawn-near`); a few hundred to a few thousand instances
+  of one BLAS.
+- **The hand-over is blade by blade.** Towards the edge of that circle whole blades drop out one
+  at a time, by the distance of their own root from the camera (`tri.rahit`), while the layer
+  fades in under them: there is no edge of tiles to see and nothing shrinks.
+- **One height field for both.** How much of its height the grass stands at is one continuous
+  function of the place (`shaders/lawnh.glsl`): the layer squashes its blades by it, and each
+  real blade is trimmed to its value at the blade's own root, so neighbouring tiles grade into
+  each other instead of stepping.
+- **Automatic length (`--lawn auto`).** The grass is long where it would be left to grow and
+  short elsewhere, from a map built with the scene (`World::build_grass_map`): long under and
+  around trees, in hollows and in patches of rough with ragged edges, short on the open ground
+  between, blended over a few metres. One tile baked at the long height (32 cm) serves both;
+  the short grass is 4.5 cm.
+- **Quality (`--grass low|medium|high|ultra`, key B)** scales how far the real blades and the
+  layer are drawn: 0.35x, 0.65x, 1x and 2x (ultra: real blades to 58 m of tall grass, the layer
+  to 440 m). In the park all four trace in 1.6 to 1.9 ms at 1080p; ultra adds about 3,000
+  instances.
+- **Any height.** `--lawn meadow` (22 cm) and `--lawn tall` (45 cm), or `--lawn-height` in cm, are
+  the same layer: the tile is four blade heights across, the blades grow wider and fewer, and
+  unmown grass has blades of every length, arching, with seed stalks. In the forest scene a
+  meadow also stands in for the tall and dry grass patches.
+
+With the lawn on, the biome's short grass patches are thinned to a fifth (`--lawn 0.3` keeps 30%;
+116,223 patches become 73,071 in the default scene) and the taller, dry and wet grasses stay as
+its tufts. Ray tracing time at 1440p, DLSS Quality, median of three alternating runs (measured
+with the first version of the lawn: 8.5 cm blades, 96 views, a 42 MB atlas):
+
+| View | Lawn | Patches only |
+|---|---|---|
+| Clearing, eye height | 5.79 ms | 6.54 ms |
+| Forest interior | 6.69 ms | 7.00 ms |
+| From 45 m up | 4.69 ms | 4.83 ms |
+| Standing, looking across | 7.63 ms | 7.97 ms |
+| Looking down at the ground | 4.26 ms | 4.77 ms |
+| Eye 0.5 m above the ground | 7.40 ms | 7.29 ms |
+
+GPU memory was 4.24 GB against 4.20 GB (the atlas is 43 MB larger now). The march itself is nearly free (laid over the full grass
+its cost was within run-to-run noise, except 0.3–0.5 ms looking straight down); the time saved is the patch boxes that
+are no longer there.
+
+![Lawn](docs/images/lawn.jpg)
+
+*Top: the default clearing with grass patches only, and with `--lawn meadow`. Bottom: the park's
+mown lawn and its tall grass (`--lawn tall`), both from 0.75 m.* It is off by default: see
+[Limitations](#limitations).
+
+**The park (`--park`)** is a scene made for it: rolling hills of lawn and nothing else on the
+ground, with the biome's trees in groves and a few standing alone (about 8,800 within 1.4 km), and
+higher hills behind. There are no grass patches, shrubs or rocks, the lawn runs up to the trunks,
+and its blades are kept nearly even, as mown. It starts on foot (see [Controls](#controls)) and
+runs at about 4 ms a frame at 2560x1080 with DLSS Quality on an RTX 5080.
+
+```
+cargo run --release -- --park
+```
+
+![The park](docs/images/park.jpg)
+
+*The park as a lawn, and with `--lawn tall`.*
+
 ### 6. LOD and draw distance
 
 | Distance (x the variant's LOD scale) | Representation | In the TLAS |
@@ -805,9 +905,15 @@ cargo run --release
 | `--views "x,h,z,yaw,pitch[,lod,debug];..."` | several cameras in one run (h above ground), one screenshot each |
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
 | `--gallery` | every variant on flat ground, one row per species |
+| `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
+| `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |
+| `--lawn on\|off\|0.2\|meadow\|tall\|auto` | forest scene: grass as a parallax layer in the terrain shader, real blades near the camera (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); a number is how much of the short grass patches stays (default 0.2); `meadow` and `tall` are 22 and 45 cm grass; `auto` is long around trees, in hollows and in rough, short elsewhere. Off by default |
+| `--grass low\|medium\|high\|ultra` | how far the lawn is drawn, blades and layer (high is the default, ultra twice its distances); key B cycles |
+| `--lawn-height 4.5` | the grass's height in cm (2 to 60; re-bakes its atlas) |
+| `--lawn-near 10` | real blades around the camera out to this many metres (0 = the layer only; default by the height, 4 to 30 m) |
 | `--site lat,lon` | build the scene from the Earth data at that place (see [The Earth](#the-earth-a-11-globe-and-real-places)) |
 | `--tour tours/showcase.txt [--tour-pace 40]` | globe: fly a scripted tour (`src/tour.rs`: shots of spline keys, local time, cloud cover, exposure; black while each shot streams in, then a fade in and out) and exit. Each frame steps 1/60 s; with a pace above 16.7 ms it plays slower than real time so a 60 fps recorder captures every frame (`tools/record_tour.ps1` + `tools/tour_post.py` turn that into a 60 fps video). `SI_TOUR_STILLS=1` saves stills per shot |
 | `--globe [--at lat,lon,height,heading,pitch] [--views "...;..."] [--time 2026-06-21T10:30] [--time-rate s]` | the 1:1 globe; `--views` takes the same five numbers per view; `--time` is UTC (default 10:30 local solar time on the June solstice), `--time-rate` simulated seconds per second (default real time, stopped when capturing); `--bench-move m` flies along the heading at constant height |
@@ -842,6 +948,8 @@ cargo run --release
 | Left click / Esc | capture / release the mouse (Esc again quits) |
 | Right mouse | look without capturing |
 | W A S D, Q / E (Space) | fly, down / up. Shift 4x, Ctrl 0.25x |
+| V | walk / fly, in any scene. On foot: W A S D walk where the camera faces, Shift runs, Ctrl crouches, Space jumps; tree trunks are solid (not on the globe) |
+| B | grass quality: low, medium, high, ultra |
 | Mouse wheel | fly speed |
 | C | cinematic smoothing |
 | F | automatic fly-through on/off |
@@ -901,11 +1009,13 @@ src/
   bc7.rs        CPU texture block compression for the texture cache
   cloudnoise.rs the clouds' tiling 3D Perlin-Worley / Worley noise, built once and cached
   world.rs      the forest scene: terrain (eroded or a real site), succession (cached), scatter,
-                ground masks
+                ground masks; the park (--park)
+  lawn.rs       --lawn: the tile of grass blades and the layout of its baked views
   biome.rs      --biome presets for the eroded terrain: species roles, understory, ground scans, climate
   erosion.rs    uplift + stream-power erosion, priority flood, drainage, river polylines
   tour.rs       scripted camera tours: the shot file, spline paths, easing, fades
   flypath.rs    arc-length parameterised Catmull-Rom fly-through path (forest scene)
+  walk.rs       the first-person walking camera: ground following, gravity, solid trunks
   globe/        the 1:1 Earth as a mode of the renderer:
     scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
     tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
@@ -918,7 +1028,8 @@ native/
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, globe.glsl, atmosphere.glsl, clouds.glsl)
+  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl, lawnh.glsl, globe.glsl, atmosphere.glsl,
+  clouds.glsl)
 tools/   asset converters, the Earth data downloader, comparisons, tour recording (see Tools)
 tours/   tour files for --tour
 ```
@@ -930,6 +1041,15 @@ tours/   tour files for --tour
   streaking. At the default LOD those plants are meshes.
 - **No wind:** the Megaplant and Megascans wind data is ignored.
 - **Repeating grass patches:** three patch layouts per grass species can be noticed from high up.
+- **Lawn (`--lawn`):** beyond the real blades around the camera the grass is a layer inside the
+  ground: it does not hide the feet of trunks and rocks, cast shadows on them or stand against
+  the sky on a crest, which shows most with tall grass. In the forest scene the real blades are
+  placed by a coarser test of where grass grows than the shader's (the two can differ by a tile
+  at the edges), nothing moves in the wind, and the globe does not have it. `--lawn auto` covers
+  the 4 km around the start; its short grass is the long tile squashed, coarser than `--lawn on`.
+- **Walking:** only tree trunks are solid (a cylinder each, measured from the bark): shrubs,
+  rocks, logs and low branches can be walked through, and water is waded on its surface. On the
+  globe nothing is solid but the ground.
 - **Poplar front-lit** impostors are still ~1.2x brighter than the mesh.
 - **Grainy LOD bands at low frame rates:** the dissolve bands and 1-sample shadows/AO rely on
   temporal accumulation.
