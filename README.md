@@ -98,15 +98,15 @@ same GPU, with the same ray tracing pipeline, once, and cached.
 
 ## Performance
 
-RTX 5080, 2560x1440, average over 300 frames. DLAA is the quality reference.
+RTX 5080, 2560x1440, median frame time over 300 frames. DLAA is the quality reference.
 
-**The generated forest** (the default temperate biome, ~6.2M plants):
+**The generated forest** (the default temperate biome, ~6.2M plants, 4.2 GB of GPU memory):
 
 | View | DLAA | DLSS-RR Quality | DLSS-RR Balanced |
 |---|---|---|---|
-| Clearing at eye level (`0,1.7,0,0,2`) | 18.6 ms | 9.7 ms | 7.9 ms |
-| Forest interior (`-150,1.7,-150,40,4`) | 19.8 ms | 10.4 ms | 8.6 ms |
-| From 45 m (`0,45,0,30,-10`) | 15.3 ms | 8.0 ms | 6.7 ms |
+| Clearing at eye level (`0,1.7,0,0,2`) | 18.6 ms | 9.9 ms | 7.9 ms |
+| Forest interior (`-150,1.7,-150,40,4`) | 20.5 ms | 10.5 ms | 8.4 ms |
+| From 45 m (`0,45,0,30,-10`) | 15.5 ms | 8.6 ms | 6.3 ms |
 
 ```
 smart_imposter --size 2560x1440 --dlss quality --views "0,1.7,0,0,2;-150,1.7,-150,40,4;0,45,0,30,-10" --frames 300 --shot shots/perf.png
@@ -117,18 +117,18 @@ Quality renders at 1708x960 and is about 2x faster than DLAA. It's a little soft
 ![DLAA vs DLSS-RR Quality](docs/images/dlss_modes.jpg)
 
 Where the time goes in the clearing at DLAA (GPU timestamps, printed by every screenshot run):
-ray tracing (primary, sun shadow and AO rays) 12.9 ms, DLSS Ray Reconstruction 5.3 ms, tonemap,
-sharpen and blit 0.07 ms; the CPU's LOD pass and instance list (~0.1 ms) overlap the previous
+ray tracing (primary, sun shadow and AO rays) 13.1 ms, DLSS Ray Reconstruction 5.2 ms, tonemap,
+sharpen and blit 0.08 ms; the CPU's LOD pass and instance list (~0.1 ms) overlap the previous
 frame's GPU work. `SI_PROF_SKIP` takes out the shadow and AO rays to see their share.
 
 **The globe** (DLSS-RR Quality, clouds on; GPU time once the view has streamed in):
 
 | View (`--at`) | GPU | GPU memory |
 |---|---|---|
-| Lake Como from 300 m (`46.05,9.25,300,200,-8`) | 16.3 ms | 7.8 GB |
-| In the treetops above Lake Como (`45.99,9.262,12,250,-4`) | 13.2 ms | 10.4 GB |
-| Aokigahara and Mount Fuji from 70 m (`35.47,138.62,70,140,-8`) | 18.5 ms | 11.7 GB |
-| The Earth from 12,000 km (`30,5,12000000,0,-90`) | 5.5 ms | 7.1 GB |
+| Lake Como from 300 m (`46.05,9.25,300,200,-8`) | 15.7 ms | 8.0 GB |
+| In the treetops above Lake Como (`45.99,9.262,12,250,-4`) | 12.9 ms | 10.6 GB |
+| Aokigahara and Mount Fuji from 70 m (`35.47,138.62,70,140,-8`) | 18.1 ms | 10.8 GB |
+| The Earth from 12,000 km (`30,5,12000000,0,-90`) | 5.2 ms | 7.1 GB |
 
 Flying at 240 m/s, 300 m over Lake Como, with everything streaming in (`--bench-move 4`, 900
 frames): average 17.2 ms, 99th percentile 21–23 ms, worst 24–37 ms over repeated runs.
@@ -373,6 +373,12 @@ the start, grows to 200 m cells out to ±60 km, and carries the Earth's curvatur
 The result is a mosaic of stand ages and species, with alder and poplar along the rivers and
 meadows on the valley floors (~6M trees in an 8 km radius). Shrubs, ferns and grass are scattered
 on jittered grids from the simulated canopy cover.
+
+Growing the forest takes ~23 s, and it is a pure function of the terrain, the biome, the radius
+and the code, so the result is cached in `assets/cache/forest` under a name made of all of them
+(the code as a hash of `world.rs`, `biome.rs` and `erosion.rs`, taken at build time). The next
+start reads it in a fraction of a second; a changed input or changed code grows a new one, and
+`SI_REGROW=1` forces it.
 
 The ground blends twelve scanned surfaces found in the Fab library cache: forest floor, mossy
 grass, uncut grass, dried grass, two rock cliffs, snow, gravel, lichen rock, riverbed, pebbles and
@@ -882,18 +888,20 @@ cargo run --release
 ```
 src/
   main.rs       window, input, fly-cam, multi-view capture, the tour player, CLI
-  renderer.rs   pipelines, SBT, impostor bake + BC compression, atlas streaming, LOD state machine,
-                TLAS, DLSS / TAA / resolve / sharpen passes, GPU profiling
+  renderer.rs   pipelines, SBT, what a scene loads, impostor bake + BC compression, frame crop,
+                atlas streaming, plant cells, LOD state machine, TLAS, DLSS / TAA / resolve /
+                sharpen passes, GPU profiling
   atlas.rs      impostor atlas cache files, stream layout, the loader thread, upload ranges
   dlss.rs       DLSS Ray Reconstruction (NGX) bindings, compiled only with the DLSS SDK
   catalog.rs    species packs, per-variant LOD scale and draw distance, ground surfaces
   gpu.rs        Vulkan device (RT, SER and NGX extensions), buffers, images, swapchain
   accel.rs      BLAS / TLAS building, instance records
-  asset.rs      .mtree loader
+  asset.rs      .mtree loader, a plant's reach (its impostor frame)
   textures.rs   parallel PNG decode, BC7 / BC5 / BC4 cache, per-species normalisation, mips
   bc7.rs        CPU texture block compression for the texture cache
   cloudnoise.rs the clouds' tiling 3D Perlin-Worley / Worley noise, built once and cached
-  world.rs      the forest scene: terrain (eroded or a real site), succession, scatter, ground masks
+  world.rs      the forest scene: terrain (eroded or a real site), succession (cached), scatter,
+                ground masks
   biome.rs      --biome presets for the eroded terrain: species roles, understory, ground scans, climate
   erosion.rs    uplift + stream-power erosion, priority flood, drainage, river polylines
   tour.rs       scripted camera tours: the shot file, spline paths, easing, fades
