@@ -1,4 +1,4 @@
-// Volumetric clouds (globe mode, main.rgen), after Schneider's Nubis (Horizon Zero Dawn / Forbidden
+// Volumetric clouds (main.rgen: the globe, and the forest scenes over a sphere under them), after Schneider's Nubis (Horizon Zero Dawn / Forbidden
 // West), Hillaire's Frostbite sky and Wrenninge's multiple-scattering approximation:
 //
 // - Three layers, fixed to the Earth (the camera frame turns into Earth axes through g.earthX..Z):
@@ -16,6 +16,11 @@
 //   the sharp forward peak of the silver lining, fogbow and glory lobes), the "powder" darkening of
 //   thin edges seen away from the sun, sky light from the atmosphere above and the sunlit ground's
 //   bounce below. Clouds shadow the ground (cloudShadow) and dim the sky light under them.
+//
+// The forest scenes (the generated forest, a site, the park: g.planet.w = 0) have the same clouds:
+// main.rs puts a planet under the scene (its centre in g.planet.xyz, the terrain already carries
+// the Earth's curvature) at a fixed place in the mid-latitudes, CLOUD_LIFT below sea level so
+// the cumulus bases stand ~1 km over the scene; their weather is a fair day's (weatherAt).
 // Needs atmosphere.glsl, shared.glsl and the Globals `g`.
 #ifndef CLOUDS_GLSL
 #define CLOUDS_GLSL
@@ -31,7 +36,13 @@ const float HIGH_BASE = 8000.0, HIGH_TOP = 9500.0;
 // altocumulus thinner, cirrus (ice) ~0.001-0.003
 const float SIGMA_LOW = 0.06, SIGMA_MID = 0.03, SIGMA_HIGH = 0.0008;
 
-bool cloudsOn() { return g.planet.w > 0.5 && g.cloud.y > 0.5; }
+// (main.rs CLOUD_LIFT) the forest scenes' sea level is this far above the clouds' ground sphere
+const float CLOUD_LIFT = 400.0;
+const float CLOUD_LOCAL_GAIN = 2.2;
+
+bool cloudsOn() { return g.cloud.y > 0.5; }
+// the forest scenes (not the globe)
+bool cloudsLocal() { return g.planet.w < 0.5; }
 
 // Earth-fixed position in km (ECEF) of a point relative to the planet centre (camera frame).
 vec3 cloudEarth(vec3 x) {
@@ -79,6 +90,16 @@ float landAt(vec3 u) {
     return smoothstep(-150.0, 150.0, e);
 }
 vec4 weatherAt(vec3 e) {
+    if (cloudsLocal()) {
+        // The forest scenes: a fair day. Fields of cumulus with clearer lanes between them
+        // (~40 km), a few altocumulus where the cumulus is thickest, cirrus streaks elsewhere.
+        vec3 q = e / 40.0 + vec3(0.0, 0.0, cloudTime() / 20000.0);
+        float sys = cnoise3(q) * 0.65 + cnoise3(q * 2.3 + 7.7) * 0.35;
+        float k = g.cloud.x / 0.45;
+        return vec4(clamp((0.245 + (sys - 0.5) * 0.08) * k, 0.0, 1.0), 0.35,
+                    clamp(0.12 * smoothstep(0.6, 0.85, sys) * k, 0.0, 1.0),
+                    clamp((0.03 + 0.2 * smoothstep(0.4, 0.75, 1.0 - sys)) * min(k, 1.5), 0.0, 1.0));
+    }
     vec3 u = normalize(e);
     float lat = degrees(asin(clamp(u.z, -1.0, 1.0)));
     float a = abs(lat);
@@ -231,7 +252,12 @@ float cloudShadow(vec3 x, vec3 L) {
         float ds = (t1 - t0) / 8.0;
         for (int i = 0; i < 8; ++i) {
             vec3 y = x + L * (t0 + (float(i) + 0.5) * ds);
-            od += lowDensity(cloudEarth(y), length(y) - R_GROUND, W, false) * ds * SIGMA_LOW;
+            float d = lowDensity(cloudEarth(y), length(y) - R_GROUND, W, false);
+            // (the coarse density has thin fringes far beyond the cloud one sees, which the
+            // detail erodes away: the forest scenes' fair-weather clouds are mostly fringe, and
+            // their shadows are the clouds' own shape)
+            if (cloudsLocal()) d = clamp((d - 0.17) / 0.83, 0.0, 1.0);
+            od += d * ds * SIGMA_LOW;
         }
     }
     vec2 mb = raySphere(x, L, R_GROUND + MID_BASE), mt = raySphere(x, L, R_GROUND + MID_TOP);
@@ -239,7 +265,9 @@ float cloudShadow(vec3 x, vec3 L) {
         float ds = (mt.y - mb.y) / 3.0;
         for (int i = 0; i < 3; ++i) {
             vec3 y = x + L * (mb.y + (float(i) + 0.5) * ds);
-            od += midDensity(cloudEarth(y), length(y) - R_GROUND, W, false) * ds * SIGMA_MID;
+            float d = midDensity(cloudEarth(y), length(y) - R_GROUND, W, false);
+            if (cloudsLocal()) d = clamp((d - 0.2) / 0.8, 0.0, 1.0);
+            od += d * ds * SIGMA_MID;
         }
     }
     vec2 hb = raySphere(x, L, R_GROUND + HIGH_BASE + 700.0);
@@ -270,15 +298,17 @@ vec2 cloudSlab(vec3 ro, vec3 rd, float rb, float rt, float tmax) {
 }
 
 // March the clouds along ro + rd * [0, tmax] (ro relative to the planet centre): in-scattered
-// light (rgb, hazed by the air in front of it) and transmittance (a). `steps`: 40 for primary
-// rays, fewer for reflections; `jitter` in [0, 1) per pixel and frame.
-vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
+// light (rgb, before the air in front of it) and transmittance (a); tFirst: where the ray met the
+// first cloud (< 0: none). `steps`: 40 for primary rays, fewer for reflections; `jitter` in
+// [0, 1) per pixel and frame.
+vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out float tFirst) {
+    tFirst = -1.0;
     if (!cloudsOn()) return vec4(0.0, 0.0, 0.0, 1.0);
     vec3 L = g.sunDir.xyz;
     float mu = dot(rd, L);
     // phase, with Wrenninge's octaves (a = 0.5 attenuation, b = 0.5 contribution, c = 0.5 eccentricity)
     float ph[3] = float[3](dropletPhase(mu, 1.0), dropletPhase(mu, 0.5), dropletPhase(mu, 0.25));
-    float T = 1.0, tFirst = -1.0;
+    float T = 1.0;
     vec3 S = vec3(0.0);
     float q = float(steps) / 40.0;
     vec3 sky = vec3(-1.0); // the sky light over the clouds: once per ray (it varies over 100s of km)
@@ -305,6 +335,12 @@ vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
         if (sky.x < 0.0) {
             vec3 Tz;
             sky = atmosphere(xm, up, 1e30, L, g.sunDir.w, Tz) * PI;
+        }
+        if (cloudsLocal()) {
+            // The forest scenes' light is not the atmosphere's: their own sun (main.rgen
+            // sunColor) and sky fill, in their sky's brightness (CLOUD_LOCAL_GAIN).
+            Esun = vec3(1.0, 0.92, 0.80) * g.sunDir.w * smoothstep(-0.02, 0.1, L.y);
+            sky = vec3(0.13, 0.20, 0.36) * 1.6;
         }
         vec3 bounce = Esun * max(dot(up, L), 0.0) * 0.15;
         float odPrev = -1.0;
@@ -355,13 +391,24 @@ vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
         }
         if (T < 0.01) break;
     }
+    // (the forest scenes' painted sky is some three times as bright as the atmosphere's single
+    // scattering for the same sun: their clouds are lit to match it)
+    if (cloudsLocal()) S *= CLOUD_LOCAL_GAIN;
+    return vec4(S, T);
+}
+
+// The globe: the clouds along ro + rd * [0, tmax] with the air in front of them (rgb to add, a
+// the transmittance of what is behind).
+vec4 cloudMarch(vec3 ro, vec3 rd, float tmax, int steps, float jitter) {
+    float tFirst;
+    vec4 c = cloudScatter(ro, rd, tmax, steps, jitter, tFirst);
     if (tFirst < 0.0) return vec4(0.0, 0.0, 0.0, 1.0);
     // The air in front of the cloud: dims the cloud and adds its own haze. The background (sky or
     // ground) already carries that haze, and the cloud covers (1 - T) of it: added back, so far
     // clouds fade into the sky colour instead of turning brown.
     vec3 Ta;
-    vec3 Sa = atmosphere(ro, rd, tFirst, L, g.sunDir.w, Ta);
-    return vec4(S * Ta + Sa * (1.0 - T), T);
+    vec3 Sa = atmosphere(ro, rd, tFirst, g.sunDir.xyz, g.sunDir.w, Ta);
+    return vec4(c.rgb * Ta + Sa * (1.0 - c.a), c.a);
 }
 
 #endif
