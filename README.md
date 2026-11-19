@@ -658,6 +658,17 @@ so far:
       atmosphere and the sunlit ground's bounce. Clouds shadow the ground through all three
       layers, dim the sky light under them and show in water reflections.
     - About 3.2 ms at 2560x1392 (Lake Como, 15.0 vs 11.8 ms); `--clouds off` or key U.
+    - **The forest scenes have the same clouds** (the generated forest, a site, the park), in
+      place of the cumulus painted on their sky. A planet is put under the scene, whose terrain
+      already carries the Earth's curvature, so the same march runs unchanged; the weather is a
+      fair day's (fields of cumulus with a base ~850 m over the start, a little altocumulus and
+      cirrus, `--cloud-cover` scales it). They are lit by the scene's own sun and sky fill, in
+      its sky's brightness, and fade into that sky with distance. Their shadows drift over the
+      land, with the shadow density eroded as the visible clouds are (the coarse density alone
+      shades far beyond the cloud one sees), and in a shadow the fill light turns grey and
+      brighter. About 0.3 to 0.6 ms at 1080p; `--clouds off` (key U) brings the painted sky back.
+
+      ![Clouds over the park and the forest](docs/images/forest_clouds.jpg)
   - Atmosphere: ozone absorption, and samples packed towards the eye with each one dimmed only to
     its own middle, so the horizon is pale and hazy rather than a brown band.
   - The sea (`src/globe/ocean.rs`, `shaders/main.rgen`), built the way film and game oceans are
@@ -899,7 +910,7 @@ cargo run --release
 | `--imp-texel 0.055 --imp-res 448 --imp-grid 12` | impostor texel size (m), maximum frame resolution, views per side |
 | `--spacing 7 --radius 8000` | forest scene: canopy tree spacing and forest radius (m, the defaults) |
 | `--sharpen 0.5`, `--no-taa` | post-processing |
-| `--clouds on\|off`, `--cloud-cover 0.45` | globe: volumetric clouds and how much of the sky they cover (0-1, before the weather systems and latitude belts); key U toggles them |
+| `--clouds on\|off`, `--cloud-cover 0.45` | volumetric clouds, in every scene, and how much of the sky they cover (0-1; on the globe before the weather systems and latitude belts); key U toggles them (off in the forest scenes: the painted sky) |
 | `--tree-thinning smooth\|stepped` | globe: how distant trees thin out (see [Trees to the horizon](#the-earth-a-11-globe-and-real-places)); key N toggles it |
 | `--shot out.png --frames N --cam x,y,z,yaw,pitch` | render N frames, save, print timings and the GPU profile, exit |
 | `--views "x,h,z,yaw,pitch[,lod,debug];..."` | several cameras in one run (h above ground), one screenshot each |
@@ -962,7 +973,7 @@ cargo run --release
 | K | supersampling 1x / 1.5x / 2x (TAA path) |
 | T | TAA on/off |
 | N (globe) | distant tree thinning: smooth (default) / stepped per tile |
-| U (globe) | volumetric clouds on/off |
+| U | volumetric clouds on/off |
 | H | sharpening strength |
 | Arrow keys | sun azimuth / elevation |
 | `-` `=` | exposure |

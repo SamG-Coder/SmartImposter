@@ -154,8 +154,9 @@ vec3 skyColor(vec3 d) {
     float s = max(dot(d, L), 0.0);
     c += vec3(1.0, 0.85, 0.62) * (0.15 * pow(s, 6.0) + 0.45 * pow(s, 64.0));
 
-    // Fair-weather cumulus on a flat cloud layer (static so still frames can accumulate).
-    if (y > 0.0) {
+    // Fair-weather cumulus painted on a flat layer, when the volumetric clouds are off
+    // (forestClouds below; static so still frames can accumulate).
+    if (y > 0.0 && !cloudsOn()) {
         vec2 uv = d.xz / (y + 0.06) * 0.55;
         float n = cloudFbm(uv * 1.3);
         float cover = smoothstep(0.52, 0.72, n) * smoothstep(0.0, 0.12, y);
@@ -188,6 +189,26 @@ float specAlbedo(float NoV, float rough) {
 vec3 hazeColor(vec3 d) {
     float s = max(dot(d, g.sunDir.xyz), 0.0);
     return vec3(0.47, 0.58, 0.72) * 0.95 + vec3(1.0, 0.85, 0.62) * (0.10 * pow(s, 4.0) + 0.25 * pow(s, 24.0));
+}
+
+// The forest scenes' volumetric clouds (clouds.glsl) over `col`, along from + dir * [0, t]
+// (`from` relative to the planet centre; t < 0: the ray went to the sky, and col is that sky).
+// The scene's own haze lies in front of them: far clouds fade into the sky behind them.
+vec3 forestClouds(vec3 col, vec3 from, vec3 dir, float t, int steps, float jitter) {
+    float tmax = t;
+    if (t < 0.0) {
+        // (below the horizon, beyond the terrain's edge: to the ground, not round the planet)
+        vec2 gs = raySphere(from, dir, R_GROUND - CLOUD_LIFT - 600.0);
+        tmax = gs.x > 0.0 ? gs.x : 1e30;
+    }
+    float tFirst;
+    vec4 c = cloudScatter(from, dir, tmax, steps, jitter, tFirst);
+    if (tFirst < 0.0) return col;
+    // (grey: the scene's haze reddens what is behind it, and a far cloud lit warm, dimmed red
+    // and veiled blue comes out pink)
+    vec3 Ta = vec3(exp(-14.0e-6 * g.extra.x * tFirst));
+    vec3 behind = t < 0.0 ? col : hazeColor(dir);
+    return col * c.a + c.rgb * Ta + behind * (1.0 - Ta) * (1.0 - c.a);
 }
 
 float traceShadow(vec3 o, vec3 d, float tmax, uint mask) {
@@ -275,6 +296,12 @@ void main() {
         vec3 E = sunColor();
         vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
         if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * cloudShadow(gq, L);
+        // (the forest scenes: the clouds' shadows drift over the land)
+        float cloudSun = 1.0;
+        if (!globe() && cloudsOn() && dbg == 0u) {
+            cloudSun = cloudShadow(gq, L);
+            E *= cloudSun;
+        }
         vec3 direct = alb / PI * E * max(ndl, 0.0) * sh;
         // Leaf transmission: the foliage texture's translucency map times Unreal's "Translucency Tint"
         // (veins and thick spots transmit less), so back-lit leaves glow with visible veins.
@@ -402,6 +429,9 @@ void main() {
         gbSpec = (glossy || water) ? specAlbedo(max(dot(n, -dir), 0.0), gbRough) : 0.0;
         // Sky fill is kept well below the sun so shaded crowns go properly dark.
         vec3 skyUp = vec3(0.13, 0.20, 0.36), ground = vec3(0.05, 0.06, 0.035);
+        // (in a cloud's shadow the light from above is the cloud's, the sun's diffused through
+        // it: grey, and more than the blue sky's)
+        skyUp = mix(vec3(0.30, 0.31, 0.33), skyUp, cloudSun);
         vec3 amb = mix(ground, skyUp, n.y * 0.5 + 0.5);
         if (globe()) {
             // sky light: the zenith radiance over the hemisphere (as globe.rgen did)
@@ -593,6 +623,8 @@ void main() {
                 // the clouds in the reflection (sky or far shore behind them)
                 vec4 cr = cloudMarch(p - g.planet.xyz, R, pl.t < 0.0 ? 1e30 : pl.t, 20, rnd(rng));
                 refl = refl * cr.a + cr.rgb;
+            } else if (!globe() && cloudsOn()) {
+                refl = forestClouds(refl, p - g.planet.xyz, R, pl.t, 20, rnd(rng));
             }
             vec3 H = normalize(L - dir);
             float glint = pow(max(dot(nR, H), 0.0), 900.0) * 120.0;
@@ -650,11 +682,14 @@ void main() {
     if (globe() && dbg == 0u && cloudsOn()) {
         vec4 cl = cloudMarch(-g.planet.xyz, dir, pl.t < 0.0 ? 1e30 : pl.t, 40, rnd(rng));
         col = col * cl.a + cl.rgb;
-    } else if (!globe() && pl.t > 0.0 && g.extra.x > 0.0 && dbg == 0u) {
-        // (the forest scene's haze; the globe has its atmosphere above)
-        vec3 beta = (vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x;
-        vec3 T = exp(-beta * pl.t);
-        col = col * T + hazeColor(dir) * (1.0 - T);
+    } else if (!globe() && dbg == 0u) {
+        if (pl.t > 0.0 && g.extra.x > 0.0) {
+            // (the forest scene's haze; the globe has its atmosphere above)
+            vec3 beta = (vec3(5.8e-6, 13.5e-6, 33.1e-6) + 2.0e-6) * g.extra.x;
+            vec3 T = exp(-beta * pl.t);
+            col = col * T + hazeColor(dir) * (1.0 - T);
+        }
+        if (cloudsOn()) col = forestClouds(col, org - g.planet.xyz, dir, pl.t, 40, rnd(rng));
     }
     // This frame's sample and hit distance; taa.comp blends it into the history.
     // eye adaptation before the 16-bit targets (moonlit radiance would flush to zero in them)

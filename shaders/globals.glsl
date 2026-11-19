@@ -22,7 +22,7 @@ struct Globals {
     vec4 earthX;    // globe mode: rows of the camera frame -> Earth axes (ECEF) rotation (clouds.glsl)
     vec4 earthY;
     vec4 earthZ;
-    vec4 cloud;     // globe mode: x cloud cover (0..1), y clouds on (1) / off (0), z smooth tree thinning (1) / stepped (0)
+    vec4 cloud;     // x cloud cover (0..1), y volumetric clouds on (1) / off (0), z globe: smooth tree thinning (1) / stepped (0), w seconds of animation
     vec4 ocean0;    // globe sea (ocean.rs): x wind m/s, y residual slope variance, z largest wave height m, w chop
     vec4 ocean1;    //   xy wind direction (patch coordinates), z whitecap coverage, w 1 once a frame is in
     vec4 ocean2;    //   slope variance of each cascade

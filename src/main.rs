@@ -1033,6 +1033,17 @@ impl App {
             let gg = globe::scene::GlobeGlobals { planet: [pc.x, pc.y, pc.z, globe::scene::RADIUS], ..Default::default() };
             s.r.set_globe_view(geo.ecef, rot, gg);
         }
+        if s.geo.is_none() {
+            // The forest scenes' clouds (clouds.glsl): a planet under the scene, CLOUD_LIFT below
+            // its sea level, at 46 N on the prime meridian (x east, y up, z south), in the
+            // scene's own coordinates (the camera is not at the origin as on the globe).
+            // planet.w stays 0: only the clouds use it.
+            const CLOUD_LIFT: f32 = 400.0;
+            planet = [0.0, -(globe::tiles::R_EARTH as f32) + CLOUD_LIFT, 0.0, 0.0];
+            let (sl, cl) = 46f32.to_radians().sin_cos();
+            // rows: east, up, south -> Earth axes
+            earth = [[0.0, cl, sl, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, sl, -cl, 0.0]];
+        }
         let g = Globals {
             cam_pos: cam_now[0],
             cam_right: cam_now[1],
@@ -1053,7 +1064,7 @@ impl App {
             earth,
             // z: globe tree thinning (1 smooth, 0 stepped; impostor.rint, globe.rchit)
             ocean: [[0.0; 4]; 3],
-            cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
+            cloud: [self.args.cloud_cover, if s.clouds { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
             biome: biome::current().ground_packed(),
             lawn: [[0.0; 4]; 4], // (set by the renderer)
         };
