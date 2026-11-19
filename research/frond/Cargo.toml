@@ -1,0 +1,18 @@
+[package]
+name = "frond"
+version = "0.1.0"
+edition = "2021"
+description = "Research: a lossless codec for SmartImposter's parallax impostor atlases"
+
+# (a crate of its own: not part of the renderer's build)
+[workspace]
+
+[dependencies]
+anyhow = "1"
+zstd = "0.13"
+brotli = "7"
+lz4_flex = "0.11"
+
+[profile.release]
+opt-level = 3
+debug = false
