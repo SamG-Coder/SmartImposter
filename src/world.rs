@@ -4,6 +4,7 @@
 //!   Earth data), on a graded grid (3 m cells in the middle, up to 300 m at the edge) reaching
 //!   TERRAIN_HALF in every direction, with the Earth's curvature (d^2 / 2R).
 //! * What grows on it: the biome preset (biome.rs, `--biome`).
+//! * Or the park (`--park`): rolling hills of lawn with groves and single trees, nothing else.
 //! * Canopy: a seed-dispersal simulation. Founder trees start in pairs; every generation each tree
 //!   drops seeds with its species' dispersal kernel, and a seedling survives depending on the site
 //!   (biome), crowding and shade tolerance. Stands, groves and ragged edges emerge on their own.
@@ -15,6 +16,7 @@ use crate::asset::{MeshData, TreeAsset};
 use crate::catalog::{Catalog, Kind};
 use glam::{Affine3A, Quat, Vec3};
 use crate::erosion::Erosion;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 pub const MAT_TERRAIN: u8 = 2;
@@ -148,6 +150,31 @@ fn land() -> &'static Land {
         println!("Start: simulation ({sx:.0}, {sz:.0}), height {:.0} m", l.h0);
         l
     })
+}
+
+// ------------------------------------------------------------------------------ the park
+
+/// The park (`--park`): gentle hills of lawn (lawn.rs) with groves and single trees, instead of
+/// the eroded landscape and its forest. Set by main before the world is built.
+static PARK: AtomicBool = AtomicBool::new(false);
+pub fn set_park() {
+    PARK.store(true, Ordering::Relaxed);
+}
+pub fn park() -> bool {
+    PARK.load(Ordering::Relaxed)
+}
+
+/// Radius (m) within which the park's trees stand.
+pub const PARK_RADIUS: f32 = 1400.0;
+
+/// Height of the park's ground: rounded hills a few hundred metres across with knolls and
+/// swells on them, a gentler start, and higher hills in the distance as a backdrop. Nowhere
+/// steep (under ~20 degrees: it is all lawn, and all walkable).
+fn park_height(x: f32, z: f32) -> f32 {
+    let r = (x * x + z * z).sqrt();
+    let hills = 42.0 * fbm(x / 340.0, z / 340.0, 3, 211) + 12.0 * fbm(x / 115.0, z / 115.0, 3, 223) + 1.6 * fbm(x / 40.0, z / 40.0, 2, 227);
+    let far = 320.0 * (0.5 + 0.5 * fbm(x / 3000.0, z / 3000.0, 4, 233)) * smoothstep(900.0, 4500.0, r);
+    hills * (0.45 + 0.55 * smoothstep(0.0, 90.0, r)) + far
 }
 
 // --------------------------------------------------------------------------- real places
@@ -326,6 +353,9 @@ pub fn terrain_sample(x: f32, z: f32) -> (f32, f32, f32, f32) {
     if let Some(s) = site() {
         return s.sample(x, z);
     }
+    if park() {
+        return (park_height(x, z) - (x * x + z * z) / (2.0 * EARTH_RADIUS), 0.0, 0.0, 0.0);
+    }
     let l = land();
     let r2 = x * x + z * z;
     // The start clearing keeps a third of the local relief (around the height at the origin).
@@ -350,6 +380,9 @@ impl World {
     /// hollows collect it; plus the soil moisture. `e`: curvature scale (m). Sun-facing slopes
     /// are added in the shader (it knows the sun).
     pub fn dryness(&self, x: f32, z: f32, wet: f32, e: f32) -> f32 {
+        if park() {
+            return 0.0; // a watered lawn
+        }
         let h = self.height_at(x, z);
         let ring = 0.25 * (self.height_at(x + e, z) + self.height_at(x - e, z) + self.height_at(x, z + e) + self.height_at(x, z - e));
         let convex = ((h - ring) / (0.06 * e)).clamp(-1.0, 1.0);
@@ -359,6 +392,10 @@ impl World {
 
     /// Soil moisture in [0, 1]: valleys and wet patches, river banks; uplands are drier.
     pub fn wetness(&self, x: f32, z: f32) -> f32 {
+        if park() {
+            // (evenly moist; the hollows a little more, which the ground shader turns mossy)
+            return (0.24 + 0.14 * fbm(x / 210.0, z / 210.0, 3, 241)).clamp(0.0, 1.0);
+        }
         let (_, bank) = self.river_at(x, z);
         let k = if site().is_some() { 1.0 } else { crate::biome::current().wet_scale };
         ((0.15 + 0.6 * twi(x, z) + 0.4 * fbm(x / 380.0, z / 380.0, 4, 31) - 0.25 * mountain_n(x, z)) * k + 0.8 * bank).clamp(0.0, 1.0)
@@ -369,6 +406,9 @@ impl World {
     /// tops, meadows on valley floors, ragged and wide edges (the seed spread fills them in), no
     /// trees in the water or on gravel bars, none above the treeline, and a clearing at the origin.
     pub fn forest_density(&self, x: f32, z: f32) -> f32 {
+        if park() {
+            return 0.0; // no forest: the trees are placed one by one (World::park)
+        }
         let r2 = x * x + z * z;
         let clearing = ((r2.sqrt() - 24.0) / 10.0).clamp(0.0, 1.0);
         if let Some(s) = site() {
@@ -936,6 +976,8 @@ impl World {
         // layers: 1 shrubs, 2 forest plants, 3 grass, 4 boulders, 5 deadwood
         let layers = [(1u32, 3.4, under_radius), (2, 2.1, under_radius), (3, 2.3, grass_radius), (4, 5.0, under_radius), (5, 7.0, under_radius)];
         use crate::biome::{Grass, Habitat};
+        // (under a lawn the short grass patches are mostly left out: lawn.rs)
+        let short_grass = crate::lawn::short_grass();
         let weighted = |list: &[(f32, &[usize])], r1: f32, r2: f32| pick(list, r1, r2);
         for (layer, step, rad) in layers {
             let count = (rad * 2.0 / step) as i32;
@@ -983,22 +1025,27 @@ impl World {
                             let w = (open * 1.15 + 0.35 * b.edge) * (0.85 + 0.15 * patchy) * smoothstep(0.0, 0.25, open + 0.5 * b.edge);
                             // sparse grass breaks up into tufts and bare ground
                             let sparse = if bp.grass_cover < 0.6 { smoothstep(0.35, 0.65, fbm(x / 14.0, z / 14.0, 3, 131)) } else { 1.0 };
-                            if r_place > (w * bp.grass_cover * sparse).min(0.97) {
+                            let tallz = smoothstep(0.1, 0.5, fbm(x / 45.0, z / 45.0, 3, 101));
+                            let share = |g: &Grass| match g {
+                                Grass::Moist => 1.6 * (1.0 - dry) * (1.0 - 0.3 * b.wet),
+                                Grass::Dry => 1.4 * dry * (1.0 - b.wet),
+                                Grass::Wet => 2.0 * b.wet * b.wet,
+                                Grass::Tall => 0.9 * tallz + 0.8 * b.edge,
+                            };
+                            // A lawn stands in for most of the short grass: those patches' share
+                            // of the places goes, the taller, dry and wet grasses keep theirs.
+                            // (as a meadow or tall grass it stands in for the tall and dry ones too)
+                            let keep = |g: &Grass| match g {
+                                Grass::Moist => short_grass,
+                                Grass::Tall | Grass::Dry => 1.0 + (short_grass - 1.0) * crate::lawn::wild(),
+                                Grass::Wet => 1.0,
+                            };
+                            let all: f32 = grasses.iter().map(|(_, wt, g)| wt * share(g)).sum();
+                            let left: f32 = grasses.iter().map(|(_, wt, g)| wt * share(g) * keep(g)).sum();
+                            if r_place > (w * bp.grass_cover * sparse).min(0.97) * if all > 0.0 { left / all } else { 1.0 } {
                                 continue;
                             }
-                            let tallz = smoothstep(0.1, 0.5, fbm(x / 45.0, z / 45.0, 3, 101));
-                            let list: Vec<(f32, &[usize])> = grasses
-                                .iter()
-                                .map(|(vs, wt, g)| {
-                                    let k = match g {
-                                        Grass::Moist => 1.6 * (1.0 - dry) * (1.0 - 0.3 * b.wet),
-                                        Grass::Dry => 1.4 * dry * (1.0 - b.wet),
-                                        Grass::Wet => 2.0 * b.wet * b.wet,
-                                        Grass::Tall => 0.9 * tallz + 0.8 * b.edge,
-                                    };
-                                    (wt * k, vs.as_slice())
-                                })
-                                .collect();
+                            let list: Vec<(f32, &[usize])> = grasses.iter().map(|(vs, wt, g)| (wt * share(g) * keep(g), vs.as_slice())).collect();
                             weighted(&list, r1, r2)
                         }
                         4 => {
@@ -1100,6 +1147,74 @@ impl World {
             let n: usize = sp.variants.clone().map(|v| per[v]).sum();
             println!("  {:<24} {:>7}", sp.name, n);
         }
+        world
+    }
+
+    /// The park (`--park`): hills of lawn, and the biome's trees in groves with single trees
+    /// between them. No understory, grass patches, rocks or deadwood: the lawn is the ground
+    /// cover (lawn.rs), right up to the trunks.
+    pub fn park(trees: &[TreeAsset], cat: &Catalog) -> Self {
+        let t0 = std::time::Instant::now();
+        let mut world = Self::build_terrain();
+        world.forest_radius = PARK_RADIUS;
+        let bp = crate::biome::current();
+        // the biome's trees, one list per kind of tree (a grove is mostly one kind)
+        let single = std::env::args().any(|a| a == "--species");
+        let mut kinds: Vec<Vec<usize>> = bp
+            .roles
+            .iter()
+            .flat_map(|role| role.iter())
+            .map(|name| cat.variants_of(name).into_iter().filter(|&v| cat.variants[v].kind == Kind::Tree && cat.variants[v].height >= 4.0).collect::<Vec<_>>())
+            .filter(|vs| !vs.is_empty())
+            .collect();
+        if kinds.is_empty() || single {
+            kinds = cat.species.iter().map(|sp| sp.variants.clone().filter(|&v| cat.variants[v].kind == Kind::Tree).collect::<Vec<_>>()).filter(|vs: &Vec<usize>| !vs.is_empty()).collect();
+        }
+        if kinds.is_empty() {
+            println!("Park: no tree species loaded, lawn only");
+            return world;
+        }
+        const STEP: f32 = 9.0;
+        let count = (2.0 * PARK_RADIUS / STEP) as i32;
+        let hs = |gx: i32, gz: i32, k: u32| hash(gx, gz, k + 900);
+        let (mut grove_trees, mut lone) = (0usize, 0usize);
+        for gz in -count / 2..count / 2 {
+            for gx in -count / 2..count / 2 {
+                let x = (gx as f32 + 0.5 + (hs(gx, gz, 1) - 0.5) * 0.7) * STEP;
+                let z = (gz as f32 + 0.5 + (hs(gx, gz, 2) - 0.5) * 0.7) * STEP;
+                let r = (x * x + z * z).sqrt();
+                if !(22.0..=PARK_RADIUS).contains(&r) {
+                    continue; // (and open lawn at the start)
+                }
+                // groves: rounded clumps some 60-150 m across, a fifth of the park; thinner at
+                // their edges; and now and then a tree on its own in the open
+                let field = fbm(x / 170.0, z / 170.0, 3, 301) + 0.25 * fbm(x / 45.0, z / 45.0, 2, 307);
+                let grove = smoothstep(0.2, 0.38, field);
+                let in_grove = hs(gx, gz, 3) < 0.6 * grove;
+                if !in_grove && hs(gx, gz, 4) > 0.007 {
+                    continue;
+                }
+                // which kind: one per neighbourhood (with a few others mixed in)
+                let pick = if hs(gx, gz, 5) < 0.65 { 0.5 + 0.5 * fbm(x / 240.0 + 9.0, z / 240.0, 2, 311) * 2.2 } else { hs(gx, gz, 6) };
+                let vs = &kinds[((pick.clamp(0.0, 0.999) * kinds.len() as f32) as usize).min(kinds.len() - 1)];
+                let variant = vs[(hs(gx, gz, 7) * vs.len() as f32) as usize % vs.len()];
+                let xform = Affine3A::from_scale_rotation_translation(
+                    Vec3::splat((0.85 + 0.3 * hs(gx, gz, 8)) * bp.tree_scale),
+                    Quat::from_rotation_y(hs(gx, gz, 9) * std::f32::consts::TAU),
+                    Vec3::new(x, world.height_at(x, z) - 0.15, z),
+                );
+                let t = &trees[variant];
+                let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
+                let seed = 1 + (hs(gx, gz, 10) * 8190.0) as u16;
+                world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint });
+                if in_grove {
+                    grove_trees += 1;
+                } else {
+                    lone += 1;
+                }
+            }
+        }
+        println!("Park: {grove_trees} trees in groves, {lone} on their own, within {PARK_RADIUS:.0} m ({:.2}s)", t0.elapsed().as_secs_f32());
         world
     }
 
@@ -1207,6 +1322,23 @@ impl World {
             splat(&mut cover, res, cell, t.center.x, t.center.z, rc, 0.9);
         }
         blur(&blur(&blur(&cover, res), res), res)
+    }
+
+    /// Does the lawn grow at (x, z)? Where the renderer stands real blades near the camera
+    /// (lawn.rs near_radius): all of the park; in the forest scene the open, moist ground the
+    /// terrain shader paints as grass (tri.rchit groundMaterial `lawn`, which also has small
+    /// noise this does not: at their edges the two can differ by a tile).
+    pub fn grows_lawn(&self, x: f32, z: f32) -> bool {
+        if park() {
+            return true;
+        }
+        let (water, bank) = self.river_at(x, z);
+        if water > 0.02 || bank > 0.5 || self.cover_at(x, z) > 0.4 {
+            return false;
+        }
+        let h = self.height_at(x, z);
+        let slope = ((self.height_at(x + 2.0, z) - h).powi(2) + (self.height_at(x, z + 2.0) - h).powi(2)).sqrt() / 2.0;
+        slope < 0.45 && self.dryness(x, z, self.wetness(x, z), 12.0) < 0.6
     }
 
     fn cover_at(&self, x: f32, z: f32) -> f32 {

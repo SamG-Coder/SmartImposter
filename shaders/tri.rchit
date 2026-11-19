@@ -27,6 +27,12 @@ vec3 ueTint(vec3 t) { return mix(vec3(1.0), clamp(t * 2.0, 0.0, 2.0), 0.6); }
 //   biome mask (R canopy cover, G moisture, B dryness, A understory, World::ground_mask), slot
 //   MAX_GROUND_TEX-2 = far mask over the whole terrain (R forest site density, World::far_mask).
 layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX];
+// the impostor atlases (impostor.rint): here for the lawn, whose atlas is one of the slots
+layout(set = 0, binding = 7) uniform sampler2D depthAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 14) uniform sampler2D normalAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 6) uniform sampler2D albedoAtlas[MAX_VARIANTS];
+layout(set = 0, binding = 11) uniform sampler2D visAtlas[MAX_VARIANTS];
+#include "lawn.glsl"
 const float GROUND_TILE = 2.2; // metres per texture repeat
 // The scans' mean albedos differ ~10x (moss 0.02 .. dried grass 0.19); bring them to 0.05..0.1.
 // Mountain scans: neutral until calibrated.
@@ -92,7 +98,8 @@ vec3 hexWeights(vec3 w, vec3 lum) {
 // mountains (by slope and true altitude): rock cliff, dark rock cliff, snow, scree, lichen rock.
 // A layer whose scan is missing (bit not set in the layer mask) uses a procedural stand-in.
 #define GROUND_LAYERS 12
-void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float bank, out vec3 albedo, out float ao) {
+// lawn: how much of the ground here is grass (the grass, wet grass and mossy grass slots).
+void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float bank, out vec3 albedo, out float ao, out float lawn) {
     vec4 mkF = textureLod(groundTex[MAX_GROUND_TEX - 2], (p.xz + TERRAIN_HALF) / (2.0 * TERRAIN_HALF), 0.0);
     vec4 mkN = textureLod(groundTex[MAX_GROUND_TEX - 1], (p.xz + NEAR_HALF) / (2.0 * NEAR_HALF), 0.0);
     float nearW = 1.0 - smoothstep(NEAR_HALF - 300.0, NEAR_HALF - 20.0, max(abs(p.x), abs(p.z)));
@@ -134,10 +141,12 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
     // Mossy, darker-green patches also in dry meadows (hollows, old clumps): ~10-30 m scale.
     float nD = fbmN(p.xz * 0.045 + 93.0, 3);
     float wMoss = (smoothstep(0.42, 0.78, wetN) + 0.7 * smoothstep(0.15, 0.6, cover + (nA - 0.5) * 0.3) + 0.8 * smoothstep(0.6, 0.78, nD + (nA - 0.5) * 0.25)) * (open + 0.4 * wFloor);
+    // (the park, lawn3.z: a kept lawn, even in colour, with only a hint of the mossy patches)
+    wMoss *= 1.0 - 0.95 * g.lawn3.z;
     // Sun-facing slopes dry out (more insolation), shaded ones stay lush.
     vec2 sunH = g.sunDir.xz / max(length(g.sunDir.xz), 1e-3);
     float sunny = dot(n.xz, sunH);
-    float dryN = dry + 1.2 * sunny + (nC - 0.5) * 0.2 + (nB - 0.5) * 0.3 + (nA - 0.5) * 0.25;
+    float dryN = dry + 1.2 * sunny + (nC - 0.5) * 0.2 + (nB - 0.5) * 0.3 + (nA - 0.5) * 0.25 - 2.0 * g.lawn3.z;
     float wDry = open * smoothstep(0.45, 0.8, dryN) * (1.0 - 0.7 * wet);
     float wGrass = open * (1.0 - 0.6 * smoothstep(0.4, 0.8, wetN)) * (1.0 - smoothstep(0.35, 0.75, dryN));
     // ---- river banks: pebble bars at the water, muddy riverbed, then wet grass on the floodplain
@@ -252,6 +261,7 @@ void groundMaterial(vec3 p, inout vec3 n, float footprint, uint layerMask, float
         nxy += nrm[l] * k;
         ao += occ[l] * k;
     }
+    lawn = (hw[2] + 0.8 * hw[11] + 0.6 * hw[1]) / max(hsum, 1e-12);
     if (g.iparams.y == 11u) {
         // debug: dominant ground layers colour-coded (floor orange, moss dark green, grass lime,
         // dry yellow, rock grey / dark grey, snow white, scree red, lichen purple, mud brown,
@@ -331,6 +341,8 @@ void main() {
     float ao = 1.0;
     vec3 trans = vec3(0.0);
     vec3 albedo;
+    // (the lawn moves the hit up to a blade, in the blades' own shade)
+    float tHit = gl_HitTEXT, sunVis = 1.0;
     uint ts = m.texSet * 6u;
     SpeciesInfo spc = species[m.texSet];
     // What this instance is, for the per-leaf colour variation: the plant and which of its parts
@@ -349,7 +361,9 @@ void main() {
         // proximity.
         Vec2Ref RV = Vec2Ref(m.uv);
         vec2 riv = RV.v[tri.x] * b.x + RV.v[tri.y] * b.y + RV.v[tri.z] * b.z;
-        if ((layerMask & 15u) == 15u && spread > 0.0) groundMaterial(wp, n, gl_HitTEXT * spread, layerMask, riv.y, albedo, ao);
+        // (without the ground scans: grass wherever it is not steep)
+        float lawnAmt = 1.0 - smoothstep(0.1, 0.3, 1.0 - n.y);
+        if ((layerMask & 15u) == 15u && spread > 0.0) groundMaterial(wp, n, gl_HitTEXT * spread, layerMask, riv.y, albedo, ao, lawnAmt);
         else albedo = terrainAlbedo(wp, n);
         if (riv.x > 0.01) {
             // Under water: this is the bed (pebbles / mud from the bank layers, wet and dark);
@@ -360,6 +374,124 @@ void main() {
             // wet banks just above the water line
             albedo *= mix(1.0, 0.62, smoothstep(0.86, 1.0, riv.y));
         }
+        // ---- the lawn (lawn.glsl): the ray is marched through the baked blades in the slab of
+        // one blade height above the ground it has just hit. A blade: the hit moves up to it. No
+        // blade: the soil between them, in their shade.
+        Lawn lw;
+        lw.H = g.lawn.x;
+        vec3 up = ng.y < 0.0 ? -ng : ng;
+        float down = -dot(gl_WorldRayDirectionEXT, up); // how fast the ray comes down on the ground
+        lw.cover = smoothstep(0.25, 0.6, lawnAmt) * (1.0 - smoothstep(0.6 * LAWN_FADE, LAWN_FADE, gl_HitTEXT));
+        // (around the camera the lawn is real blades, renderer.rs place_grass: the layer comes in
+        // under them as they shrink into the ground at the edge of that circle)
+        if (g.lawn3.w > 0.0) lw.cover *= smoothstep(0.5, 0.8, length(wp - g.camPos.xyz) / g.lawn3.w);
+        if (lw.H > 0.0 && spread > 0.0 && riv.x <= 0.01 && down > 1e-3 && up.y > 0.3 && lw.cover > 0.03) {
+            lw.slot = uint(g.lawn2.w);
+            lw.T = g.lawn.y;
+            lw.n = g.lawn.zw;
+            lw.slopes = g.lawn3.xy;
+            lw.res = g.lawn2.x;
+            lw.gut = g.lawn2.y;
+            // A real lawn is not one square repeated: it is taller here and shorter there, and no
+            // row of tiles shows. The blades' height varies over a few metres (the baked blades
+            // are squashed: the ray is stretched the other way, and marched as baked; the park is
+            // mown, nearly even), and the
+            // tiling is bent by a slow, smooth offset.
+            float tall = mix(mix(0.55, 0.86, g.lawn3.z), 1.0, smoothstep(0.2, 0.8, 0.6 * vnoise(wp.xz * 0.23 + 11.3) + 0.4 * vnoise(wp.xz * 0.9)));
+            // (and in tufts a foot across, with their own shade: the texture a lawn keeps from
+            // further away than its blades show; gone before a pixel is as wide as a tuft)
+            float tufts = 1.0 - smoothstep(30.0, 110.0, gl_HitTEXT);
+            vec2 tuft = vec2(vnoise(wp.xz * 3.3 + 5.0), vnoise(wp.xz * 5.9 + 17.0));
+            tall *= mix(1.0, mix(0.84, 1.0, tuft.x), tufts);
+            // (gently: every copy of the tile is shifted on its own already, lawn.glsl lawnTile,
+            // and a strong bend shears tall blades into swirls)
+            vec2 bend = (vec2(vnoise(wp.xz * 0.31 + 3.7), vnoise(wp.xz * 0.31 + 57.1)) - 0.5) * 0.22
+                      + (vec2(vnoise(wp.xz * 0.07 + 23.9), vnoise(wp.xz * 0.07 + 91.3)) - 0.5) * 0.8;
+            // tile space: world x and z, y the height above the ground (measured up, also on a
+            // slope) in baked blade heights
+            vec3 D = vec3(gl_WorldRayDirectionEXT.x, -down / (up.y * tall), gl_WorldRayDirectionEXT.z);
+            float s1 = min(1.04 * lw.H / -D.y, gl_HitTEXT - gl_RayTminEXT);
+            vec3 P0 = vec3(wp.x + bend.x, 0.0, wp.z + bend.y) - D * s1;
+            vec3 sun = normalize(vec3(g.sunDir.x, g.sunDir.y / tall, g.sunDir.z));
+            float texel = lw.T / (lw.res - 2.0 * lw.gut);
+            lw.lod = clamp(log2(max(gl_HitTEXT * spread / texel, 1e-6)) - 1.0, 0.0, g.lawn2.z - 1.0);
+            lw.marchLod = floor(lw.lod + 0.5);
+            uint seed = hash2(gl_LaunchIDEXT.xy) ^ pcg(g.iparams.z * 7919u + 0x1a3fu);
+            lw.thr = mix(0.03, 0.97, rnd(seed));
+            vec2 cell = lawnPick(lw, normalize(-D), rnd(seed));
+            float sH;
+            vec2 uvH;
+            bool blade = lawnMarch(lw, cell, P0, D, s1, sH, uvH);
+            // Down between the blades without meeting one: from above that is the soil. Seen at a
+            // low angle it cannot be (the ray has crossed the whole depth of the lawn sideways):
+            // then it is the base of the blades, deep in their shade.
+            float deep = 1.0;
+            if (!blade && rnd(seed) > smoothstep(0.2, 0.6, -normalize(D).y)) {
+                blade = true;
+                deep = 0.45;
+            }
+            if (blade) {
+                vec2 auv = lawnAtlasUV(lw, cell, uvH);
+                vec4 a = textureLod(albedoAtlas[nonuniformEXT(lw.slot)], auv, lw.lod);
+                vec2 nxy = textureLod(normalAtlas[nonuniformEXT(lw.slot)], auv, lw.lod).rg * 2.0 - 1.0;
+                vec4 vs = textureLod(visAtlas[nonuniformEXT(lw.slot)], auv, max(lw.lod - 1.0, 0.0)); // half-res atlas
+                // (the atlas stores sqrt(albedo)) The blades take on the colour of the ground they
+                // grow from: lush, mossy or dry as the ground texture is there.
+                vec3 tint = clamp(albedo / vec3(0.050, 0.085, 0.022), 0.5, 1.8);
+                albedo = a.rgb * a.rgb * mix(vec3(1.0), tint, 0.6) * mix(0.82, 1.12, vnoise(wp.xz * 0.55 + 41.0)) * mix(1.0, mix(0.88, 1.1, tuft.y), tufts);
+                n = octDecode(nxy);
+                ng = n;
+                ao = a.a * deep;
+                trans = albedo * 2.0;
+                mat = MAT_LEAF;
+                extraFlags = FLAG_GLOSSY | FLAG_IMPOSTOR | FLAG_LAWN;
+                tHit = gl_HitTEXT - (s1 - sH);
+                // blade normals point every way within a texel: the spread scales the sunlight
+                // (as for the grass impostors), and the blades towards the sun shade it
+                sunVis = clamp(vs.y, 0.2, 1.0) * lawnSun(lw, P0 + D * sH, sun, seed) * deep;
+            } else {
+                ao *= mix(1.0, 0.45, lw.cover);
+                sunVis = lawnSun(lw, P0 + D * s1, sun, seed);
+            }
+        }
+    } else if ((m.flags & 2u) != 0u) {
+        // A blade of the lawn tile (lawn.rs; only ever seen by the lawn's bake): coloured from
+        // where on the blade this is (uv.y: root 0 .. tip 1) and the blade's random number.
+        Vec2Ref UV = Vec2Ref(m.uv);
+        vec2 uv = UV.v[tri.x] * b.x + UV.v[tri.y] * b.y + UV.v[tri.z] * b.z;
+        // (a seed stalk of unmown grass: uv.y + 2)
+        bool stalk = uv.y > 1.5;
+        if (stalk) uv.y -= 2.0;
+        uint lr = pcg(leafId * 7919u + 91u);
+        float h1 = float(lr & 0xFFFFu) / 65535.0, h2 = float(lr >> 16) / 65535.0;
+        // darker and bluer at the root, lighter and yellower at the tip; every blade its own
+        // shade, a few of them straw
+        vec3 green = mix(vec3(0.026, 0.050, 0.012), vec3(0.070, 0.118, 0.028), smoothstep(0.0, 0.85, uv.y));
+        green *= mix(vec3(1.10, 1.0, 0.72), vec3(0.90, 1.0, 1.10), h1) * mix(0.78, 1.2, h2);
+        vec3 straw = vec3(0.16, 0.13, 0.06) * mix(0.7, 1.1, h1);
+        albedo = mix(green, straw, step(0.94, h2) * smoothstep(0.2, 0.7, uv.y));
+        albedo *= mix(0.86, 1.0, abs(uv.x * 2.0 - 1.0)); // the midrib
+        // (the stalk dries towards its seed head, which is tan)
+        if (stalk) albedo = mix(mix(green, straw, smoothstep(0.25, 0.7, uv.y)), vec3(0.125, 0.105, 0.055) * mix(0.75, 1.15, h1), smoothstep(0.68, 0.76, uv.y));
+        if (!bake) {
+            // A real blade near the camera (renderer.rs place_grass): in the colour the layer
+            // gives its blades further out, that of the ground it grows from (the lawn above).
+            vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+            uint layerMask = floatBitsToUint(g.lodParams.w);
+            float spread = g.camFwd.w;
+            if ((layerMask & 15u) == 15u && spread > 0.0) {
+                vec3 gn = vec3(0.0, 1.0, 0.0), galb;
+                float gao, gl;
+                groundMaterial(wp, gn, gl_HitTEXT * spread, layerMask, 0.0, galb, gao, gl);
+                vec3 tint = clamp(galb / vec3(0.050, 0.085, 0.022), 0.5, 1.8);
+                float tufts = 1.0 - smoothstep(30.0, 110.0, gl_HitTEXT);
+                albedo *= mix(vec3(1.0), tint, 0.6) * mix(0.82, 1.12, vnoise(wp.xz * 0.55 + 41.0)) * mix(1.0, mix(0.88, 1.1, vnoise(wp.xz * 5.9 + 17.0)), tufts);
+            }
+        }
+        // (a real blade near the camera has no highlight of its own: every blade glinting makes
+        // the grass pale next to the layer further out, whose texels are many blades each)
+        extraFlags = bake ? FLAG_GLOSSY : 0u;
+        trans = albedo * 2.0;
     } else if (textured) {
         Vec2Ref UV = Vec2Ref(m.uv);
         vec2 t0 = UV.v[tri.x], t1 = UV.v[tri.y], t2 = UV.v[tri.z];
@@ -425,12 +557,12 @@ void main() {
     }
 
     pl.albedo = albedo;
-    pl.t = gl_HitTEXT;
+    pl.t = tHit;
     pl.n = n;
     pl.ng = ng;
     pl.flags = mat | extraFlags;
     pl.ao = ao;
-    pl.sunVis = 1.0;
+    pl.sunVis = sunVis;
     pl.shadowMask = 0xFFu;
     pl.trans = trans;
 }

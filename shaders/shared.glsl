@@ -11,6 +11,7 @@
 #define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
 #define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
+#define FLAG_LAWN 8192u   // a blade of the lawn (lawn.glsl): an impostor hit on the ground
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
 #define MAX_GROUND_TEX 80 // 3 per ground layer (26 layers); the last two slots are the far / near masks
@@ -100,6 +101,22 @@ void frameBasis(vec3 f, out vec3 r, out vec3 u) {
 
 // Direction of impostor frame `cell` in an N x N hemi-octahedral grid (frames at grid vertices).
 vec3 frameDir(vec2 cell, float N) { return hemiOctDecode(cell / (N - 1.0)); }
+
+// The lawn's views (src/lawn.rs): n.x azimuths round the compass x n.y slopes, the slope
+// (cot of the elevation) geometric from slopes.x (steepest) to slopes.y (flattest). `cell`:
+// (azimuth index, slope index); the direction points from the lawn towards the viewer.
+vec3 lawnFrameDir(vec2 cell, vec2 n, vec2 slopes) {
+    float az = cell.x / n.x * 6.2831853;
+    float s = slopes.x * pow(slopes.y / slopes.x, cell.y / (n.y - 1.0));
+    return normalize(vec3(s * cos(az), 1.0, s * sin(az)));
+}
+// Where direction v lies among the views: x in [0, n.x) (it wraps), y in [0, n.y - 1] (steeper
+// and flatter directions: the first and the last row).
+vec2 lawnFrameCoord(vec3 v, vec2 n, vec2 slopes) {
+    float az = atan(v.z, v.x) / 6.2831853;
+    float s = clamp(length(v.xz) / max(v.y, 1e-4), slopes.x, slopes.y);
+    return vec2(fract(az + 1.0) * n.x, log(s / slopes.x) / log(slopes.y / slopes.x) * (n.y - 1.0));
+}
 
 // ---------------------------------------------------------------- materials
 // Foliage in dry biomes (dry 0..1): towards a dusty grey-olive of the same brightness, a little

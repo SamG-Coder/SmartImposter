@@ -27,6 +27,9 @@ struct Globals {
     vec4 ocean1;    //   xy wind direction (patch coordinates), z whitecap coverage, w 1 once a frame is in
     vec4 ocean2;    //   slope variance of each cascade
     uvec4 biome;    // forest scene: ground slot -> scanned surface, one byte per slot (biome.rs)
+    vec4 lawn;      // forest scene lawn (lawn.rs): x blade height m (0 = no lawn), y tile m, zw views (azimuths, slopes)
+    vec4 lawn2;     //   x texels per view, y gutter texels, z atlas levels, w atlas slot
+    vec4 lawn3;     //   xy slope (cot elevation) of the steepest and flattest views, z 1 = the park (--park: watered, no dried grass), w real blades around the camera to this distance (m)
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).
