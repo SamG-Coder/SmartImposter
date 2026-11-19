@@ -6,12 +6,14 @@
 #define MAT_BARK 0u
 #define MAT_LEAF 1u
 #define MAT_TERRAIN 2u
+#define MAT_AIRCRAFT 3u
 #define FLAG_IMPOSTOR 256u
 #define FLAG_IMPOSTOR_HI 512u
 #define FLAG_WATER 2048u  // river surface: reflective water (main.rgen)
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
 #define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
 #define FLAG_LAWN 8192u   // a blade of the lawn (lawn.glsl): an impostor hit on the ground
+#define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
 #define MAX_GROUND_TEX 81 // 3 per ground layer (26 layers); then the grass map (--lawn auto) and the far / near masks

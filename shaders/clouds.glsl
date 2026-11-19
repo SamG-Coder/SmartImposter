@@ -279,6 +279,61 @@ float cloudShadow(vec3 x, vec3 L) {
     return exp(-0.7 * od);
 }
 
+// ---- the aircraft's wake (--test-flight): where it has flown through cloud, the cloud is
+// stirred and thinned. Its engine's heat and the sinking, warming air in its wake evaporate the
+// droplets (a dissipation trail: a clear lane through thin cloud), and its tip vortices roll the
+// cloud round the path. The wake is a string of points with their age (g.wake); round each
+// stretch the density is cut in a tube that widens with age, and the cloud's shapes are turned
+// about the path. The tube closes again after a minute and a half.
+vec3 wakePoint(int i) { return g.wake[i].xyz - g.planet.xyz; }
+
+// The stretches of the wake that the ray ro + rd t comes near (at most 6): their first points.
+int wakeNear(vec3 ro, vec3 rd, out int cand[6]) {
+    int nc = 0;
+    int n = g.acState.x > 0.5 ? int(g.acState2.y) : 0;
+    for (int i = 0; i + 1 < n && nc < 6; ++i) {
+        if (max(g.wakeB[i].y, g.wakeB[i + 1].y) <= 0.0) continue;
+        vec3 a = wakePoint(i), b = wakePoint(i + 1);
+        float rad = 0.5 * length(b - a) + 3.0 * (9.0 + 1.4 * g.wake[i + 1].w);
+        vec3 oc = 0.5 * (a + b) - ro;
+        float tc = dot(oc, rd);
+        if (tc < -rad) continue;
+        vec3 perp = oc - rd * tc;
+        if (dot(perp, perp) > rad * rad) continue;
+        cand[nc++] = i;
+    }
+    return nc;
+}
+
+// x as the wake has stirred it (the cloud is looked up there), and how much of the cloud at x
+// the wake has cleared (0..1).
+vec3 wakeWarp(vec3 x, int cand[6], int nc, out float carve) {
+    carve = 0.0;
+    vec3 best = x;
+    float bw = 0.0;
+    for (int k = 0; k < nc; ++k) {
+        int i = cand[k];
+        vec3 a = wakePoint(i), ab = wakePoint(i + 1) - a;
+        float s = clamp(dot(x - a, ab) / max(dot(ab, ab), 1e-3), 0.0, 1.0);
+        vec3 c = a + ab * s, r = x - c;
+        float age = mix(g.wake[i].w, g.wake[i + 1].w, s);
+        float st = mix(g.wakeB[i].y, g.wakeB[i + 1].y, s) * smoothstep(100.0, 60.0, age);
+        float R = 9.0 + 1.4 * age;
+        float d2 = dot(r, r) / (R * R);
+        if (d2 > 9.0 || st <= 0.0) continue;
+        float w = st * exp(-1.2 * d2);
+        carve = max(carve, w);
+        if (w > bw) {
+            bw = w;
+            vec3 u = normalize(ab);
+            float th = 2.2 * st * exp(-0.5 * d2);
+            best = c + r * cos(th) + cross(u, r) * sin(th) + u * dot(u, r) * (1.0 - cos(th));
+        }
+    }
+    carve *= 0.96;
+    return best;
+}
+
 // One layer's slab [rb, rt] (radii) along ro + rd t within tmax: (t0, t1), empty if t1 <= t0.
 vec2 cloudSlab(vec3 ro, vec3 rd, float rb, float rt, float tmax) {
     float r0 = length(ro);
@@ -312,6 +367,11 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
     vec3 S = vec3(0.0);
     float q = float(steps) / 40.0;
     vec3 sky = vec3(-1.0); // the sky light over the clouds: once per ray (it varies over 100s of km)
+    // --test-flight: the cloud close to the camera is what one flies through. The samples crowd
+    // towards the camera (the first few metres apart, not a kilometre), and the wake stirs it.
+    bool craft = g.acState.x > 0.5;
+    int cand[6];
+    int nc = craft ? wakeNear(ro, rd, cand) : 0;
     for (int layer = 0; layer < 3; ++layer) {
         float rb = R_GROUND + (layer == 0 ? LOW_BASE : layer == 1 ? MID_BASE : HIGH_BASE);
         float rt = R_GROUND + (layer == 0 ? LOW_TOP : layer == 1 ? MID_TOP : HIGH_TOP);
@@ -325,7 +385,7 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
         if (layer == 1 && max(Wa.z, Wb.z) <= 0.0) continue;
         if (layer == 2 && max(Wa.w, Wb.w) <= 0.0) continue;
         int n = int(float(layer == 0 ? 56 : layer == 1 ? 14 : 6) * q) + 2;
-        float ds = len / float(n);
+        float pw = craft ? mix(2.4, 1.0, smoothstep(0.0, 3000.0, sl.x)) : 1.0;
         float sigma = layer == 0 ? SIGMA_LOW : layer == 1 ? SIGMA_MID : SIGMA_HIGH;
         // light at the layer: the sun through the air above it, the sky above (atmosphere) and
         // the sunlit ground below (albedo ~0.15), once per layer
@@ -346,12 +406,17 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
         float odPrev = -1.0;
         int lit = 0;
         for (int i = 0; i < n; ++i) {
-            float t = sl.x + (float(i) + jitter) * ds;
+            float ta = len * pow(float(i) / float(n), pw);
+            float ds = len * pow(float(i + 1) / float(n), pw) - ta;
+            float t = sl.x + ta + jitter * ds;
             vec3 x = ro + rd * t;
+            float carve = 0.0;
+            if (nc > 0 && layer < 2) x = wakeWarp(x, cand, nc, carve);
             float h = length(x) - R_GROUND;
             vec3 e = cloudEarth(x);
             vec4 W = mix(Wa, Wb, (t - sl.x) / max(len, 1.0));
             float d = layer == 0 ? lowDensity(e, h, W, true) : layer == 1 ? midDensity(e, h, W, true) : highDensity(e, h, W);
+            d *= 1.0 - carve;
             if (d <= 0.0) continue;
             if (tFirst < 0.0) tFirst = t;
             float hn = layer == 0 ? (h - LOW_BASE) / (lowTop(W.y) - LOW_BASE) : layer == 1 ? (h - MID_BASE) / (MID_TOP - MID_BASE) : 0.5;

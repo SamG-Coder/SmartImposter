@@ -1,0 +1,30 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#include "rt.glsl"
+
+// Any-hit for the aircraft's glass (the canopy, the head-up display; every other part of it is
+// opaque and never runs this). From outside the canopy is its gold film: a tinted mirror of the
+// sky (a ray that meets it from outside stops there). From inside one looks out through it, and
+// the sun comes in: a ray on its way out of the canopy passes. The head-up display's glass is
+// not drawn.
+hitAttributeEXT vec2 bary;
+
+layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[]; };
+struct AcMaterial { vec4 base; vec4 mre; vec4 emit; };
+layout(set = 0, binding = 37, scalar) readonly buffer AcMats { AcMaterial acMats[]; };
+
+void main() {
+    MeshInfo m = meshes[gl_InstanceCustomIndexEXT & 0x7FFu];
+    uint word = UintRef(m.mat).v[gl_PrimitiveID >> 2];
+    float a = acMats[(word >> ((gl_PrimitiveID & 3u) * 8u)) & 0xFFu].base.a;
+    if (a >= 0.999) return;
+    if (a < 0.15) {
+        ignoreIntersectionEXT;
+        return;
+    }
+    // (the canopy bulges out from about where the pilot's chest is: a ray heading away from
+    // there at the glass is leaving it)
+    vec3 hit = gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT;
+    if (dot(gl_ObjectRayDirectionEXT, hit - vec3(0.0, 0.75, -4.0)) > 0.0) ignoreIntersectionEXT;
+}

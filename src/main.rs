@@ -5,6 +5,7 @@
 //! a baked parallax octahedral impostor.
 
 mod accel;
+mod aircraft;
 mod atlas;
 mod biome;
 mod asset;
@@ -13,9 +14,12 @@ mod catalog;
 mod cloudnoise;
 mod dlss;
 mod erosion;
+mod flight;
 mod flypath;
 mod globe;
 mod lawn;
+mod gamepad;
+mod pilot;
 mod textures;
 mod tour;
 mod walk;
@@ -105,6 +109,9 @@ struct Args {
     /// DLSS Ray Reconstruction mode (index into dlss::MODES), None = TAA + supersampling.
     dlss: Option<usize>,
     sharpen: f32,
+    /// `--test-flight`: fly the F-16 (tools/make_f16.py) over the globe (flight.rs, pilot.rs),
+    /// starting at `--at` (lat, lon, height above the ground, heading)
+    test_flight: bool,
 }
 
 fn parse_args() -> Args {
@@ -156,10 +163,12 @@ fn parse_args() -> Args {
         cloud_cover: 0.45,
         dlss: Some(1),
         sharpen: 0.5,
+        test_flight: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     let mut lawn_given = false;
+    let mut at_given = false;
     let floats = |s: &str| -> Vec<f32> { s.split(',').filter_map(|v| v.trim().parse().ok()).collect() };
     while i < args.len() {
         let next = args.get(i + 1).cloned().unwrap_or_default();
@@ -190,6 +199,7 @@ fn parse_args() -> Args {
                 let v: Vec<f64> = next.split(',').filter_map(|v| v.trim().parse().ok()).collect();
                 if v.len() == 5 {
                     a.at = [v[0], v[1], v[2], v[3], v[4]];
+                    at_given = true;
                 }
             }
             "--site" => {
@@ -314,9 +324,18 @@ fn parse_args() -> Args {
                 i -= 1;
             }
             "--walk" => a.walk = Some(next != "off"),
+            "--test-flight" => {
+                a.test_flight = true;
+                a.globe = true;
+                i -= 1;
+            }
             other => eprintln!("unknown argument {other}"),
         }
         i += 2;
+    }
+    // a test flight starts high over the lake, heading up it towards the Alps
+    if a.test_flight && !at_given {
+        a.at = [45.86, 9.27, 2600.0, 15.0, 0.0];
     }
     // the park is a lawn (unless `--lawn off` asks for the bare ground texture)
     if a.park && !lawn_given {
@@ -392,6 +411,10 @@ struct State {
     tour: Option<TourRun>,
     /// seconds of animation since the start (cloud evolution and drift)
     clock: f64,
+    /// `--test-flight`: the aircraft and who flies it
+    pilot: Option<pilot::Pilot>,
+    /// --test-flight: the game controllers
+    pads: Option<gamepad::Pads>,
 }
 
 /// A `--tour` in progress: the shot being loaded (black, waiting for streaming) or played.
@@ -529,6 +552,10 @@ impl App {
         // Walking (not on the globe; a capture run keeps the camera it was given unless asked)
         let walk_on = a.walk.unwrap_or(park && a.shot.is_none() && a.bench_move == 0.0 && !a.fly);
 
+        let aircraft = match a.test_flight {
+            true => Some(aircraft::load(std::path::Path::new("assets/aircraft/f16c.acm"))?),
+            false => None,
+        };
         let size = window.inner_size();
         let r = Renderer::new(
             window.display_handle()?.as_raw(),
@@ -544,6 +571,7 @@ impl App {
             a.ss,
             a.dlss,
             globe_terrain.clone(),
+            aircraft,
         )?;
         let start_y = r.world.surface_at(0.0, 0.0) + 1.8;
         let cam = match a.cam {
@@ -611,7 +639,29 @@ impl App {
             settle: 0,
             tour: None,
             clock: 0.0,
+            pilot: None,
+            pads: None,
         };
+        if let (true, Some(geo)) = (a.test_flight, state.geo.as_ref()) {
+            // 450 knots, level, on the heading given
+            let speed = std::env::var("SI_FLIGHT_SPEED").ok().and_then(|v| v.parse().ok()).unwrap_or(231.5);
+            state.pilot = Some(pilot::Pilot::new(geo.ecef, a.at[3], speed));
+            state.pads = Some(gamepad::Pads::new());
+            if a.shot.is_none() {
+                // the cursor is the game's from the start (Esc gives it back, a click takes it again)
+                state.captured = true;
+                if state.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                    let _ = state.window.set_cursor_grab(CursorGrabMode::Confined);
+                }
+                state.window.set_cursor_visible(false);
+            }
+            println!("Test flight (the keys of GTA V): W / S faster and slower (Shift / Ctrl too; past 100% the afterburner lights),");
+            println!("             A / D turn left and right, numpad 8 / 5 or Up / Down nose down and up, numpad 4 / 6 or Left / Right roll,");
+            println!("             the mouse looks round (Esc frees the cursor); hold its left button to fly with it; Space speed brakes,");
+            println!("             C view (chase, cockpit, fly-by), wheel distance, R restart");
+            println!("             Controller: right trigger faster, left slower; left stick nose and roll (forward: nose down); bumpers turn;");
+            println!("             right stick look round; A / Cross speed brakes; View / Select or Y / Triangle view; D-pad distance; Menu / Start restart");
+        }
         if let Some(path) = &a.tour {
             let shots = tour::load(path)?;
             let total: f64 = shots.iter().map(|s| s.secs).sum();
@@ -848,7 +898,9 @@ impl App {
             s.vel = Vec3::ZERO;
         }
 
-        if s.fly_on {
+        if s.pilot.is_some() {
+            // (--test-flight: the camera follows the aircraft, below)
+        } else if s.fly_on {
             s.fly_dist += self.args.fly_speed * dt;
             let (pos, yaw, pitch) = s.path.camera(&s.r.world, s.fly_dist);
             s.cam.pos = pos;
@@ -935,7 +987,21 @@ impl App {
                 }
             }
         }
-        let (fwd, right, up) = s.cam.basis();
+        let (mut fwd, mut right, mut up) = s.cam.basis();
+        if let (Some(p), Some(geo), Some(scene)) = (s.pilot.as_mut(), s.geo.as_mut(), &s.r.globe) {
+            // --test-flight: fly the aircraft a step; the camera is where its view puts it
+            let terrain = &scene.terrain;
+            // (a capture run flies a fixed sixtieth of a second per frame: the same flight every time)
+            let step = if self.args.shot.is_some() { 1.0 / 60.0 } else { dt as f64 };
+            // (a controller flies it only while this is the window in front)
+            let pad = s.pads.as_mut().map(|c| c.poll()).filter(|_| s.window.has_focus() || self.args.shot.is_some()).unwrap_or_default();
+            let view = p.update(&s.keys, &pad, step, s.looking, |pos| globe::tiles::ground_radius(terrain, pos));
+            geo.ecef = view.pos;
+            geo.frame = globe::scene::transport(geo.frame, geo.ecef);
+            (fwd, right, up) = ((geo.frame * view.fwd).as_vec3(), (geo.frame * view.right).as_vec3(), (geo.frame * view.up).as_vec3());
+            s.cam.pos = Vec3::ZERO;
+            s.cam.fov_y = view.fov_y;
+        }
         if let (true, Some(geo), Some(scene)) = (self.args.bench_move != 0.0, s.geo.as_mut(), &s.r.globe) {
             // Globe fly-through benchmark: along the heading at a constant height above the ground.
             let ground = globe::tiles::ground_radius(&scene.terrain, geo.ecef);
@@ -960,7 +1026,7 @@ impl App {
         .iter()
         .map(|v| v.to_bits())
         .collect();
-        if fp != s.fingerprint {
+        if fp != s.fingerprint || s.pilot.is_some() {
             s.fingerprint = fp;
             s.accum = 0;
         } else {
@@ -1044,7 +1110,7 @@ impl App {
             // rows: east, up, south -> Earth axes
             earth = [[0.0, cl, sl, 0.0], [1.0, 0.0, 0.0, 0.0], [0.0, sl, -cl, 0.0]];
         }
-        let g = Globals {
+        let mut g = Globals {
             cam_pos: cam_now[0],
             cam_right: cam_now[1],
             cam_up: cam_now[2],
@@ -1067,12 +1133,16 @@ impl App {
             cloud: [self.args.cloud_cover, if s.clouds { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
             biome: biome::current().ground_packed(),
             lawn: [[0.0; 4]; 4], // (set by the renderer)
+            ..Default::default()
         };
+        if let (Some(p), Some(geo)) = (s.pilot.as_mut(), s.geo.as_ref()) {
+            s.r.ac_pose = Some(p.fill(&mut g, geo.frame, geo.ecef));
+        }
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
         // globe: a view is only captured once its terrain and trees have streamed in
-        let settling = self.args.bench_move == 0.0 && s.tour.is_none() && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
+        let settling = self.args.bench_move == 0.0 && s.tour.is_none() && s.pilot.is_none() && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
         let capture = capture && !settling;
         if let Some(gs) = s.r.globe.as_mut() {
             gs.clock = s.clock;
@@ -1152,7 +1222,12 @@ impl App {
 
         s.fps_frames += 1;
         let el_t = s.fps_time.elapsed().as_secs_f32();
-        if el_t > 0.5 {
+        if let (Some(p), true) = (&s.pilot, el_t > 0.1) {
+            // --test-flight: the instruments
+            s.window.set_title(&format!("{} | {:.0} fps", p.hud(), s.fps_frames as f32 / el_t));
+            s.fps_time = Instant::now();
+            s.fps_frames = 0;
+        } else if el_t > 0.5 {
             let fps = s.fps_frames as f32 / el_t;
             let mode = ["lit", "LOD view", "normals", "albedo", "AO", "sun visibility"][s.debug.min(5) as usize];
             let cam_mode = if let Some(geo) = &s.geo {
@@ -1207,6 +1282,17 @@ impl App {
         }
         if !pressed || repeat {
             return;
+        }
+        if let Some(p) = s.pilot.as_mut() {
+            // --test-flight: the keys that fly are the pilot's
+            match code {
+                KeyCode::KeyC => return p.next_view(),
+                KeyCode::KeyR => return p.reset(),
+                KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::KeyV | KeyCode::KeyF | KeyCode::KeyB => return,
+                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Space => return,
+                KeyCode::Numpad4 | KeyCode::Numpad5 | KeyCode::Numpad6 | KeyCode::Numpad8 => return,
+                _ => {}
+            }
         }
         match code {
             KeyCode::Escape => {
@@ -1386,9 +1472,22 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput { state, button, .. } if self.args.shot.is_none() => {
                 if let Some(s) = self.state.as_mut() {
+                    if let (Some(p), MouseButton::Left) = (s.pilot.as_mut(), button) {
+                        // --test-flight: the cursor is locked to the window (a click takes it
+                        // back after Esc); with the left button held the mouse is the stick
+                        if state == ElementState::Pressed && !s.captured {
+                            s.captured = true;
+                            if s.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
+                                let _ = s.window.set_cursor_grab(CursorGrabMode::Confined);
+                            }
+                            s.window.set_cursor_visible(false);
+                        } else {
+                            p.mouse_fly = state == ElementState::Pressed;
+                        }
+                    }
                     match button {
                         // Left click: capture the mouse for free look (Esc releases).
-                        MouseButton::Left if state == ElementState::Pressed && !s.captured => {
+                        MouseButton::Left if state == ElementState::Pressed && !s.captured && s.pilot.is_none() => {
                             s.captured = true;
                             if s.window.set_cursor_grab(CursorGrabMode::Locked).is_err() {
                                 let _ = s.window.set_cursor_grab(CursorGrabMode::Confined);
@@ -1414,6 +1513,9 @@ impl ApplicationHandler for App {
                         MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                     };
                     s.base_speed = (s.base_speed * 1.2f32.powf(steps)).clamp(0.5, 300.0);
+                    if let Some(p) = s.pilot.as_mut() {
+                        p.zoom(steps as f64);
+                    }
                 }
             }
             WindowEvent::Focused(false) => {
@@ -1432,7 +1534,14 @@ impl ApplicationHandler for App {
     fn device_event(&mut self, _el: &ActiveEventLoop, _id: DeviceId, event: DeviceEvent) {
         if let DeviceEvent::MouseMotion { delta } = event {
             if let Some(s) = self.state.as_mut() {
-                if s.looking || s.captured {
+                if let Some(p) = s.pilot.as_mut() {
+                    // --test-flight: the mouse looks round the aircraft, as in GTA V (the view
+                    // goes back behind it a moment after the mouse stops); with the left button
+                    // held it is the stick
+                    if s.captured || s.looking || p.mouse_fly {
+                        p.mouse(delta.0, delta.1);
+                    }
+                } else if s.looking || s.captured {
                     if s.fly_on {
                         // Mouse look takes over from the automatic path.
                         s.fly_on = false;

@@ -31,6 +31,17 @@ struct Globals {
     vec4 lawn2;     //   x texels per view, y gutter texels, z atlas levels, w atlas slot
     vec4 lawn3;     //   xy slope (cot elevation) of the steepest and flattest views, z 1 = the park (--park: watered, no dried grass), w real blades around the camera to this distance (m)
     vec4 lawn4;     //   x segments of a blade, y auto mode: the short grass as a part of the baked height (0 = not auto), z the low end of the height patches, w the distance (m) by which the layer has faded into the ground texture
+    vec4 acInv0;    // --test-flight, the aircraft: the renderer's frame -> its model frame (rows, w the translation)
+    vec4 acInv1;
+    vec4 acInv2;
+    vec4 acPrev0;   //   a point on the aircraft this frame -> where it was last frame (rows): motion vectors
+    vec4 acPrev1;
+    vec4 acPrev2;
+    vec4 acState;   //   x 1 = an aircraft is flying, y afterburner 0..1, z Mach number, w vapour cone 0..1
+    vec4 acState2;  //   x vapour over the wings 0..1, y points in the wake, z air density / sea level's, w seconds flown
+    vec4 acVel;     //   xyz which way the air goes past the aircraft (model frame, unit), w engine power 0..1
+    vec4 wake[32];  //   where the aircraft has been, newest first (the renderer's frame); w age (s)
+    vec4 wakeB[32]; //   x condensation trail left there 0..1, y how much the air was stirred there 0..1
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).

@@ -37,7 +37,7 @@ pub fn find(dir: &Path, suffix: &str, foliage: bool) -> Option<PathBuf> {
     })
 }
 
-fn decode_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+pub fn decode_rgba(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
     let mut dec = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path)?));
     dec.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = dec.read_info()?;
