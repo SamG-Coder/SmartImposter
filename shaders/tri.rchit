@@ -305,7 +305,7 @@ void main() {
     uint seed = instSeed(ci);
     MeshInfo m = meshes[meshId];
 
-    uvec3 tri = UVec3Ref(m.idx).v[gl_PrimitiveID];
+    uvec3 tri = meshTri(m, gl_PrimitiveID);
     Vec3Ref P = Vec3Ref(m.pos);
     Vec3Ref N = Vec3Ref(m.nrm);
     vec3 b = vec3(1.0 - bary.x - bary.y, bary.x, bary.y);
@@ -317,8 +317,12 @@ void main() {
     vec3 ng = normalize(cross(e1, e2));
     n = normalize(o2w * n);
 
-    uint word = UintRef(m.mat).v[gl_PrimitiveID >> 2];
-    uint mbyte = (word >> ((gl_PrimitiveID & 3u) * 8u)) & 0xFFu;
+    // (a grid mesh is the terrain, all of it: no material buffer)
+    uint mbyte = MAT_TERRAIN;
+    if ((m.flags >> 8) == 0u) {
+        uint word = UintRef(m.mat).v[gl_PrimitiveID >> 2];
+        mbyte = (word >> ((gl_PrimitiveID & 3u) * 8u)) & 0xFFu;
+    }
     uint mat = mbyte & 3u;       // low 2 bits: material
     uint leafId = mbyte >> 2;    // high 6 bits: random per individual leaf (from the converter)
     uint extraFlags = 0u;
@@ -329,6 +333,14 @@ void main() {
     vec3 albedo;
     uint ts = m.texSet * 6u;
     SpeciesInfo spc = species[m.texSet];
+    // What this instance is, for the per-leaf colour variation: the plant and which of its parts
+    // (the same whenever the instance list is rebuilt, so the leaves keep their colours as the
+    // camera moves), and its biome's dryness. The impostor bake has only the plant's parts, in
+    // order, and no tint (impostor.rchit applies the plant's own).
+    bool bake = g.lodParams.z < -0.5;
+    InstInfo inst = insts[bake ? 0 : gl_InstanceID];
+    uint instId = bake ? uint(gl_InstanceID) : (inst.flags >> 5) + (inst.data & 0xFFFFFFu) * 2053u;
+    float instDry = bake ? 0.0 : float((inst.flags >> 1) & 15u) / 15.0;
     if (mat == MAT_TERRAIN) {
         vec3 wp = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
         float spread = g.camFwd.w;
@@ -378,11 +390,11 @@ void main() {
             nrmTex = vec4(textureLod(matTex[nonuniformEXT(ts + 1u)], uv, lod).rg, textureLod(matTex[nonuniformEXT(ts + 2u)], uv, lod).r, 1.0);
             // set below, once the albedo is known
             // Subtle per-leaf variation on top of the texture (texture already has per-leaf colour).
-            uint lr = pcg(leafId * 7919u + uint(gl_InstanceID) * 104729u + 17u);
+            uint lr = pcg(leafId * 7919u + instId * 104729u + 17u);
             float h1 = float(lr & 0xFFFFu) / 65535.0, h2 = float(lr >> 16) / 65535.0;
             vec3 hue = mix(vec3(1.06, 1.0, 0.88), vec3(0.94, 1.0, 1.08), h1) * mix(0.88, 1.12, h2);
             albedo = ca.rgb * ueTint(spc.leafTint.rgb) * spc.leafTint.w * hue * treeTint(seed, 1.0);
-            albedo = dryTint(albedo, float((insts[gl_InstanceID].flags >> 1) & 15u) / 15.0);
+            albedo = dryTint(albedo, instDry);
             if (underside) albedo *= vec3(1.18, 1.15, 1.25); // paler underside
             // Transmission like Unreal's two-sided foliage: albedo x translucency tint x mask.
             trans = albedo * spc.transTint.rgb * (nrmTex.b * spc.transTint.w);
@@ -402,7 +414,7 @@ void main() {
         // No textures available: procedural leaf colour.
         bool underside = dot(ng, gl_WorldRayDirectionEXT) > 0.0;
         vec3 base = underside ? vec3(0.100, 0.135, 0.052) : vec3(0.048, 0.088, 0.020);
-        uint lr = pcg(leafId * 7919u + uint(gl_InstanceID) * 104729u + 17u);
+        uint lr = pcg(leafId * 7919u + instId * 104729u + 17u);
         float h1 = float(lr & 0xFFFFu) / 65535.0, h2 = float(lr >> 16) / 65535.0;
         vec3 hue = mix(vec3(1.15, 1.0, 0.65), vec3(0.86, 1.0, 1.18), h1);
         albedo = base * hue * mix(0.70, 1.28, h2 * h2) * treeTint(seed, 1.0);

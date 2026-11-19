@@ -767,6 +767,61 @@ fn grow_forest(world: &World, radius: f32, avail: [bool; 6], spacing: f32) -> Ve
     trees
 }
 
+/// The grown canopy from the cache (assets/cache/forest), or grown now (~20 s for the default
+/// 8 km forest) and cached. The growth is a pure function of the terrain, the biome preset, the
+/// radius and this code; the file is named by all of them (the code by SI_WORLD_CODE, build.rs's
+/// hash of the sources the growth lives in), so a stale forest is never loaded. SI_REGROW grows
+/// it again.
+fn grow_forest_cached(world: &World, radius: f32, avail: [bool; 6], spacing: f32) -> Vec<Seedling> {
+    const DIR: &str = "assets/cache/forest";
+    let code = env!("SI_WORLD_CODE");
+    fn floats(v: &[f32]) -> &[u8] {
+        bytemuck::cast_slice(v)
+    }
+    let key = crate::atlas::Key::new()
+        .bytes(crate::biome::current().name.as_bytes())
+        .u64(radius.to_bits() as u64)
+        .u64(spacing.to_bits() as u64)
+        .bytes(&avail.map(|a| a as u8))
+        .bytes(floats(&world.xs))
+        .bytes(floats(&world.heights))
+        .bytes(floats(&world.water))
+        .bytes(floats(&world.bank))
+        .get();
+    let path = std::path::Path::new(DIR).join(format!("{code}-{key:016x}.bin"));
+    // a real site's biome also reads the Earth data: always grown
+    let cached = site().is_none() && std::env::var("SI_REGROW").is_err();
+    if cached {
+        if let Ok(d) = std::fs::read(&path) {
+            if d.len() % 10 == 0 && !d.is_empty() {
+                let f = |b: &[u8]| f32::from_le_bytes(b.try_into().unwrap());
+                let trees: Vec<Seedling> = d.chunks_exact(10).map(|c| Seedling { x: f(&c[0..4]), z: f(&c[4..8]), sp: c[8], gen: c[9], alive: true }).collect();
+                println!("Forest growth: {} trees from the cache ({})", trees.len(), path.display());
+                return trees;
+            }
+        }
+    }
+    let trees = grow_forest(world, radius, avail, spacing);
+    if cached {
+        let mut d = Vec::with_capacity(trees.len() * 10);
+        for t in &trees {
+            d.extend_from_slice(&t.x.to_le_bytes());
+            d.extend_from_slice(&t.z.to_le_bytes());
+            d.extend_from_slice(&[t.sp, t.gen]);
+        }
+        let tmp = path.with_extension("tmp");
+        if std::fs::create_dir_all(DIR).is_ok() && std::fs::write(&tmp, &d).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+            // forests grown by older code are of no use any more
+            for e in std::fs::read_dir(DIR).into_iter().flatten().flatten() {
+                if !e.file_name().to_string_lossy().starts_with(code) {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
+    }
+    trees
+}
+
 // ------------------------------------------------------------------------------------ world
 
 impl World {
@@ -848,7 +903,7 @@ impl World {
             vs.sort_by(|a, b| cat.variants[*b].height.partial_cmp(&cat.variants[*a].height).unwrap()); // tallest first
         }
         let avail = [0, 1, 2, 3, 4, 5].map(|k| !by_species[k].is_empty());
-        let grown = grow_forest(&world, radius, avail, bp.spacing);
+        let grown = grow_forest_cached(&world, radius, avail, bp.spacing);
         let mut rng = Rng(0x1234_5678_9abc_def0);
         let mut counts = [0usize; 5]; // trees, shrubs, plants, grass, rocks and deadwood
         let mut canopy: Vec<usize> = Vec::new(); // indices into world.trees of the simulated trees
@@ -1132,7 +1187,8 @@ impl World {
                 uvs[k * 2 + 1] = bank[k];
             }
         }
-        MeshData { name: "terrain".into(), positions, normals, uvs, indices, materials }
+        // (rt.glsl meshTri works these triangles out from the grid size: keep the two in step)
+        MeshData { name: "terrain".into(), positions, normals, uvs, indices, materials, grid: n as u32 }
     }
 
     /// Canopy cover of the trees (Kind::Tree, >= 4 m) on the COVER_RES grid, softened.

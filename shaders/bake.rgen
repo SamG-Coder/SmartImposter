@@ -24,6 +24,8 @@ layout(push_constant) uniform BakePC {
     float aoRange;
     uint visRays;
     uint pad1;
+    uvec2 size;   // texels of a frame (across, up): the square frame of `res` texels cropped
+    uvec2 crop;   // its first texel in the square frame
 } pc;
 
 vec3 uniformSphere(inout uint s) {
@@ -40,7 +42,10 @@ void main() {
     uint fi = pc.frameOffset + gl_LaunchIDEXT.z;
     if (fi >= pc.grid * pc.grid) return;
     uvec2 cell = uvec2(fi % pc.grid, fi / pc.grid);
-    uvec2 px = gl_LaunchIDEXT.xy;
+    // The frame is the square view of the bounding sphere (res x res texels) cropped to the
+    // plant: px is the texel in that square, so the rays, and their random numbers, are those of
+    // the uncropped bake.
+    uvec2 px = gl_LaunchIDEXT.xy + pc.crop;
 
     vec3 c = pc.centerRadius.xyz;
     float R = pc.centerRadius.w;
@@ -98,7 +103,7 @@ void main() {
         vbSum += vb * (3.0 * invV);
     }
 
-    ivec2 texel = ivec2(cell * pc.res + px);
+    ivec2 texel = ivec2(cell * pc.size + gl_LaunchIDEXT.xy);
     if (hits == 0u) {
         imageStore(bakeAlbedo, texel, vec4(0.0, 0.0, 0.0, 1.0));
         imageStore(bakeND, texel, vec4(0.0, 0.0, -1.0, 0.0));

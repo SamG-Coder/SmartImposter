@@ -11,6 +11,13 @@ pub struct Accel {
     pub addr: u64,
 }
 
+impl Accel {
+    /// No acceleration structure (a mesh the scene never shows).
+    pub fn none() -> Self {
+        Accel { raw: vk::AccelerationStructureKHR::null(), buf: Buffer::none(), addr: 0 }
+    }
+}
+
 pub fn triangles_geometry(pos_addr: u64, vcount: u32, idx_addr: u64) -> vk::AccelerationStructureGeometryKHR<'static> {
     vk::AccelerationStructureGeometryKHR::default()
         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
@@ -37,7 +44,7 @@ pub fn aabb_geometry(aabb_addr: u64) -> vk::AccelerationStructureGeometryKHR<'st
         })
 }
 
-fn create_accel(gpu: &Gpu, ty: vk::AccelerationStructureTypeKHR, size: u64) -> Result<Accel> {
+pub fn create_accel(gpu: &Gpu, ty: vk::AccelerationStructureTypeKHR, size: u64) -> Result<Accel> {
     let buf = gpu.create_buffer(size, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "accel")?;
     unsafe {
         let raw = gpu.accel_fn.create_acceleration_structure(

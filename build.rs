@@ -12,6 +12,16 @@ fn main() {
         .filter(|p| p.exists())
         .unwrap_or_else(|| PathBuf::from("glslangValidator"));
 
+    // The forest growth cache (world.rs grow_forest_cached) is only valid for the code that grew
+    // it: a hash of the sources it lives in names the cache files.
+    let mut code = 0xcbf2_9ce4_8422_2325u64;
+    for f in ["src/world.rs", "src/biome.rs", "src/erosion.rs"] {
+        println!("cargo:rerun-if-changed={f}");
+        for b in std::fs::read(f).expect("world sources").iter().filter(|b| **b != 13) {
+            code = (code ^ *b as u64).wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    println!("cargo:rustc-env=SI_WORLD_CODE={code:016x}");
     println!("cargo:rerun-if-changed=shaders");
     for entry in std::fs::read_dir("shaders").expect("shaders dir") {
         let path = entry.unwrap().path();

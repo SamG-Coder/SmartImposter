@@ -10,6 +10,10 @@ pub struct MeshData {
     pub uvs: Vec<f32>,       // uv, image space (top-left origin)
     pub indices: Vec<u32>,   // 3 per triangle
     pub materials: Vec<u8>,  // 1 per triangle, padded to a multiple of 4
+    /// A regular grid of `grid` x `grid` vertices (the terrain: world.rs World::mesh), two
+    /// triangles per cell in rows, all of one material: the shaders work the triangles out
+    /// (rt.glsl meshTri), so the renderer keeps no index or material buffer. 0 = any mesh.
+    pub grid: u32,
 }
 
 impl MeshData {
@@ -18,6 +22,12 @@ impl MeshData {
     }
     pub fn tri_count(&self) -> u32 {
         (self.indices.len() / 3) as u32
+    }
+    /// The box of the vertices (min, max).
+    pub fn bounds(&self) -> (Vec3, Vec3) {
+        self.positions
+            .chunks_exact(3)
+            .fold((Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)), |(lo, hi), v| (lo.min(Vec3::new(v[0], v[1], v[2])), hi.max(Vec3::new(v[0], v[1], v[2]))))
     }
 }
 
@@ -36,6 +46,37 @@ pub struct TreeAsset {
 impl TreeAsset {
     pub fn expanded_tris(&self, meshes: &[MeshData]) -> u64 {
         self.parts.iter().map(|p| meshes[p.mesh as usize].tri_count() as u64).sum()
+    }
+
+    /// How far the plant's geometry reaches from the centre of its bounding box: (the largest
+    /// horizontal distance from the vertical axis through it, the largest distance). Seen from
+    /// any direction, the plant is at most the first wide and twice the second tall around the
+    /// centre: the impostor frame it needs (renderer.rs frame_res). `bounds`: every mesh's box
+    /// (MeshData::bounds).
+    pub fn reach(&self, meshes: &[MeshData], bounds: &[(Vec3, Vec3)]) -> (f32, f32) {
+        let c = (self.bmin + self.bmax) * 0.5;
+        let across = |p: Vec3| (p.x - c.x) * (p.x - c.x) + (p.z - c.z) * (p.z - c.z);
+        let all = |p: Vec3| (p - c).length_squared();
+        let corners = |p: &TreePart| -> [Vec3; 8] {
+            let (lo, hi) = bounds[p.mesh as usize];
+            std::array::from_fn(|k| p.xform.transform_point3(Vec3::new(if k & 1 == 0 { lo.x } else { hi.x }, if k & 2 == 0 { lo.y } else { hi.y }, if k & 4 == 0 { lo.z } else { hi.z })))
+        };
+        // (a part's box bounds it from above: its vertices are only walked while that could still
+        // beat the best found, the outermost twigs)
+        let mut best = (0.0f32, 0.0f32);
+        let mut parts: Vec<(f32, f32, &TreePart)> =
+            self.parts.iter().map(|p| (corners(p).into_iter().map(across).fold(0.0f32, f32::max), corners(p).into_iter().map(all).fold(0.0f32, f32::max), p)).collect();
+        parts.sort_by(|a, b| (b.0.max(b.1)).total_cmp(&a.0.max(a.1)));
+        for (ub_across, ub_all, p) in parts {
+            if ub_across <= best.0 && ub_all <= best.1 {
+                continue;
+            }
+            for v in meshes[p.mesh as usize].positions.chunks_exact(3) {
+                let q = p.xform.transform_point3(Vec3::new(v[0], v[1], v[2]));
+                best = (best.0.max(across(q)), best.1.max(all(q)));
+            }
+        }
+        (best.0.sqrt(), best.1.sqrt())
     }
 }
 
@@ -95,7 +136,7 @@ pub fn load(path: &str) -> Result<TreePack> {
         let indices = r.u32s(t * 3)?;
         let padded = t.div_ceil(4) * 4;
         let materials = r.bytes(padded)?.to_vec();
-        meshes.push(MeshData { name, positions, normals, uvs, indices, materials });
+        meshes.push(MeshData { name, positions, normals, uvs, indices, materials, grid: 0 });
     }
     let tree_count = r.u32()? as usize;
     let mut trees = Vec::with_capacity(tree_count);

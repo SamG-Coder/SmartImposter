@@ -111,7 +111,9 @@ pub fn upload_with_mips(gpu: &Gpu, w: u32, h: u32, rgba: &[u8], format: vk::Form
                 vk::Filter::LINEAR,
             );
         }
-        barrier(cb, 0, mips - 1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags2::TRANSFER_READ, vk::AccessFlags2::SHADER_READ, t, vk::PipelineStageFlags2::ALL_COMMANDS);
+        if mips > 1 {
+            barrier(cb, 0, mips - 1, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags2::TRANSFER_READ, vk::AccessFlags2::SHADER_READ, t, vk::PipelineStageFlags2::ALL_COMMANDS);
+        }
         barrier(cb, mips - 1, 1, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags2::TRANSFER_WRITE, vk::AccessFlags2::SHADER_READ, t, vk::PipelineStageFlags2::ALL_COMMANDS);
     })?;
     gpu.destroy_buffer(&mut staging);
@@ -460,11 +462,12 @@ const FOLIAGE_LUMINANCE: f32 = 0.09; // Black Alder's, which the lighting was tu
 /// whether any species has foliage textures.
 type SpeciesTextures = (Vec<Image>, Vec<(f32, f32)>, bool);
 
-pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<SpeciesTextures> {
+/// `used`: the species the scene shows; the others keep their slots as 1x1 placeholders.
+pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog, used: &[bool]) -> Result<SpeciesTextures> {
     let mut jobs = Vec::new();
-    for s in &cat.species {
+    for (i, s) in cat.species.iter().enumerate() {
         for &(src, format, enc, fill) in &SLOTS {
-            let path = s.textures[src].clone().filter(|p| p.exists());
+            let path = s.textures[src].clone().filter(|p| used[i] && p.exists());
             jobs.push(Job { path, format, fill, enc });
         }
     }
@@ -488,7 +491,9 @@ pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<SpeciesT
             // Grass is matched to the ground textures it stands on (the scans are 2-7x brighter).
             let target = if s.kind == crate::catalog::Kind::Grass { 0.085 } else { FOLIAGE_LUMINANCE }; // ~ the ground scans
             let k = if l > 0.0 { (target / l).clamp(0.12, 1.6) } else { 1.0 };
-            println!("  {:<24} foliage luminance {:.3} -> x{:.2}, translucency mean {:.2}", s.name, l, k, tb);
+            if used[i] {
+                println!("  {:<24} foliage luminance {:.3} -> x{:.2}, translucency mean {:.2}", s.name, l, k, tb);
+            }
             (k, if tb > 0.0 { tb } else { 0.33 })
         })
         .collect();
@@ -496,11 +501,12 @@ pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog) -> Result<SpeciesT
 }
 
 /// Ground layers: albedo (sRGB), normal, ORM per layer, in catalog order.
-pub fn load_ground(gpu: &Gpu, ground: &[Option<crate::catalog::GroundMaterial>]) -> Result<Vec<Image>> {
+/// `used`: the scans the scene shows (the others are not loaded).
+pub fn load_ground(gpu: &Gpu, ground: &[Option<crate::catalog::GroundMaterial>], used: &[bool]) -> Result<Vec<Image>> {
     let mut jobs = Vec::new();
-    for g in ground {
+    for (i, g) in ground.iter().enumerate() {
         // Missing layers keep their slots (1x1 placeholders): the shader indexes layers by position.
-        let p = |f: fn(&crate::catalog::GroundMaterial) -> &PathBuf| g.as_ref().map(|g| f(g).clone());
+        let p = |f: fn(&crate::catalog::GroundMaterial) -> &PathBuf| g.as_ref().filter(|_| used[i]).map(|g| f(g).clone());
         // colour BC7, normal x / y BC5, occlusion (the only ORM channel read) BC4
         jobs.push(Job { path: p(|g| &g.albedo), format: vk::Format::R8G8B8A8_SRGB, fill: [100, 100, 100, 255], enc: Enc::Colour });
         jobs.push(Job { path: p(|g| &g.normal), format: vk::Format::R8G8B8A8_UNORM, fill: [128, 128, 255, 255], enc: Enc::Rg });

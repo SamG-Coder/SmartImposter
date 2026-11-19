@@ -2,6 +2,7 @@
 
 use crate::accel::{self, Accel, Tlas};
 use crate::asset::{MeshData, TreePack};
+use crate::atlas::Res;
 use crate::catalog::Catalog;
 use crate::gpu::{align_up, Buffer, Gpu, Image, Swapchain};
 use crate::world::World;
@@ -90,11 +91,14 @@ struct Targets {
 struct InstInfo {
     center: [f32; 3],
     data: u32, // tree index (24 bits) | variant << 24 (8 bits)
-    flags: u32, // bit 0: the tree also has mesh instances (tri.rahit dissolves them)
+    flags: u32, // bit 0: the tree also has mesh instances (tri.rahit dissolves them); bits 1..4 dryness; from bit 5 the part
 }
 
 const INST_HAS_MESH: u32 = 1;
 const INST_VARIANT_SHIFT: u32 = 24;
+/// InstInfo.flags: which part of its plant the instance is (from this bit up; tri.rchit's per-leaf
+/// colour variation).
+const INST_PART_SHIFT: u32 = 5;
 
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -113,9 +117,12 @@ pub struct ImpostorInfo {
     pub bmax: [f32; 4],
     pub trans: [f32; 4],
     pub grid: u32,
+    /// texels per frame: across | up << 16
     pub res: u32,
     pub mips: u32,
     pub lod_scale: f32,
+    /// xy: half the width and height of a frame (m)
+    pub frame: [f32; 4],
 }
 
 #[repr(C)]
@@ -123,7 +130,7 @@ pub struct ImpostorInfo {
 struct MeshInfoGpu {
     addr: [u64; 5], // pos, nrm, idx, mat, uv
     tex_set: u32,
-    flags: u32, // MESH_ALPHA_TESTED
+    flags: u32, // MESH_ALPHA_TESTED; >> 8: a grid mesh's vertices per side
 }
 
 /// Mesh flag: the leaf texture's alpha is an opacity mask (alpha-tested in tri.rahit).
@@ -144,15 +151,20 @@ struct BcAtlas {
     depth: Image,  // BC5: depth * 0.5 + 0.5, coverage
     vis: Image,    // BC3, half resolution: directional visibility a, b/3 + 0.5
     grid: u32,
-    res: u32,
+    res: Res,
     mips: u32,
+}
+
+/// GPU bytes of an atlas of `grid` x `grid` frames of `res` texels with all its levels.
+fn atlas_bytes(grid: u32, res: Res) -> u64 {
+    let s = (grid * res[0]) as u64 * (grid * res[1]) as u64;
+    // BC3/BC5: 1 byte per texel; vis at quarter area; mips +1/3
+    (s * 3 + s / 4) * 4 / 3
 }
 
 impl BcAtlas {
     fn bytes(&self) -> u64 {
-        let s = (self.grid * self.res) as u64;
-        // BC3/BC5: 1 byte per texel; vis at quarter area; mips +1/3
-        (s * s * 3 + s * s / 4) * 4 / 3
+        atlas_bytes(self.grid, self.res)
     }
     fn destroy(&mut self, gpu: &Gpu) {
         for img in [&mut self.albedo, &mut self.normal, &mut self.depth, &mut self.vis] {
@@ -161,14 +173,14 @@ impl BcAtlas {
     }
 }
 
-fn create_bc_atlas(gpu: &Gpu, name: &str, grid: u32, res: u32, mips: u32) -> Result<BcAtlas> {
+fn create_bc_atlas(gpu: &Gpu, name: &str, grid: u32, res: Res, mips: u32) -> Result<BcAtlas> {
     let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST;
-    let size = grid * res;
+    let (w, h) = (grid * res[0], grid * res[1]);
     Ok(BcAtlas {
-        albedo: gpu.create_image(size, size, mips, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} albedo"))?,
-        normal: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} normal"))?,
-        depth: gpu.create_image(size, size, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} depth"))?,
-        vis: gpu.create_image(size / 2, size / 2, mips - 1, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} visibility"))?,
+        albedo: gpu.create_image(w, h, mips, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} albedo"))?,
+        normal: gpu.create_image(w, h, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} normal"))?,
+        depth: gpu.create_image(w, h, mips, vk::Format::BC5_UNORM_BLOCK, usage, &format!("{name} depth"))?,
+        vis: gpu.create_image(w / 2, h / 2, mips - 1, vk::Format::BC3_UNORM_BLOCK, usage, &format!("{name} visibility"))?,
         grid,
         res,
         mips,
@@ -181,13 +193,18 @@ struct VariantAtlas {
     name: String,
     grid: u32,
     /// the full atlas's frame resolution and levels
-    res: u32,
+    res: Res,
     mips: u32,
+    /// the square frame of the bounding sphere the frames are cropped from: its texels per side
+    /// and the first texel of the crop (bake.rgen)
+    square: u32,
+    crop: [u32; 2],
     /// levels the base atlas drops
     skip: u32,
     key: u64,
     path: std::path::PathBuf,
-    base: BcAtlas,
+    /// (the globe; the forest scene keeps the full atlases of its own variants and nothing else)
+    base: Option<BcAtlas>,
     full: Option<BcAtlas>,
     loading: bool,
     /// the upload buffer range its full atlas is being read into
@@ -197,12 +214,15 @@ struct VariantAtlas {
 }
 
 impl VariantAtlas {
-    fn shown(&self) -> &BcAtlas {
-        self.full.as_ref().unwrap_or(&self.base)
+    fn shown(&self) -> Option<&BcAtlas> {
+        self.full.as_ref().or(self.base.as_ref())
     }
     fn full_bytes(&self) -> u64 {
-        let s = (self.grid * self.res) as u64;
-        (s * s * 3 + s * s / 4) * 4 / 3
+        atlas_bytes(self.grid, self.res)
+    }
+    /// The texel size of the full atlas (m), from the bounding sphere's radius.
+    fn texel(&self, radius: f32) -> f32 {
+        2.0 * radius / self.square as f32
     }
 }
 
@@ -223,6 +243,8 @@ struct BakePush {
     ao_range: f32,
     vis_rays: u32,
     pad: u32,
+    size: [u32; 2],
+    crop: [u32; 2],
 }
 
 /// Impostor atlas settings. Each variant gets its own resolution: texels of `texel` metres
@@ -247,6 +269,30 @@ impl ImpostorSettings {
     }
 }
 
+/// The frame of a plant in texels (across, up) and where it starts in the square frame of
+/// `square` texels that shows the plant's whole bounding sphere: the square cropped, about its
+/// centre, to what the plant can cover in any view. `across`, `up`: how far the plant reaches
+/// from the sphere's centre sideways and at all (asset.rs TreeAsset::reach), in texels. A
+/// margin of one texel of the coarsest level stays empty around the plant (what a filtered
+/// lookup at the plant's edge reads). The frame is a whole number of BC blocks of the coarsest
+/// level and at least 8 of its texels, as the square is, and the crop starts on a whole block of
+/// every level: the blocks that remain, at every level, are the square bake's.
+fn frame_res(square: u32, mips: u32, across: f32, up: f32) -> (Res, [u32; 2]) {
+    let step = 4 << (mips - 1);
+    let margin = (1 << (mips - 1)) as f32 + 1.0;
+    let side = |reach: f32| {
+        let want = (2.0 * (reach + margin)).ceil() as u32;
+        let mut s = (want.div_ceil(step).max(2) * step).min(square);
+        // (the crop, half the difference, a whole step too)
+        if !(square - s).is_multiple_of(2 * step) {
+            s += step;
+        }
+        s
+    };
+    let res = [side(across), side(up)];
+    (res, [(square - res[0]) / 2, (square - res[1]) / 2])
+}
+
 /// Mip count for a frame resolution: every encoded level must stay a multiple of 4 (BC blocks)
 /// and frames keep at least 8 texels.
 fn atlas_mips(res: u32) -> u32 {
@@ -263,6 +309,57 @@ struct MeshGpu {
     idx: Buffer,
     mat: Buffer,
     uv: Buffer,
+}
+
+/// What the scene can show. On the globe any species may come into view; the forest scene (a
+/// biome, a real site, the gallery) only ever shows the variants that grow in it, so only their
+/// meshes, textures, BLASes and atlases go to the GPU.
+struct Used {
+    variant: Vec<bool>,
+    mesh: Vec<bool>,
+    species: Vec<bool>,
+    /// scanned ground surfaces (catalog.rs GROUND_LAYERS)
+    ground: Vec<bool>,
+}
+
+impl Used {
+    fn new(pack: &TreePack, catalog: &Catalog, world: &World, globe: bool) -> Self {
+        let mut u = Used {
+            variant: vec![globe; pack.trees.len()],
+            mesh: vec![globe; pack.meshes.len()],
+            species: vec![globe; catalog.species.len()],
+            ground: vec![globe; catalog.ground.len()],
+        };
+        if globe {
+            return u;
+        }
+        for t in &world.trees {
+            u.variant[t.variant as usize] = true;
+        }
+        for (v, t) in pack.trees.iter().enumerate().filter(|(v, _)| u.variant[*v]) {
+            if let Some(s) = catalog.variants.get(v).and_then(|vi| u.species.get_mut(vi.species)) {
+                *s = true;
+            }
+            for p in &t.parts {
+                u.mesh[p.mesh as usize] = true;
+                if let Some(s) = catalog.mesh_species.get(p.mesh as usize).and_then(|&s| u.species.get_mut(s as usize)) {
+                    *s = true;
+                }
+            }
+        }
+        // tri.rchit groundMaterial: a slot shows the biome's scan, its own one where that scan is
+        // not downloaded, or (river slots) scans 0 / 1; scan 0 also sets the texel size
+        let has = |i: usize| catalog.ground.get(i).is_some_and(|g| g.is_some());
+        for (slot, &scan) in crate::biome::current().ground.iter().enumerate() {
+            let src = if has(scan as usize) { scan as usize } else { slot };
+            for i in [src, 0, 1] {
+                if let Some(g) = u.ground.get_mut(i) {
+                    *g = true;
+                }
+            }
+        }
+        u
+    }
 }
 
 struct RtPipeline {
@@ -381,14 +478,17 @@ pub struct Renderer {
     _meshes: Vec<MeshGpu>,
     mesh_info: Buffer,
     species_buf: Buffer,
+    /// per mesh (a null one for meshes the scene never shows)
     blas: Vec<Accel>,
-    _aabbs: Vec<Buffer>,
-    /// the impostor proxies' BLASes (one AABB per variant): referenced by the TLAS instances
-    _imp_blas: Vec<Accel>,
     imp_info: Buffer,
     imp_infos: Vec<ImpostorInfo>,
-    /// per variant: base atlas always, full atlas near the camera (atlas.rs)
+    /// per variant (atlas.rs): on the globe the base atlas always and the full one near the
+    /// camera; in the forest scene the full atlas of every variant that grows in it
     atlases: Vec<VariantAtlas>,
+    /// bound in the slots of variants without an atlas (never sampled)
+    atlas_blank: BcAtlas,
+    /// the variants the scene can show (Used)
+    used_variant: Vec<bool>,
     atlas_loader: crate::atlas::Loader,
     /// GPU memory the full atlases may take (SI_IMPOSTOR_MB)
     atlas_budget: u64,
@@ -396,7 +496,7 @@ pub struct Renderer {
     /// persistently mapped upload buffer the loader reads full atlases into, its free ranges,
     /// the uploads to record into this frame (variant, offset) and the ranges to free once the
     /// frame that copied them is done (offset, length)
-    atlas_staging: Buffer,
+    atlas_staging: Option<Buffer>,
     atlas_ranges: crate::atlas::Ranges,
     atlas_uploads: Vec<(usize, u64)>,
     atlas_retire: Vec<(u64, u64)>,
@@ -433,10 +533,15 @@ pub struct Renderer {
     state_writes: Vec<(u32, u32)>,
     /// Cluster BLASes (one AABB per plant) and their AABB buffer.
     _cluster_blas: Vec<Accel>,
-    _cluster_aabbs: Buffer,
     /// TLAS instances that never change: terrain and the plant clusters.
     static_insts: Vec<vk::AccelerationStructureInstanceKHR>,
-    static_inst_data: Vec<InstInfo>,
+    /// cells with draw-distance plants, their complete BLASes to build in this frame, and the
+    /// ones to free once the frame in flight is done
+    near_cells: Vec<NearCell>,
+    near_builds: Vec<usize>,
+    near_retire: Vec<NearBlas>,
+    near_scratch: Buffer,
+    tree_of: Vec<u32>,
     insts: Vec<vk::AccelerationStructureInstanceKHR>,
     inst_data: Vec<InstInfo>,
     inst_info: Buffer,
@@ -496,13 +601,21 @@ fn scaled_extent(e: vk::Extent2D, scale: f32) -> vk::Extent2D {
     }
 }
 
+impl MeshGpu {
+    /// A mesh the scene never shows: nothing on the GPU.
+    fn none() -> Self {
+        MeshGpu { pos: Buffer::none(), nrm: Buffer::none(), idx: Buffer::none(), mat: Buffer::none(), uv: Buffer::none() }
+    }
+}
+
 fn upload_mesh(gpu: &Gpu, m: &MeshData) -> Result<MeshGpu> {
     let geo = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR;
     Ok(MeshGpu {
         pos: gpu.upload_buffer(bytemuck::cast_slice(&m.positions), geo, &m.name)?,
         nrm: gpu.upload_buffer(bytemuck::cast_slice(&m.normals), vk::BufferUsageFlags::STORAGE_BUFFER, &m.name)?,
         idx: gpu.upload_buffer(bytemuck::cast_slice(&m.indices), geo, &m.name)?,
-        mat: gpu.upload_buffer(&m.materials, vk::BufferUsageFlags::STORAGE_BUFFER, &m.name)?,
+        // (a grid mesh's triangles are all one material: rt.glsl meshTri, tri.rchit)
+        mat: if m.grid == 0 { gpu.upload_buffer(&m.materials, vk::BufferUsageFlags::STORAGE_BUFFER, &m.name)? } else { Buffer::none() },
         uv: gpu.upload_buffer(bytemuck::cast_slice(&m.uvs), vk::BufferUsageFlags::STORAGE_BUFFER, &m.name)?,
     })
 }
@@ -628,7 +741,23 @@ impl Renderer {
             }
         };
         let dlss_mode = if dlss_ok { dlss_mode } else { None };
-        let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog)?;
+        let on_globe = globe.is_some();
+        let used = Used::new(&pack, &catalog, &world, on_globe);
+        if !on_globe {
+            let n = |v: &[bool]| v.iter().filter(|&&b| b).count();
+            println!(
+                "Scene: {} of {} variants, {} of {} meshes, {} of {} species, {} of {} ground scans",
+                n(&used.variant),
+                used.variant.len(),
+                n(&used.mesh),
+                used.mesh.len(),
+                n(&used.species),
+                used.species.len(),
+                n(&used.ground),
+                used.ground.len()
+            );
+        }
+        let (mat_tex, leaf_scale, has_tex) = crate::textures::load_species(&gpu, &catalog, &used.species)?;
         let cloud_noise = {
             let (shape, detail) = crate::cloudnoise::load_or_build();
             [
@@ -636,7 +765,7 @@ impl Renderer {
                 gpu.upload_volume(crate::cloudnoise::DETAIL as u32, &detail, "cloud detail noise")?,
             ]
         };
-        let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground)?;
+        let mut ground_tex = crate::textures::load_ground(&gpu, &catalog.ground, &used.ground)?;
         // bit per scanned ground layer present (tri.rchit uses procedural stand-ins for the others)
         let ground_layers = catalog.ground.iter().enumerate().map(|(i, g)| (g.is_some() as u32) << i).sum::<u32>();
         {
@@ -666,16 +795,22 @@ impl Renderer {
         // ---- geometry: plant meshes followed by terrain
         assert!(pack.meshes.len() < 2048, "mesh ids are 11 bits in the instance custom index");
         let mut meshes = Vec::new();
-        for m in pack.meshes.iter().chain(std::iter::once(&world.terrain)) {
-            meshes.push(upload_mesh(&gpu, m)?);
+        // (the terrain, after the plant meshes, is always shown)
+        let shown = |i: usize| used.mesh.get(i).copied().unwrap_or(true);
+        for (i, m) in pack.meshes.iter().chain(std::iter::once(&world.terrain)).enumerate() {
+            meshes.push(if shown(i) { upload_mesh(&gpu, m)? } else { MeshGpu::none() });
         }
         let infos: Vec<MeshInfoGpu> = meshes
             .iter()
             .enumerate()
-            .map(|(i, m)| MeshInfoGpu {
-                addr: [m.pos.addr, m.nrm.addr, m.idx.addr, m.mat.addr, m.uv.addr],
-                tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
-                flags: if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 },
+            .map(|(i, m)| {
+                // a grid mesh (the terrain): its index buffer is only BLAS build input
+                let grid = if i < pack.meshes.len() { pack.meshes[i].grid } else { world.terrain.grid };
+                MeshInfoGpu {
+                    addr: [m.pos.addr, m.nrm.addr, if grid == 0 { m.idx.addr } else { 0 }, m.mat.addr, m.uv.addr],
+                    tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
+                    flags: if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 } | grid << 8,
+                }
             })
             .collect();
         let mesh_info = gpu.upload_buffer(bytemuck::cast_slice(&infos), vk::BufferUsageFlags::STORAGE_BUFFER, "mesh info")?;
@@ -702,21 +837,27 @@ impl Renderer {
         }
         let species_buf = gpu.upload_buffer(bytemuck::cast_slice(&species), vk::BufferUsageFlags::STORAGE_BUFFER, "species")?;
         let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).collect();
-        let geoms: Vec<_> = meshes
+        let built: Vec<usize> = (0..meshes.len()).filter(|&i| shown(i)).collect();
+        let geoms: Vec<_> = built
             .iter()
-            .zip(&all_meshes)
-            .map(|(g, m)| (accel::triangles_geometry(g.pos.addr, m.vertex_count(), g.idx.addr), m.tri_count()))
+            .map(|&i| (accel::triangles_geometry(meshes[i].pos.addr, all_meshes[i].vertex_count(), meshes[i].idx.addr), all_meshes[i].tri_count()))
             .collect();
-        let blas = accel::build_blases(&gpu, &geoms)?;
-        println!("BLAS: {} meshes built in {:.2}s", blas.len(), t0.elapsed().as_secs_f32());
+        let mut blas: Vec<Accel> = (0..meshes.len()).map(|_| Accel::none()).collect();
+        for (&i, a) in built.iter().zip(accel::build_blases(&gpu, &geoms)?) {
+            blas[i] = a;
+            if all_meshes[i].grid != 0 {
+                gpu.destroy_buffer(&mut meshes[i].idx); // the shaders work a grid's triangles out
+                meshes[i].idx = Buffer::none();
+            }
+        }
+        println!("BLAS: {} meshes built in {:.2}s", built.len(), t0.elapsed().as_secs_f32());
 
         // ---- impostor proxies and atlases: one per plant variant, resolution from its size
         let nv = pack.trees.len();
         assert!(nv <= MAX_VARIANTS, "too many plant variants ({nv} > {MAX_VARIANTS})");
-        let mut aabbs = Vec::new();
         let mut imp_infos = Vec::new();
         let mut atlases = Vec::new();
-        let mut atlas_bytes = 0u64;
+        let mut full_bytes = 0u64;
         let mut raw_bytes = 0u64;
         // GPU memory for the full atlases of the variants near the camera (SI_IMPOSTOR_MB, default
         // 25% of the largest device-local heap); every variant keeps its base atlas besides
@@ -730,7 +871,11 @@ impl Renderer {
                 .unwrap_or(8 << 30);
             std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 4)
         };
-        let atlas_staging = gpu.create_buffer(ATLAS_STAGING, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas uploads")?;
+        // (full atlases stream in on the globe only)
+        let atlas_staging = match on_globe {
+            true => Some(gpu.create_buffer(ATLAS_STAGING, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas uploads")?),
+            false => None,
+        };
         // everything that changes a bake (atlas.rs cache key), shared by all variants
         let bake_key = crate::atlas::Key::new()
             .bytes(spv!("bake.rgen"))
@@ -745,6 +890,25 @@ impl Renderer {
             .u64(imp.vis_rays as u64)
             .u64(has_tex as u64)
             .get();
+        // How far every plant reaches from the centre of its bounding box (its frame: frame_res),
+        // on every core: the outer parts' vertices are walked. Every variant, also those this
+        // scene does not show: the frame is part of the cache key.
+        let reach: Vec<(f32, f32)> = {
+            let bounds: Vec<(Vec3, Vec3)> = pack.meshes.iter().map(|m| m.bounds()).collect();
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let out: Vec<std::sync::Mutex<(f32, f32)>> = pack.trees.iter().map(|_| std::sync::Mutex::new((0.0, 0.0))).collect();
+            std::thread::scope(|s| {
+                for _ in 0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) {
+                    s.spawn(|| loop {
+                        let v = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(t) = pack.trees.get(v) else { break };
+                        *out[v].lock().unwrap() = t.reach(&pack.meshes, &bounds);
+                    });
+                }
+            });
+            out.into_iter().map(|m| m.into_inner().unwrap()).collect()
+        };
+        let mut square_bytes = 0u64;
         for (v, t) in pack.trees.iter().enumerate() {
             let vi = &catalog.variants[v];
             let sp = &species[vi.species.min(species.len() - 1)];
@@ -752,9 +916,13 @@ impl Renderer {
             let (lo, hi) = (t.bmin - pad, t.bmax + pad);
             let c = (t.bmin + t.bmax) * 0.5;
             let r = (t.bmax - t.bmin).length() * 0.5;
-            // Forest tiles are seen from > 1 km only: fixed 256 px frames (~0.6 m texels).
-            let res = imp.res_for(r / vi.texel_scale, vi.lod_scale);
-            let mips = atlas_mips(res);
+            // The square frame of the bounding sphere sets the texel size; the frame that is baked
+            // and kept is that square cropped to the plant.
+            let square = imp.res_for(r / vi.texel_scale, vi.lod_scale);
+            let mips = atlas_mips(square);
+            let texels = square as f32 / (2.0 * r);
+            let (res, crop) = frame_res(square, mips, reach[v].0 * texels, reach[v].1 * texels);
+            square_bytes += atlas_bytes(imp.grid, [square, square]);
             imp_infos.push(ImpostorInfo {
                 center_radius: [c.x, c.y, c.z, r],
                 // w: 1 = foliage only (grass, ferns: no bark, so never classify texels as bark by
@@ -773,47 +941,46 @@ impl Renderer {
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
                 grid: imp.grid,
-                res,
+                res: 0,
                 mips,
                 lod_scale: vi.lod_scale,
+                frame: [r * res[0] as f32 / square as f32, r * res[1] as f32 / square as f32, 0.0, 0.0],
             });
-            let data = [lo.x, lo.y, lo.z, hi.x, hi.y, hi.z];
-            aabbs.push(gpu.upload_buffer(
-                bytemuck::cast_slice(&data),
-                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-                "aabb",
-            )?);
-            let size = imp.grid * res;
             let skip = crate::atlas::skip_for(mips);
-            let base = create_bc_atlas(&gpu, &t.name, imp.grid, res >> skip, mips - skip)?;
+            let base_res = [res[0] >> skip, res[1] >> skip];
+            let base = match on_globe {
+                true => Some(create_bc_atlas(&gpu, &t.name, imp.grid, base_res, mips - skip)?),
+                false => None,
+            };
             // the shaders start on the base atlas (update_atlases swaps the full one in)
             let info = imp_infos.last_mut().unwrap();
-            (info.res, info.mips) = (res >> skip, mips - skip);
+            (info.res, info.mips) = (base_res[0] | base_res[1] << 16, mips - skip);
             let mesh_key = t.parts.iter().fold(crate::atlas::Key::new().u64(bake_key).bytes(t.name.as_bytes()).u64(t.parts.len() as u64), |k, p| {
                 let m = &pack.meshes[p.mesh as usize];
                 k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
             });
-            let key = mesh_key.u64(res as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
-            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, skip, key, path: crate::atlas::path_for(&t.name, key), base, full: None, loading: false, upload: None, wanted: 0 };
-            atlas_bytes += full.full_bytes();
-            raw_bytes += (size as u64 * size as u64 * 16) * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
+            let key = mesh_key.u64(square as u64).u64(res[0] as u64).u64(res[1] as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
+            let path = crate::atlas::path_for(&t.name, key);
+            let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, square, crop, skip, key, path, base, full: None, loading: false, upload: None, wanted: 0 };
+            full_bytes += full.full_bytes();
+            raw_bytes += (imp.grid * res[0]) as u64 * (imp.grid * res[1]) as u64 * 16 * 4 / 3; // the old rgba8 + rgba16f + rgba8 layout
             atlases.push(full);
         }
         println!(
-            "Impostor atlases: {} variants, {:.2} GB BC-compressed at full resolution (uncompressed {:.2} GB); full atlases near the camera within {:.2} GB",
+            "Impostor atlases: {} variants, {:.2} GB BC-compressed at full resolution (frames cropped to the plants; {:.2} GB as squares, {:.2} GB uncompressed){}",
             atlases.len(),
-            atlas_bytes as f64 / 1e9,
+            full_bytes as f64 / 1e9,
+            square_bytes as f64 / 1e9,
             raw_bytes as f64 / 1e9,
-            atlas_budget as f64 / 1e9
+            if on_globe { format!("; full atlases near the camera within {:.2} GB", atlas_budget as f64 / 1e9) } else { String::new() }
         );
-        let imp_geoms: Vec<_> = aabbs.iter().map(|b| (accel::aabb_geometry(b.addr), 1)).collect();
-        let imp_blas = accel::build_blases(&gpu, &imp_geoms)?;
+        let atlas_blank = create_bc_atlas(&gpu, "blank", 1, [8, 8], 2)?;
         // host-visible: update_atlases rewrites a variant's resolution when its atlas changes
         let info_bytes: &[u8] = bytemuck::cast_slice(&imp_infos);
         let mut imp_info = gpu.create_buffer(info_bytes.len() as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "impostor info")?;
         imp_info.mapped()[..info_bytes.len()].copy_from_slice(info_bytes);
         gpu.one_time(|cb| {
-            for a in atlases.iter().map(|a| &a.base) {
+            for a in atlases.iter().filter_map(|a| a.base.as_ref()).chain(std::iter::once(&atlas_blank)) {
                 for img in [a.albedo.raw, a.normal.raw, a.depth.raw, a.vis.raw] {
                     gpu.image_barrier(
                         cb,
@@ -1055,7 +1222,8 @@ impl Renderer {
                 .unwrap()
         };
 
-        let est = 600_000u32;
+        // (the temperate clearing needs ~270k instances; a denser spot grows it: update_instances)
+        let est = 400_000u32;
         let world_trees_len = world.trees.len();
         let tlas = Tlas::new(&gpu, est)?;
         let inst_info = Self::create_inst_info(&gpu, tlas.capacity)?;
@@ -1130,11 +1298,11 @@ impl Renderer {
             mesh_info,
             species_buf,
             blas,
-            _aabbs: aabbs,
-            _imp_blas: imp_blas,
             imp_info,
             imp_infos,
             atlases,
+            atlas_blank,
+            used_variant: used.variant,
             atlas_loader: crate::atlas::Loader::spawn(),
             atlas_budget,
             atlas_frame: 0,
@@ -1167,9 +1335,12 @@ impl Renderer {
             plant_state: clusters.state,
             state_writes: Vec::new(),
             _cluster_blas: clusters.blas,
-            _cluster_aabbs: clusters.aabbs,
             static_insts: clusters.insts,
-            static_inst_data: clusters.inst_data,
+            near_cells: clusters.near,
+            near_builds: Vec::new(),
+            near_retire: Vec::new(),
+            near_scratch: clusters.near_scratch,
+            tree_of: clusters.tree_of,
             insts: Vec::new(),
             inst_data: Vec::new(),
             inst_info,
@@ -1262,84 +1433,143 @@ impl Renderer {
         Ok(r)
     }
 
-    /// Group the plants into CLUSTER x CLUSTER m cells, one AABB BLAS per cell with one box per
-    /// plant (its world bounds), and write the plant records in cluster order. The TLAS gets one
-    /// instance per cluster (custom index = first record of the cluster) plus the terrain.
+    /// Group the plants into CLUSTER x CLUSTER m cells and write the plant records in cell order,
+    /// the plants without a draw distance first. Every cell gets an AABB BLAS with one box per
+    /// such plant (its world bounds): always in the TLAS, one instance per cell (custom index =
+    /// the cell's first record), next to the terrain. The plants with a draw distance
+    /// (impostor.rint drops them beyond it) are only in the BLAS a cell gets while the camera is
+    /// within that distance (build_near): rays in the far field do not stop at boxes that can
+    /// never be hit, and those boxes take no memory.
     fn build_clusters(gpu: &Gpu, world: &World, pack: &TreePack, catalog: &Catalog, terrain_blas: u64) -> Result<(Clusters, f32)> {
         const CLUSTER: f32 = 192.0;
         let t0 = Instant::now();
         let n = world.trees.len();
-        let key = |p: Vec3| (((p.z / CLUSTER).floor() as i32) as i64) << 32 | (((p.x / CLUSTER).floor() as i32) as u32 as i64);
+        let culled = |t: &crate::world::TreeInstance| catalog.variants[t.variant as usize].cull > 0.0;
+        let key = |t: &crate::world::TreeInstance| {
+            let p = t.center;
+            ((((p.z / CLUSTER).floor() as i32) as i64) << 32 | (((p.x / CLUSTER).floor() as i32) as u32 as i64), culled(t))
+        };
         let mut order: Vec<u32> = (0..n as u32).collect();
-        order.sort_by_key(|&i| key(world.trees[i as usize].center));
+        order.sort_by_key(|&i| key(&world.trees[i as usize]));
         let mut rec_of = vec![0u32; n];
         let mut recs: Vec<PlantRecGpu> = Vec::with_capacity(n);
         let mut aabbs: Vec<[f32; 6]> = Vec::with_capacity(n);
-        let mut ranges: Vec<(u32, u32)> = Vec::new(); // (first record, count)
-        let mut last_key = None;
+        // per cell: first record, plants without a draw distance, plants; the box of the culled
+        // plants' centres and their largest draw distance
+        struct Cell {
+            first: u32,
+            keep: u32,
+            count: u32,
+            lo: Vec3,
+            hi: Vec3,
+            cull: f32,
+        }
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut last_cell = None;
         for (k, &i) in order.iter().enumerate() {
             let t = &world.trees[i as usize];
             rec_of[i as usize] = k as u32;
-            let kk = key(t.center);
-            if last_key != Some(kk) {
-                ranges.push((k as u32, 0));
-                last_key = Some(kk);
+            let (cell, far) = key(t);
+            if last_cell != Some(cell) {
+                cells.push(Cell { first: k as u32, keep: 0, count: 0, lo: Vec3::splat(f32::MAX), hi: Vec3::splat(f32::MIN), cull: 0.0 });
+                last_cell = Some(cell);
             }
-            ranges.last_mut().unwrap().1 += 1;
-            let c = t.xform.matrix3;
-            let o = t.xform.translation;
-            recs.push(PlantRecGpu {
-                rows: [
-                    c.x_axis.x, c.y_axis.x, c.z_axis.x, o.x, //
-                    c.x_axis.y, c.y_axis.y, c.z_axis.y, o.y, //
-                    c.x_axis.z, c.y_axis.z, c.z_axis.z, o.z,
-                ],
-                data: t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21),
-            });
-            let asset = &pack.trees[t.variant as usize];
-            let (lo, hi) = (asset.bmin - Vec3::splat(0.05), asset.bmax + Vec3::splat(0.05));
-            let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
-            for corner in 0..8 {
-                let v = Vec3::new(
-                    if corner & 1 == 0 { lo.x } else { hi.x },
-                    if corner & 2 == 0 { lo.y } else { hi.y },
-                    if corner & 4 == 0 { lo.z } else { hi.z },
-                );
-                let w = t.xform.transform_point3(v);
-                mn = mn.min(w);
-                mx = mx.max(w);
+            let c = cells.last_mut().unwrap();
+            c.count += 1;
+            if far {
+                (c.lo, c.hi, c.cull) = (c.lo.min(t.center), c.hi.max(t.center), c.cull.max(catalog.variants[t.variant as usize].cull));
+            } else {
+                c.keep += 1;
             }
-            aabbs.push([mn.x, mn.y, mn.z, mx.x, mx.y, mx.z]);
+            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21);
+            recs.push(PlantRecGpu::new(t.xform.matrix3.into(), t.xform.translation.into(), data));
+            aabbs.push(plant_box(t, &pack.trees[t.variant as usize]));
         }
-        let aabb_buf = gpu.upload_buffer(
+        let mut aabb_buf = gpu.upload_buffer(
             bytemuck::cast_slice(&aabbs),
             vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
             "plant aabbs",
         )?;
-        let geoms: Vec<_> = ranges.iter().map(|&(first, count)| (accel::aabb_geometry(aabb_buf.addr + first as u64 * 24), count)).collect();
+        let kept: Vec<usize> = (0..cells.len()).filter(|&c| cells[c].keep > 0).collect();
+        let geoms: Vec<_> = kept.iter().map(|&c| (accel::aabb_geometry(aabb_buf.addr + cells[c].first as u64 * 24), cells[c].keep)).collect();
         let blas = accel::build_blases(gpu, &geoms)?;
+        gpu.destroy_buffer(&mut aabb_buf); // build input only
         let rec = gpu.upload_buffer(bytemuck::cast_slice(&recs), vk::BufferUsageFlags::STORAGE_BUFFER, "plant records")?;
         let mut state = gpu.create_buffer((n.max(1) * 4) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "plant state")?;
         state.mapped().fill(0);
         let terrain_id = pack.meshes.len();
         let mesh_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
         let mut insts = vec![accel::make_instance(&glam::Affine3A::IDENTITY, terrain_id as u32, 1, 0, mesh_flags, terrain_blas)];
-        let mut inst_data = vec![InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 }];
-        for (ci, &(first, _)) in ranges.iter().enumerate() {
-            // mask bit 1: impostors; hit record 1: impostor intersection + closest hit
-            insts.push(accel::make_instance(
-                &glam::Affine3A::IDENTITY,
-                first,
-                2,
-                1,
-                vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE,
-                blas[ci].addr,
-            ));
-            inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
+        let mut far_inst: Vec<Option<vk::AccelerationStructureInstanceKHR>> = vec![None; cells.len()];
+        for (&c, b) in kept.iter().zip(&blas) {
+            far_inst[c] = Some(cluster_instance(cells[c].first, b.addr));
         }
+        let mut near = Vec::new();
+        let (mut near_plants, mut scratch) = (0usize, 0u64);
+        for (ci, c) in cells.iter().enumerate() {
+            if c.count > c.keep {
+                near.push(NearCell { first: c.first, count: c.count, far: far_inst[ci], lo: c.lo, hi: c.hi, cull: c.cull, on: false, full: None });
+                near_plants += (c.count - c.keep) as usize;
+                scratch = scratch.max(accel::blas_sizes(gpu, &accel::aabb_geometry(0), c.count).1);
+            } else if let Some(i) = far_inst[ci] {
+                insts.push(i);
+            }
+        }
+        let align = gpu.rt.scratch_alignment.max(256);
+        let near_scratch = gpu.create_buffer(scratch + align, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::GpuOnly, "near blas scratch")?;
         let max_ls = catalog.variants.iter().map(|v| v.lod_scale).fold(0.0f32, f32::max);
-        println!("Impostor clusters: {} plants in {} cluster BLASes ({:.2}s)", n, ranges.len(), t0.elapsed().as_secs_f32());
-        Ok((Clusters { rec_of, rec, state, blas, aabbs: aabb_buf, insts, inst_data }, max_ls))
+        println!(
+            "Impostor clusters: {} plants in {} cells; {} plants with a draw distance join their cell near the camera ({:.2}s)",
+            n,
+            cells.len(),
+            near_plants,
+            t0.elapsed().as_secs_f32()
+        );
+        Ok((Clusters { rec_of, tree_of: order, rec, state, blas, insts, near, near_scratch }, max_ls))
+    }
+
+    /// A cell with draw-distance plants has come within their reach: its complete BLAS (every
+    /// plant of the cell), created now and built in this frame (record_near_builds).
+    fn build_near(&mut self, ci: usize) -> Result<()> {
+        let c = &self.near_cells[ci];
+        let boxes: Vec<[f32; 6]> = (c.first..c.first + c.count)
+            .map(|r| {
+                let t = &self.world.trees[self.tree_of[r as usize] as usize];
+                plant_box(t, &self.pack.trees[t.variant as usize])
+            })
+            .collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&boxes);
+        let mut input = self.gpu.create_buffer(
+            bytes.len() as u64,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            MemoryLocation::CpuToGpu,
+            "near plant aabbs",
+        )?;
+        input.mapped()[..bytes.len()].copy_from_slice(bytes);
+        let (size, _) = accel::blas_sizes(&self.gpu, &accel::aabb_geometry(input.addr), c.count);
+        let accel = accel::create_accel(&self.gpu, vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL, size)?;
+        self.near_cells[ci].full = Some(NearBlas { accel, input });
+        self.near_builds.push(ci);
+        Ok(())
+    }
+
+    /// The BLAS builds of the cells that came into reach, before this frame's TLAS build.
+    fn record_near_builds(&mut self, cb: vk::CommandBuffer) {
+        let align = self.gpu.rt.scratch_alignment.max(256);
+        let scratch = align_up(self.near_scratch.addr, align);
+        for ci in std::mem::take(&mut self.near_builds) {
+            let c = &self.near_cells[ci];
+            let Some(f) = &c.full else { continue }; // left again before it was built
+            accel::cmd_build_blas(&self.gpu, cb, &accel::aabb_geometry(f.input.addr), c.count, f.accel.raw, scratch);
+            // the scratch buffer is shared: one build after the other
+            self.gpu.memory_barrier(
+                cb,
+                vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+                vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR,
+            );
+        }
     }
 
     fn create_inst_info(gpu: &Gpu, capacity: u32) -> Result<Buffer> {
@@ -1465,7 +1695,7 @@ impl Renderer {
         let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
                 .map(|i| {
-                    let a = self.atlases[i.min(self.atlases.len() - 1)].shown();
+                    let a = self.atlases.get(i).and_then(|a| a.shown()).unwrap_or(&self.atlas_blank);
                     vk::DescriptorImageInfo::default()
                         .sampler(self.sampler)
                         .image_view(pick(a))
@@ -1528,20 +1758,21 @@ impl Renderer {
         let missing: Vec<usize> = (0..self.atlases.len())
             .filter(|&v| {
                 let a = &self.atlases[v];
-                rebake || !crate::atlas::valid(&a.path, a.key, a.grid, a.res, a.mips)
+                self.used_variant[v] && (rebake || !crate::atlas::valid(&a.path, a.key, a.grid, a.res, a.mips))
             })
             .collect();
         if missing.is_empty() {
-            println!("Impostor atlases: all {} in the cache ({})", self.atlases.len(), crate::atlas::DIR);
+            println!("Impostor atlases: all {} in the cache ({})", self.used_variant.iter().filter(|&&u| u).count(), crate::atlas::DIR);
             return self.load_base_atlases(t_all);
         }
-        let max_size = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res).max().unwrap_or(32);
+        let max_w = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res[0]).max().unwrap_or(32);
+        let max_h = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res[1]).max().unwrap_or(32);
         let smips = missing.iter().map(|&v| self.atlases[v].mips).max().unwrap_or(1);
         let st = vk::ImageUsageFlags::STORAGE;
         let mut scratch = [
-            self.gpu.create_image(max_size, max_size, smips, vk::Format::R8G8B8A8_UNORM, st, "bake albedo")?,
-            self.gpu.create_image(max_size, max_size, smips, vk::Format::R16G16B16A16_SFLOAT, st, "bake normal-depth")?,
-            self.gpu.create_image(max_size, max_size, smips, vk::Format::R8G8B8A8_UNORM, st, "bake visibility")?,
+            self.gpu.create_image(max_w, max_h, smips, vk::Format::R8G8B8A8_UNORM, st, "bake albedo")?,
+            self.gpu.create_image(max_w, max_h, smips, vk::Format::R16G16B16A16_SFLOAT, st, "bake normal-depth")?,
+            self.gpu.create_image(max_w, max_h, smips, vk::Format::R8G8B8A8_UNORM, st, "bake visibility")?,
         ];
         self.gpu.one_time(|cb| {
             for s in &scratch {
@@ -1558,7 +1789,7 @@ impl Renderer {
             }
         })?;
         // Encoded blocks of one variant (all levels of all four atlases): < 4.5 bytes per level-0 texel.
-        let enc_size = max_size as u64 * max_size as u64 * 9 / 2;
+        let enc_size = max_w as u64 * max_h as u64 * 9 / 2;
         let mut enc = self.gpu.create_buffer(
             enc_size,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC,
@@ -1615,6 +1846,7 @@ impl Renderer {
         for &v in &missing {
             let t0 = Instant::now();
             let (res, grid, mips) = (self.atlases[v].res, self.atlases[v].grid, self.atlases[v].mips);
+            let (square, crop) = (self.atlases[v].square, self.atlases[v].crop);
             let tree = &self.pack.trees[v];
             let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
             let alpha_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
@@ -1637,14 +1869,14 @@ impl Renderer {
             // Bake rays are orthographic: fixed texture footprint = one bake sub-sample (negative
             // spread in tri.rchit), and the material textures switched on.
             let mut bg = Globals::default();
-            bg.cam_fwd[3] = -(2.0 * r / res as f32 / imp.ss as f32);
+            bg.cam_fwd[3] = -(2.0 * r / square as f32 / imp.ss as f32);
             bg.params[1] = self.has_tex as u32 as f32;
             bg.lod_params[2] = -1.0; // bake: tri.rahit only alpha-tests, no LOD dissolve
             self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&bg));
             let mut push = BakePush {
                 center_radius: [c.x, c.y, c.z, r],
                 grid,
-                res,
+                res: square,
                 frame_offset: 0,
                 ss: imp.ss,
                 ao_rays: imp.ao_rays,
@@ -1652,6 +1884,8 @@ impl Renderer {
                 ao_range: imp.ao_range * (r / 8.0).clamp(0.2, 1.0),
                 vis_rays: imp.vis_rays,
                 pad: 0,
+                size: res,
+                crop,
             };
             for row in 0..grid {
                 push.frame_offset = row * grid;
@@ -1665,14 +1899,14 @@ impl Renderer {
                         &self.bake_pipe.miss,
                         &self.bake_pipe.hit,
                         &vk::StridedDeviceAddressRegionKHR::default(),
-                        res,
-                        res,
+                        res[0],
+                        res[1],
                         grid,
                     );
                 })?;
             }
 
-            let size = grid * res;
+            let size = [grid * res[0], grid * res[1]];
             let regions = crate::atlas::layout(grid, res, mips);
             let stream = crate::atlas::stream_bytes(grid, res, mips);
             assert!(stream <= enc_size, "bc block buffer too small");
@@ -1683,9 +1917,8 @@ impl Renderer {
                 // coverage-weighted mips of the uncompressed scratch atlas
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.mip_pipe);
                 for level in 1..mips {
-                    let s = size >> level;
                     d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.mip_layout, 0, &[mip_sets[level as usize]], &[]);
-                    d.cmd_dispatch(cb, s.div_ceil(8), s.div_ceil(8), 1);
+                    d.cmd_dispatch(cb, (size[0] >> level).div_ceil(8), (size[1] >> level).div_ceil(8), 1);
                     self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, cs, rw);
                 }
                 // BC encode every region of the stream (atlas.rs layout): mode = image; the
@@ -1693,11 +1926,11 @@ impl Renderer {
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_pipe);
                 for r in &regions {
                     let scratch_level = if r.img == 3 { r.level + 1 } else { r.level };
-                    let bx = r.size / 4;
+                    let (bx, by) = (r.size[0] / 4, r.size[1] / 4);
                     d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.bcenc_layout, 0, &[enc_sets[scratch_level as usize]], &[]);
-                    let pc = [r.img as u32, bx, bx, (r.offset / 16) as u32];
+                    let pc = [r.img as u32, bx, by, (r.offset / 16) as u32];
                     d.cmd_push_constants(cb, self.bcenc_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&pc));
-                    d.cmd_dispatch(cb, bx.div_ceil(8), bx.div_ceil(8), 1);
+                    d.cmd_dispatch(cb, bx.div_ceil(8), by.div_ceil(8), 1);
                 }
                 self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
                 d.cmd_copy_buffer(cb, enc.raw, enc_host.raw, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: stream }]);
@@ -1713,12 +1946,15 @@ impl Renderer {
             let tris = tree.expanded_tris(&self.pack.meshes);
             total_tris += tris;
             println!(
-                "Baked {:<28} {:>4} parts {:>6.1}M tris -> {:>4}px frames, {:>5}^2 atlas, {:>5.1} MB, {:.2}s",
+                "Baked {:<28} {:>4} parts {:>6.1}M tris -> {:>3}x{:<3} px frames (of {:>3}), {:>4}x{:<4} atlas, {:>5.1} MB, {:.2}s",
                 tree.name,
                 tree.parts.len(),
                 tris as f64 / 1e6,
-                res,
-                size,
+                res[0],
+                res[1],
+                square,
+                size[0],
+                size[1],
                 stream as f64 / 1e6,
                 t0.elapsed().as_secs_f32()
             );
@@ -1742,36 +1978,37 @@ impl Renderer {
         self.load_base_atlases(t_all)
     }
 
-    /// Every variant's base atlas from the cache; outside the globe (one small forest, every
-    /// variant in view) the full atlases too.
+    /// The atlases from the cache. The globe: every variant's base atlas (the full ones stream in
+    /// near the camera). The forest scene: the full atlas of every variant that grows in it (one
+    /// forest, every variant in view), and nothing for the others.
     fn load_base_atlases(&mut self, t_all: Instant) -> Result<()> {
+        // (every variant's file stays, also those this scene does not show: the next biome's)
         crate::atlas::prune(&self.atlases.iter().map(|a| a.path.clone()).collect::<Vec<_>>());
-        let mut bytes = 0u64;
-        for v in 0..self.atlases.len() {
-            let a = &self.atlases[v];
-            let regions: Vec<_> = crate::atlas::layout(a.grid, a.res, a.mips).into_iter().filter(|r| r.level >= a.skip).collect();
-            let data = crate::atlas::read_regions(&a.path, &regions)?;
-            self.upload_atlas(&self.atlases[v].base, &regions, &data, self.atlases[v].skip)?;
-            bytes += self.atlases[v].base.bytes();
-        }
-        println!(
-            "Impostor base atlases: {:.2} GB on the GPU for {} variants (full atlases stream in near the camera)",
-            bytes as f64 / 1e9,
-            self.atlases.len()
-        );
-        if self.globe.is_none() {
-            // the forest scene: full atlases for the variants that grow in it (every one is in view)
-            let mut used = vec![false; self.atlases.len()];
-            for t in &self.world.trees {
-                if let Some(u) = used.get_mut(t.variant as usize) {
-                    *u = true;
-                }
+        if self.globe.is_some() {
+            let mut bytes = 0u64;
+            for v in 0..self.atlases.len() {
+                let a = &self.atlases[v];
+                let Some(base) = &a.base else { continue };
+                let regions: Vec<_> = crate::atlas::layout(a.grid, a.res, a.mips).into_iter().filter(|r| r.level >= a.skip).collect();
+                let data = crate::atlas::read_regions(&a.path, &regions)?;
+                self.upload_atlas(base, &regions, &data, a.skip)?;
+                bytes += base.bytes();
             }
-            for v in (0..self.atlases.len()).filter(|&v| used[v]) {
+            println!(
+                "Impostor base atlases: {:.2} GB on the GPU for {} variants (full atlases stream in near the camera)",
+                bytes as f64 / 1e9,
+                self.atlases.len()
+            );
+        } else {
+            let mut bytes = 0u64;
+            let scene: Vec<usize> = (0..self.atlases.len()).filter(|&v| self.used_variant[v]).collect();
+            for v in scene {
                 let a = &self.atlases[v];
                 let stream = crate::atlas::read_regions(&a.path, &crate::atlas::layout(a.grid, a.res, a.mips))?;
                 self.install_full(v, &stream)?;
+                bytes += self.atlases[v].full_bytes();
             }
+            println!("Impostor atlases: {:.2} GB on the GPU for the scene's {} variants", bytes as f64 / 1e9, self.used_variant.iter().filter(|&&u| u).count());
         }
         println!("Impostors ready in {:.1}s", t_all.elapsed().as_secs_f32());
         Ok(())
@@ -1810,7 +2047,7 @@ impl Renderer {
                 let region = vk::BufferImageCopy {
                     buffer_offset: at,
                     image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: r.level - skip, base_array_layer: 0, layer_count: 1 },
-                    image_extent: vk::Extent3D { width: r.size, height: r.size, depth: 1 },
+                    image_extent: vk::Extent3D { width: r.size[0], height: r.size[1], depth: 1 },
                     ..Default::default()
                 };
                 self.gpu.device.cmd_copy_buffer_to_image(cb, src, imgs[r.img], vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
@@ -1837,7 +2074,8 @@ impl Renderer {
         for (v, offset) in std::mem::take(&mut self.atlas_uploads) {
             let (grid, res, mips) = (self.atlases[v].grid, self.atlases[v].res, self.atlases[v].mips);
             if let Some(full) = &self.atlases[v].full {
-                self.cmd_upload_atlas(cb, full, &crate::atlas::layout(grid, res, mips), self.atlas_staging.raw, offset, 0);
+                let src = self.atlas_staging.as_ref().expect("uploads only on the globe").raw;
+                self.cmd_upload_atlas(cb, full, &crate::atlas::layout(grid, res, mips), src, offset, 0);
             }
             self.atlas_retire.push((offset, crate::atlas::stream_bytes(grid, res, mips)));
         }
@@ -1857,9 +2095,9 @@ impl Renderer {
 
     /// The resolution and levels of the atlas a variant shows now, into the impostor info.
     fn set_atlas_info(&mut self, v: usize) {
-        let a = self.atlases[v].shown();
+        let Some(a) = self.atlases[v].shown() else { return };
         let (res, mips) = (a.res, a.mips);
-        self.imp_infos[v].res = res;
+        self.imp_infos[v].res = res[0] | res[1] << 16;
         self.imp_infos[v].mips = mips;
         let n = std::mem::size_of::<ImpostorInfo>();
         self.imp_info.mapped()[v * n..(v + 1) * n].copy_from_slice(bytemuck::bytes_of(&self.imp_infos[v]));
@@ -1911,7 +2149,7 @@ impl Renderer {
                 let need: Vec<f32> = (0..n)
                     .map(|v| {
                         let a = &self.atlases[v];
-                        let texel = 2.0 * self.imp_infos[v].center_radius[3] / a.res as f32;
+                        let texel = a.texel(self.imp_infos[v].center_radius[3]);
                         (texel * (1u32 << a.skip) as f32 / pixel.max(1e-5)).clamp(30.0, ATLAS_RADIUS as f32)
                     })
                     .collect();
@@ -1931,8 +2169,8 @@ impl Renderer {
                     if a.full.is_none() && !a.loading {
                         // read straight into the upload buffer (later, when it is full)
                         let len = crate::atlas::stream_bytes(a.grid, a.res, a.mips);
-                        if let Some(offset) = self.atlas_ranges.alloc(len) {
-                            let addr = self.atlas_staging.mapped().as_mut_ptr() as usize + offset as usize;
+                        if let (Some(staging), Some(offset)) = (self.atlas_staging.as_mut(), self.atlas_ranges.alloc(len)) {
+                            let addr = staging.mapped().as_mut_ptr() as usize + offset as usize;
                             a.loading = true;
                             a.upload = Some(offset);
                             self.atlas_loader.request(v, a.path.clone(), crate::atlas::Dest { addr, len: len as usize });
@@ -1968,19 +2206,19 @@ impl Renderer {
 
     /// GPU memory of the impostor atlases: (base, full) bytes and how many variants are full.
     pub fn atlas_memory(&self) -> (u64, u64, usize) {
-        let base = self.atlases.iter().map(|a| a.base.bytes()).sum();
+        let base = self.atlases.iter().filter_map(|a| a.base.as_ref()).map(|a| a.bytes()).sum();
         let full: Vec<_> = self.atlases.iter().filter_map(|a| a.full.as_ref()).collect();
         (base, full.iter().map(|a| a.bytes()).sum(), full.len())
     }
 
     /// Debug: write the albedo of the first baked variant (uncompressed scratch) as a PNG.
-    fn dump_scratch(&self, img: &Image, size: u32, prefix: &str) -> Result<()> {
-        let n = size as u64 * size as u64;
+    fn dump_scratch(&self, img: &Image, size: [u32; 2], prefix: &str) -> Result<()> {
+        let n = size[0] as u64 * size[1] as u64;
         let mut buf = self.gpu.create_buffer(n * 4, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "dump")?;
         let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
         let region = vk::BufferImageCopy {
             image_subresource: layers,
-            image_extent: vk::Extent3D { width: size, height: size, depth: 1 },
+            image_extent: vk::Extent3D { width: size[0], height: size[1], depth: 1 },
             ..Default::default()
         };
         self.gpu.one_time(|cb| unsafe {
@@ -1997,7 +2235,7 @@ impl Renderer {
         self.gpu.destroy_buffer(&mut buf);
         let path = format!("{prefix}_albedo.png");
         let file = std::io::BufWriter::new(std::fs::File::create(&path)?);
-        let mut enc = png::Encoder::new(file, size, size);
+        let mut enc = png::Encoder::new(file, size[0], size[1]);
         enc.set_color(png::ColorType::Rgba);
         enc.set_depth(png::BitDepth::Eight);
         enc.write_header()?.write_image_data(&px)?;
@@ -2071,6 +2309,25 @@ impl Renderer {
         active.sort_unstable();
         self.near_count = active.len();
         self.active = active;
+        // Cells with draw-distance plants: complete while the camera is within that distance
+        // (impostor.rint measures to the plant's centre; a few metres early, and back later, so a
+        // camera at the edge does not rebuild the TLAS every frame). A complete BLAS is kept a
+        // while longer for a camera that turns back.
+        let mut build = Vec::new();
+        for (ci, c) in self.near_cells.iter_mut().enumerate() {
+            let d = (cam.clamp(c.lo, c.hi) - cam).length();
+            let on = d < c.cull + if c.on { 24.0 } else { 8.0 };
+            changed |= on != c.on;
+            c.on = on;
+            if on && c.full.is_none() {
+                build.push(ci);
+            } else if !on && d > c.cull + 150.0 {
+                self.near_retire.extend(c.full.take());
+            }
+        }
+        for ci in build {
+            self.build_near(ci)?;
+        }
         let t_states = Instant::now();
         self.profile.cpu_lod_parts[0] += (t_states - t_begin).as_secs_f64() * 1000.0;
         if changed {
@@ -2080,7 +2337,12 @@ impl Renderer {
             self.insts.clear();
             self.inst_data.clear();
             self.insts.extend_from_slice(&self.static_insts);
-            self.inst_data.extend_from_slice(&self.static_inst_data);
+            self.insts.extend(self.near_cells.iter().filter_map(|c| match (&c.full, c.on) {
+                (Some(f), true) => Some(cluster_instance(c.first, f.accel.addr)),
+                _ => c.far,
+            }));
+            // (the terrain and the clusters have no per-instance info: tri.rahit never runs on them)
+            self.inst_data.resize(self.insts.len(), InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
             const MAX_INSTANCES: usize = 8_000_000;
             for &pi in &self.active {
                 let i = pi as usize;
@@ -2096,12 +2358,12 @@ impl Renderer {
                 let tree = (rec & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
                 // tri.rahit: dissolve; bits 1..4 the biome's dryness tint (tri.rchit)
                 let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1);
-                for p in &variant.parts {
+                for (pi, p) in variant.parts.iter().enumerate() {
                     let alpha = self.catalog.mesh_alpha[p.mesh as usize];
                     let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                     let m = t.xform * p.xform;
                     self.insts.push(accel::make_instance(&m, p.mesh | seed, 1, sbt, flags, self.blas[p.mesh as usize].addr));
-                    self.inst_data.push(InstInfo { center, data: tree, flags: band });
+                    self.inst_data.push(InstInfo { center, data: tree, flags: band | (pi as u32) << INST_PART_SHIFT });
                 }
             }
             if self.insts.len() > self.tlas.capacity as usize {
@@ -2420,11 +2682,11 @@ impl Renderer {
                     let seed = ((r[12] >> 8) & 0x1FFF) << 11;
                     let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT);
                     let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1;
-                    for p in &pack.trees[v].parts {
+                    for (pi, p) in pack.trees[v].parts.iter().enumerate() {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
                         insts.push(accel::make_instance(&(plant * p.xform), p.mesh | seed, 1, sbt, flags, blas[p.mesh as usize].addr));
-                        inst_data.push(InstInfo { center: center.to_array(), data, flags: iflags });
+                        inst_data.push(InstInfo { center: center.to_array(), data, flags: iflags | (pi as u32) << INST_PART_SHIFT });
                     }
                 });
             }
@@ -2435,6 +2697,11 @@ impl Renderer {
         let t_wait = Instant::now();
         unsafe { d.wait_for_fences(&[self.fence], true, u64::MAX).context("waiting for previous frame")? };
         self.profile.cpu_wait += t_wait.elapsed().as_secs_f64() * 1000.0;
+        // (the frame that may still have traced them is done; this frame's TLAS is without them)
+        for mut f in std::mem::take(&mut self.near_retire) {
+            accel::destroy_accel(&self.gpu, &mut f.accel);
+            self.gpu.destroy_buffer(&mut f.input);
+        }
         if self.globe.is_some() && self.insts.len() > self.tlas.capacity as usize {
             // dense understory, rocks and near tree meshes can outgrow the first estimate
             let cap = (self.insts.len() as f32 * 1.5) as u32;
@@ -2529,6 +2796,7 @@ impl Renderer {
                 scene.record(&self.gpu, cb);
             }
             self.record_atlas_uploads(cb);
+            self.record_near_builds(cb);
             if self.tlas_dirty {
                 self.tlas.cmd_build(&self.gpu, cb, self.insts.len() as u32);
                 self.tlas_dirty = false;
@@ -2766,22 +3034,76 @@ impl Renderer {
     }
 }
 
-/// Per plant record (rt.glsl PlantRec): object->world 3x4 rows, variant | seed << 8.
+/// Per plant record (rt.glsl PlantRec): object->world 3x4 rows, variant | seed << 8 | ...
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
-struct PlantRecGpu {
+pub struct PlantRecGpu {
     rows: [f32; 12],
     data: u32,
 }
 
+impl PlantRecGpu {
+    /// From the plant's object -> world transform.
+    pub fn new(m: glam::Mat3, pos: Vec3, data: u32) -> Self {
+        let rows = [
+            m.x_axis.x, m.y_axis.x, m.z_axis.x, pos.x, //
+            m.x_axis.y, m.y_axis.y, m.z_axis.y, pos.y, //
+            m.x_axis.z, m.y_axis.z, m.z_axis.z, pos.z,
+        ];
+        PlantRecGpu { rows, data }
+    }
+}
+
 struct Clusters {
+    /// plant -> record, record -> plant
     rec_of: Vec<u32>,
+    tree_of: Vec<u32>,
     rec: Buffer,
     state: Buffer,
     blas: Vec<Accel>,
-    aabbs: Buffer,
+    /// always in the TLAS: the terrain and the cells without draw-distance plants
     insts: Vec<vk::AccelerationStructureInstanceKHR>,
-    inst_data: Vec<InstInfo>,
+    near: Vec<NearCell>,
+    near_scratch: Buffer,
+}
+
+/// A cell that has plants with a draw distance. While the camera is within `cull` of the box of
+/// their centres the TLAS holds `full`, a BLAS of all the cell's plants (records first..first +
+/// count); otherwise `far`, the permanent BLAS of its plants without a draw distance (if any).
+struct NearCell {
+    first: u32,
+    count: u32,
+    far: Option<vk::AccelerationStructureInstanceKHR>,
+    lo: Vec3,
+    hi: Vec3,
+    cull: f32,
+    on: bool,
+    full: Option<NearBlas>,
+}
+
+struct NearBlas {
+    accel: Accel,
+    /// its boxes (build input)
+    input: Buffer,
+}
+
+/// A cell's TLAS instance. Mask bit 1: impostors; hit record 1: impostor intersection + closest
+/// hit; custom index: the cell's first plant record.
+fn cluster_instance(first: u32, blas: u64) -> vk::AccelerationStructureInstanceKHR {
+    accel::make_instance(&glam::Affine3A::IDENTITY, first, 2, 1, vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE, blas)
+}
+
+/// The world box of a plant's impostor: the box of its turned bounding box.
+fn plant_box(t: &crate::world::TreeInstance, asset: &crate::asset::TreeAsset) -> [f32; 6] {
+    let (lo, hi) = (asset.bmin - Vec3::splat(0.05), asset.bmax + Vec3::splat(0.05));
+    let (mut mn, mut mx) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for corner in 0..8 {
+        let v = Vec3::new(if corner & 1 == 0 { lo.x } else { hi.x }, if corner & 2 == 0 { lo.y } else { hi.y }, if corner & 4 == 0 { lo.z } else { hi.z });
+        let w = t.xform.transform_point3(v);
+        mn = mn.min(w);
+        mx = mx.max(w);
+    }
+    [mn.x, mn.y, mn.z, mx.x, mx.y, mx.z]
 }
 
 /// Uniform grid of plant indices for the near-camera LOD query.
