@@ -73,7 +73,25 @@ pub struct Globals {
     /// edge, views (azimuths, slopes); texels per view, gutter texels, atlas levels, atlas slot;
     /// slope of the steepest and the flattest views.
     pub lawn: [[f32; 4]; 4],
+    /// `--test-flight` (the aircraft; main.rgen, aircraft.glsl, clouds.glsl): the renderer's frame
+    /// -> the aircraft's model frame (rows, w the translation)
+    pub ac_inv: [[f32; 4]; 3],
+    /// a point on the aircraft this frame -> where it was last frame (rows): motion vectors
+    pub ac_prev: [[f32; 4]; 3],
+    /// x 1 = an aircraft is flying, y afterburner 0..1, z Mach number, w vapour cone 0..1
+    pub ac_state: [f32; 4],
+    /// x vapour over the wings 0..1, y points in the wake, z air density / sea level's, w seconds flown
+    pub ac_state2: [f32; 4],
+    /// xyz which way the air goes past the aircraft (model frame, unit), w engine power 0..1
+    pub ac_vel: [f32; 4],
+    /// where the aircraft has been, newest first (the renderer's frame); w age in seconds
+    pub wake: [[f32; 4]; WAKE_POINTS],
+    /// x condensation trail left there 0..1, y how much the air was stirred there 0..1
+    pub wake_b: [[f32; 4]; WAKE_POINTS],
 }
+
+/// Points of the aircraft's wake kept for the shaders (globals.glsl).
+pub const WAKE_POINTS: usize = 32;
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
 struct Targets {
@@ -585,6 +603,13 @@ pub struct Renderer {
     globe_dummy: Option<(Buffer, Buffer, Image)>,
     /// Globe mode: this frame's camera (ECEF), its frame rotation and globe.rchit's globals.
     globe_view: Option<(glam::DVec3, glam::DMat3, crate::globe::scene::GlobeGlobals)>,
+    /// `--test-flight`: the aircraft's skin maps and materials (placeholders without one), its
+    /// parts (meshes ac_first..), and where it is this frame
+    ac_tex: Vec<Image>,
+    ac_mats: Buffer,
+    ac_parts: Vec<crate::aircraft::Part>,
+    ac_first: usize,
+    pub ac_pose: Option<crate::aircraft::Pose>,
     /// Globe mode: plant records currently drawn as meshes (1 both / 2 mesh only).
     globe_states: std::collections::HashMap<u32, u32>,
     /// Globe mode: trees in the TLAS last frame (window title).
@@ -654,6 +679,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         gpu.shader_module(spv!("impostor.rchit"))?,
         gpu.shader_module(spv!("tri.rahit"))?,
         gpu.shader_module(spv!("globe.rchit"))?,
+        gpu.shader_module(spv!("aircraft.rchit"))?,
+        gpu.shader_module(spv!("aircraft.rahit"))?,
     ];
     let kinds = [
         vk::ShaderStageFlags::RAYGEN_KHR,
@@ -664,6 +691,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::ANY_HIT_KHR,
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+        vk::ShaderStageFlags::ANY_HIT_KHR,
     ];
     let stages: Vec<_> = modules
         .iter()
@@ -680,7 +709,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     };
     let u = vk::SHADER_UNUSED_KHR;
     // Hit records (instance SBT offset): 0 opaque triangles, 1 impostor AABBs,
-    // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve), 3 globe terrain.
+    // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve), 3 globe terrain,
+    // 4 the aircraft (its glass is seen through by the any-hit).
     let groups = [
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 0, u, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 1, u, u, u),
@@ -689,6 +719,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         group(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP, u, 5, u, 4),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 3, 6, u),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 7, u, u),
+        group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 8, 9, u),
     ];
     let info = vk::RayTracingPipelineCreateInfoKHR::default()
         .stages(&stages)
@@ -710,15 +741,15 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     let ba = gpu.rt.base_alignment as u64;
     let off_miss = align_up(stride, ba);
     let off_hit = align_up(off_miss + 2 * stride, ba);
-    let total = off_hit + 4 * stride;
-    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 7, 7 * hs as usize)? };
+    let total = off_hit + 5 * stride;
+    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 8, 8 * hs as usize)? };
     let mut sbt = gpu.create_buffer(total + ba, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR, MemoryLocation::CpuToGpu, "sbt")?;
     let base = align_up(sbt.addr, ba);
     let shift = (base - sbt.addr) as usize;
     {
         let m = sbt.mapped();
         for (group, off) in
-            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride)]
+            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride), (7, off_hit + 4 * stride)]
         {
             let dst = shift + off as usize;
             m[dst..dst + hs as usize].copy_from_slice(&handles[group * hs as usize..(group + 1) * hs as usize]);
@@ -729,7 +760,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         pipe,
         rgen: region(0, stride),
         miss: region(off_miss, 2 * stride),
-        hit: region(off_hit, 4 * stride),
+        hit: region(off_hit, 5 * stride),
         _sbt: sbt,
     })
 }
@@ -750,6 +781,7 @@ impl Renderer {
         render_scale: f32,
         dlss_mode: Option<usize>,
         globe: Option<std::sync::Arc<crate::globe::dem::Terrain>>,
+        aircraft: Option<crate::aircraft::Model>,
     ) -> Result<Self> {
         let t0 = Instant::now();
         let gpu = Gpu::new(display, window, validation)?;
@@ -829,7 +861,12 @@ impl Renderer {
         let mut meshes = Vec::new();
         // (the terrain, after the plant meshes, is always shown; so is the lawn tile after it)
         let shown = |i: usize| used.mesh.get(i).copied().unwrap_or(true);
-        let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).chain(lawn_tile.iter()).collect();
+        // (and the aircraft's parts last: --test-flight)
+        let no_meshes: Vec<MeshData> = Vec::new();
+        let ac_meshes = aircraft.as_ref().map(|a| &a.meshes).unwrap_or(&no_meshes);
+        let ac_first = pack.meshes.len() + 1 + lawn_tile.iter().count();
+        let all_meshes: Vec<&MeshData> = pack.meshes.iter().chain(std::iter::once(&world.terrain)).chain(lawn_tile.iter()).chain(ac_meshes.iter()).collect();
+        assert!(all_meshes.len() < 2048, "mesh ids are 11 bits in the instance custom index");
         let lawn_mesh = lawn_tile.as_ref().map(|_| pack.meshes.len() + 1);
         for (i, m) in all_meshes.iter().enumerate() {
             meshes.push(if shown(i) { upload_mesh(&gpu, m)? } else { MeshGpu::none() });
@@ -1071,8 +1108,22 @@ impl Renderer {
             )?
         };
 
-        const _: () = assert!(std::mem::size_of::<Globals>() <= 512);
-        let ubo = gpu.create_buffer(512, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globals")?;
+        // the aircraft's skin and materials (bindings 36, 37), or placeholders
+        let (ac_tex, ac_mats) = match &aircraft {
+            Some(a) => {
+                let t = Instant::now();
+                let tex = crate::aircraft::load_textures(&gpu, &a.dir)?;
+                println!("Aircraft: {} parts, {} triangles, skin in {:.2}s", a.parts.len(), a.meshes.iter().map(|m| m.tri_count()).sum::<u32>(), t.elapsed().as_secs_f32());
+                (tex, gpu.upload_buffer(bytemuck::cast_slice(&a.materials), vk::BufferUsageFlags::STORAGE_BUFFER, "aircraft materials")?)
+            }
+            None => (
+                vec![crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "aircraft placeholder")?],
+                gpu.upload_buffer(&[0u8; 48], vk::BufferUsageFlags::STORAGE_BUFFER, "aircraft materials")?,
+            ),
+        };
+        let ac_parts: Vec<crate::aircraft::Part> = aircraft.map(|a| a.parts).unwrap_or_default();
+        const _: () = assert!(std::mem::size_of::<Globals>() <= 2048);
+        let ubo = gpu.create_buffer(2048, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globals")?;
         let mat_sampler = unsafe {
             gpu.device.create_sampler(
                 &vk::SamplerCreateInfo::default()
@@ -1132,6 +1183,9 @@ impl Renderer {
             b(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, OCEAN_TEX as u32, rt_all),
             b(34, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
             b(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
+            // the aircraft (aircraft.rchit): its skin's three maps, its materials
+            b(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 3, rt_all),
+            b(37, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -1197,7 +1251,7 @@ impl Renderer {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 24 },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1 + OCEAN_TEX as u32 + 2),
+                descriptor_count: 2 * (4 * nvar + (crate::textures::SPECIES_SLOTS * MAX_SPECIES) as u32 + MAX_GROUND_TEX as u32 + 1 + OCEAN_TEX as u32 + 2 + 3),
             },
         ];
         let desc_pool = unsafe {
@@ -1423,6 +1477,11 @@ impl Renderer {
             globe: None,
             globe_dummy: None,
             globe_view: None,
+            ac_tex,
+            ac_mats,
+            ac_parts,
+            ac_first,
+            ac_pose: None,
             globe_states: std::collections::HashMap::new(),
             globe_trees: 0,
         };
@@ -1759,6 +1818,8 @@ impl Renderer {
         };
         let mat_tex = tex(&self.mat_tex, crate::textures::SPECIES_SLOTS * MAX_SPECIES);
         let ground_tex = tex(&self.ground_tex, MAX_GROUND_TEX);
+        let ac_tex = tex(&self.ac_tex, 3);
+        let ac_mats = buf(&self.ac_mats);
         let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
                 .map(|i| {
@@ -1800,6 +1861,8 @@ impl Renderer {
             w(33, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ocean_tex),
             w(34, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_shape),
             w(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_detail),
+            w(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ac_tex),
+            w(37, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ac_mats),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -2862,6 +2925,18 @@ impl Renderer {
                         inst_data.push(InstInfo { center: center.to_array(), data, flags: iflags | (pi as u32) << INST_PART_SHIFT });
                     }
                 });
+            }
+            // the aircraft: one instance per part, the moving surfaces turned about their hinges
+            if let Some(pose) = &self.ac_pose {
+                let opaque = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+                let seen_through = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
+                for (k, part) in self.ac_parts.iter().enumerate() {
+                    let mesh = self.ac_first + k;
+                    let m = pose.xform * pose.part(part);
+                    // (mask 4, its own bit: the rays its shock waves bend look past it, main.rgen)
+                    self.insts.push(accel::make_instance(&m, mesh as u32, 4, 4, if part.glass { seen_through } else { opaque }, self.blas[mesh].addr));
+                    self.inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
+                }
             }
             globe_cpu = [p[0], p[1], t2.elapsed().as_secs_f64() * 1e3];
             globe_states = states;

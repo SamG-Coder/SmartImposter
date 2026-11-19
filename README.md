@@ -807,6 +807,65 @@ screen for 40 ms) a 60 fps recorder captures every frame however heavy the scene
 frames, cuts the loading gaps and adds titles, giving smooth 60 fps video.
 [`tours/showcase.txt`](tours/showcase.txt) is a five-minute flight over ten forests.
 
+**Test flight** (`--test-flight`, `src/flight.rs`, `src/pilot.rs`, `src/aircraft.rs`). An F-16C
+flown over the globe, from a chase camera, the cockpit or a camera it flies past.
+
+```
+cargo run --release -- --test-flight                          # over Lake Como, heading for the Alps
+cargo run --release -- --test-flight --at 32,-122,1000,90,0   # lat, lon, height above ground, heading
+```
+
+![An F-16C over Lake Como: afterburner lit, a vapour cone round it](docs/images/test_flight.jpg)
+
+![Shock waves bending the view above Mach 1, a hard pull with its wing-tip vortices, a condensation trail high up, the cockpit](docs/images/test_flight_views.jpg)
+
+The model as Blender renders it (`tools/make_f16.py --renders`):
+
+![The F-16C model](docs/images/f16_model.jpg)
+
+- **The aircraft** is built by `tools/make_f16.py` in Blender from published dimensions and a
+  digitised three-view (the script's header says what is data and what is estimated), painted
+  by `tools/f16_paint.py` and written as `assets/aircraft/f16c.acm` with its three skin maps.
+  It is not in the repository: run the script once (`blender -b --python tools/make_f16.py --
+  assets/aircraft`). It is ray traced like everything else, by its own hit shaders
+  (`aircraft.rchit`, `aircraft.rahit`): the painted skin, flat materials, a mirror-gold canopy
+  one looks out through from inside. The leading-edge flaps, flaperons, tailplanes and rudder
+  move.
+- **The flight model** (`flight.rs`) integrates lift, drag, side force, thrust and gravity in
+  the 1976 standard atmosphere. The coefficients (by angle of attack and Mach number) and the
+  engine (an F110-GE-129's 76 / 132 kN, falling with air density, rising with ram pressure,
+  losing inlet recovery above Mach 1) are fitted to the aircraft's published performance, not
+  taken from wind-tunnel tables: it tops out at Mach 2.10 at 12 km and Mach 1.29 at sea
+  level (the real aircraft: about 2.05 and 1.2), with the transonic drag rise between. It is flown through the real aircraft's control
+  laws: the stick commands load factor (+9 to -3 g, 1 g hands off) limited to 25.2 degrees
+  angle of attack, and roll rate about the flight path (to 324 deg/s, less when slow or at
+  high angle of attack); sideslip is held at zero unless the pedals ask for some. The moments
+  themselves are not modelled (the computer's commands are followed with the airframe's lags),
+  nor fuel, stores, landing gear or wind. Four unit tests hold it to 1 g hands off, the 9 g and
+  angle-of-attack limits and the top speed.
+- **As flown, it is tuned for play** (`Sim::arcade`, on in `--test-flight`), away from the real
+  aircraft in two ways: 30% more afterburner and no inlet loss, so it reaches Mach 3.08 at
+  12 km and Mach 1.62 at sea level; and A / D turn it (a 40 degree bank flown for you, plus up
+  to 1.4 g of flat turn), where a real rudder only slips the nose a few degrees.
+- **The air bends the light** (`aircraft.glsl` `craftBend`): supersonic, the bow shock and the
+  tail shock are cones of denser air (half angle asin(1 / Mach)), and a ray is refracted going
+  in and coming out, most where it meets the cone edge on. What is behind is looked for again
+  along the bent ray, so the land and sky show two shifted lines trailing back from the
+  aircraft; the exhaust makes what is seen through it shimmer. The bending is many times the
+  real air's, which only a schlieren camera shows.
+- **What speed does to the air** (`shaders/aircraft.glsl`), all thin volumes integrated along
+  the view ray: the afterburner's flame with its shock diamonds; the veil of condensation
+  round the aircraft between about Mach 0.9 and 1.09 low down (a ragged cone ending at the
+  shock, its sunward side warm, the far side sky blue, pastel fringes where it is thinnest); vapour over the wings and in the tip
+  and strake vortices above 4 g; a condensation trail where the air is colder than about
+  -40 C (above roughly 8.5 km). Humidity is assumed by height, not simulated. There is no sound.
+- **Clouds** (`clouds.glsl`): with an aircraft flying, the cloud samples crowd towards the
+  camera (metres apart, not a kilometre), so one flies through cloud and not past a backdrop.
+  The aircraft's wake, 32 points kept for 95 s and drifting with the wind, clears a tube
+  through the cloud that widens from 9 m to ~140 m and turns the cloud's shapes about the
+  path. Inside a thick deck that tube is what keeps the aircraft in sight of the chase camera;
+  the lane it leaves in thin or broken cloud is subtle.
+
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
 
@@ -918,6 +977,7 @@ cargo run --release
 | `--gallery` | every variant on flat ground, one row per species |
 | `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
+| `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |
@@ -983,6 +1043,25 @@ cargo run --release
 | `,` `.` / Arrows (globe) | clock back / forward an hour (Shift: a day; up / down: a day) |
 | `/` (globe) | clock speed: real time, 1 min/s, 1 h/s, 1 day/s, stopped |
 | F11 / F12 | fullscreen / screenshot |
+| **`--test-flight`** | |
+| W / S (or Shift / Ctrl) | faster / slower (the keys are Grand Theft Auto V's for aircraft); past 100% the afterburner lights, held back past idle the speed brakes open |
+| A / D | turn left / right: the aircraft banks into the turn and levels again after |
+| Numpad 8 / 5 (or Up / Down) | nose down / up (a key asks for half of what the aircraft can do) |
+| Numpad 4 / 6 (or Left / Right) | roll left / right |
+| mouse, wheel | look round the aircraft (the cursor is locked to the window; Esc frees it, a click takes it back; the view goes behind the aircraft again 2 s after the mouse stops); chase distance |
+| left mouse button (hold) | fly with the mouse: forward nose down, sideways roll |
+| Space | speed brakes (hold) |
+| C | view: chase, cockpit, fly-by |
+| R | back to the start |
+| **controller** (`--test-flight`) | a PlayStation controller (DualSense, DualShock 4: read directly over USB or Bluetooth) or any gamepad the system reports (Xbox); the layout is Grand Theft Auto V's too; it flies only while the window is in front |
+| right / left trigger | faster / slower (held past idle: speed brakes) |
+| left stick | the stick: forward nose down, back nose up, sideways roll (gentle near the centre, all the aircraft can do at the rim) |
+| bumpers | turn left / right, as A / D |
+| right stick | look round the aircraft |
+| A / Cross | speed brakes (hold) |
+| View / Select (or Y / Triangle) | view: chase, cockpit, fly-by |
+| D-pad up / down | chase distance |
+| Menu / Start | back to the start |
 
 ## Tools
 
@@ -999,6 +1078,7 @@ cargo run --release
 | `tools/fab_to_mtree.py` | Megascans plants (alpha-tested cards: palms, ferns, yuccas) and scanned solids (cacti, boulders, logs, snags, sharing one texture atlas) from Fab glTF → species packs |
 | `tools/usd_inspect.py`, `tools/usd_details.py`, `tools/uv_check.py`, `tools/leaf_check.py` | asset inspection |
 | `tools/make_docs_images.py` | build the README images from renders |
+| `tools/make_f16.py`, `tools/f16_paint.py` | run in Blender: build the F-16C of `--test-flight` from published dimensions and a digitised three-view, paint its skin atlas, write it for the renderer (`.acm`) and as glTF |
 | `tools/record_tour.ps1` | record a `--tour` with OBS Studio (profile setup in the script header) |
 | `tools/tour_post.py` | recorded tour → finished video: finds the shots, drops repeated frames (paced recording), dips to black between shots, title cards and lower thirds from the tour file, H.264 60 fps |
 
@@ -1027,6 +1107,10 @@ src/
   tour.rs       scripted camera tours: the shot file, spline paths, easing, fades
   flypath.rs    arc-length parameterised Catmull-Rom fly-through path (forest scene)
   walk.rs       the first-person walking camera: ground following, gravity, solid trunks
+  aircraft.rs   --test-flight: the aircraft's model and skin, its moving parts
+  flight.rs     the flight model: atmosphere, forces, engine, fly-by-wire control laws
+  pilot.rs      keys to stick and throttle, the chase / cockpit / fly-by cameras, the wake
+  gamepad.rs    a game controller for the test flight (PlayStation over HID, the rest through gilrs)
   globe/        the 1:1 Earth as a mode of the renderer:
     scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
     tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
@@ -1039,8 +1123,8 @@ native/
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rchit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl, lawnh.glsl, globe.glsl, atmosphere.glsl,
-  clouds.glsl)
+  globe.rchit  aircraft.rchit  aircraft.rahit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl,
+  lawnh.glsl, globe.glsl, atmosphere.glsl, clouds.glsl, aircraft.glsl)
 tools/   asset converters, the Earth data downloader, comparisons, tour recording (see Tools)
 tours/   tour files for --tour
 ```
@@ -1070,6 +1154,12 @@ tours/   tour files for --tour
 - **Globe:** the ground colour where there is no land cover data is a latitude stand-in; no stars;
   site mode (`--site`) grows the temperate preset unless `--biome` picks another. Terrain pools take ~1–2 GB of
   VRAM in a typical view.
+- **Test flight (`--test-flight`):** the globe only. No landing gear, runway, sound, instruments
+  in the cockpit or head-up display: the speed, Mach number, height, g and angle of attack are
+  in the window's title. Hitting the ground puts the aircraft back at the start. From outside
+  the canopy is an opaque gold mirror. Only the DLSS path has the aircraft's motion vectors:
+  under TAA it will probably smear (not tried). The effects are tuned by eye, not measured.
+  Trees and fine terrain may still be streaming in under a fast, low aircraft.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 
