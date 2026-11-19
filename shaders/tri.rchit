@@ -33,6 +33,7 @@ layout(set = 0, binding = 14) uniform sampler2D normalAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 6) uniform sampler2D albedoAtlas[MAX_VARIANTS];
 layout(set = 0, binding = 11) uniform sampler2D visAtlas[MAX_VARIANTS];
 #include "lawn.glsl"
+#include "lawnh.glsl"
 const float GROUND_TILE = 2.2; // metres per texture repeat
 // The scans' mean albedos differ ~10x (moss 0.02 .. dried grass 0.19); bring them to 0.05..0.1.
 // Mountain scans: neutral until calibrated.
@@ -381,10 +382,10 @@ void main() {
         lw.H = g.lawn.x;
         vec3 up = ng.y < 0.0 ? -ng : ng;
         float down = -dot(gl_WorldRayDirectionEXT, up); // how fast the ray comes down on the ground
-        lw.cover = smoothstep(0.25, 0.6, lawnAmt) * (1.0 - smoothstep(0.6 * LAWN_FADE, LAWN_FADE, gl_HitTEXT));
+        lw.cover = smoothstep(0.25, 0.6, lawnAmt) * (1.0 - smoothstep(0.6 * g.lawn4.w, g.lawn4.w, gl_HitTEXT));
         // (around the camera the lawn is real blades, renderer.rs place_grass: the layer comes in
         // under them as they shrink into the ground at the edge of that circle)
-        if (g.lawn3.w > 0.0) lw.cover *= smoothstep(0.5, 0.8, length(wp - g.camPos.xyz) / g.lawn3.w);
+        if (g.lawn3.w > 0.0) lw.cover *= smoothstep(0.5, 0.88, length(wp - g.camPos.xyz) / g.lawn3.w);
         if (lw.H > 0.0 && spread > 0.0 && riv.x <= 0.01 && down > 1e-3 && up.y > 0.3 && lw.cover > 0.03) {
             lw.slot = uint(g.lawn2.w);
             lw.T = g.lawn.y;
@@ -397,7 +398,8 @@ void main() {
             // are squashed: the ray is stretched the other way, and marched as baked; the park is
             // mown, nearly even), and the
             // tiling is bent by a slow, smooth offset.
-            float tall = mix(mix(0.55, 0.86, g.lawn3.z), 1.0, smoothstep(0.2, 0.8, 0.6 * vnoise(wp.xz * 0.23 + 11.3) + 0.4 * vnoise(wp.xz * 0.9)));
+            // (lawnh.glsl: the real blades near the camera stand as tall)
+            float tall = lawnStands(wp.xz);
             // (and in tufts a foot across, with their own shade: the texture a lawn keeps from
             // further away than its blades show; gone before a pixel is as wide as a tuft)
             float tufts = 1.0 - smoothstep(30.0, 110.0, gl_HitTEXT);

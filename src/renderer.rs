@@ -29,7 +29,7 @@ const OCEAN_TEX: usize = crate::globe::ocean::CASCADES * 2;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
-pub const MAX_GROUND_TEX: usize = 80;
+pub const MAX_GROUND_TEX: usize = 81;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -72,7 +72,7 @@ pub struct Globals {
     /// Forest scene, the lawn (lawn.rs; set by the renderer): blade height (0 = no lawn), tile
     /// edge, views (azimuths, slopes); texels per view, gutter texels, atlas levels, atlas slot;
     /// slope of the steepest and the flattest views.
-    pub lawn: [[f32; 4]; 3],
+    pub lawn: [[f32; 4]; 4],
 }
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
@@ -572,6 +572,7 @@ pub struct Renderer {
     /// where the camera was when they were placed (they are placed again once it has moved).
     grass_insts: Vec<vk::AccelerationStructureInstanceKHR>,
     grass_at: Vec3,
+    grass_radius: f32,
     near_count: usize,
     pub need_resize: bool,
     render_scale: f32,
@@ -742,7 +743,7 @@ impl Renderer {
         height: u32,
         pack: TreePack,
         catalog: Catalog,
-        world: World,
+        mut world: World,
         imp: ImpostorSettings,
         vsync: bool,
         validation: bool,
@@ -802,6 +803,12 @@ impl Renderer {
                 ground_tex.push(crate::textures::upload_with_mips(&gpu, 1, 1, &[128, 128, 128, 255], vk::Format::R8G8B8A8_UNORM, "ground placeholder")?);
             }
             ground_tex.truncate(MAX_GROUND_TEX - 2);
+            // the slot before the masks: the grass map of `--lawn auto` (World::build_grass_map)
+            if imp.lawn && !on_globe && crate::lawn::auto_short() > 0.0 {
+                world.build_grass_map(&pack.trees, &catalog);
+                let rgba: Vec<u8> = world.grass.iter().flat_map(|&v| [v, v, v, 255]).collect();
+                ground_tex[MAX_GROUND_TEX - 3] = crate::textures::upload_with_mips(&gpu, MASK_RES as u32, MASK_RES as u32, &rgba, vk::Format::R8G8B8A8_UNORM, "grass map")?;
+            }
             const FAR_RES: u32 = 2048;
             let far = world.far_mask(FAR_RES as usize, &pack.trees, &catalog);
             ground_tex.push(crate::textures::upload_with_mips(&gpu, FAR_RES, FAR_RES, &far, vk::Format::R8G8B8A8_UNORM, "far ground mask")?);
@@ -1406,6 +1413,7 @@ impl Renderer {
             first_update: true,
             grass_insts: Vec::new(),
             grass_at: Vec3::splat(f32::MAX),
+            grass_radius: 0.0,
             near_count: 0,
             need_resize: false,
             render_scale,
@@ -2472,8 +2480,9 @@ impl Renderer {
     /// The lawn's real blades around the camera (lawn.rs): one instance of the tile's mesh per
     /// square of the lawn's grid within reach, standing on the terrain (sheared to its slope, so
     /// the blades stay upright), turned one of four ways (blades are whole, so any placing of a
-    /// tile joins its neighbours), and shrinking into the ground towards the edge of the circle,
-    /// where the terrain shader's layer takes over (tri.rchit, lawn3.w). Placed again when the
+    /// tile joins its neighbours), as tall as the layer is there, and thinning out blade by blade
+    /// towards the edge of the circle, where the terrain shader's layer takes over (tri.rahit,
+    /// tri.rchit, lawn3.w). Placed again when the
     /// camera has moved a quarter of a metre. Returns whether the instances changed.
     fn place_grass(&mut self, cam: Vec3) -> bool {
         let radius = crate::lawn::near_radius();
@@ -2483,10 +2492,12 @@ impl Renderer {
             self.grass_at = Vec3::splat(f32::MAX);
             return had;
         };
-        if (cam - self.grass_at).length() < 0.25 {
+        // (or the radius has changed: the grass quality, key B)
+        if (cam - self.grass_at).length() < 0.25 && radius == self.grass_radius {
             return false;
         }
         self.grass_at = cam;
+        self.grass_radius = radius;
         let before = self.grass_insts.len();
         self.grass_insts.clear();
         // (well above the ground there are no blades to see: the layer alone)
@@ -2495,6 +2506,7 @@ impl Renderer {
         }
         let tile = crate::lawn::tile_size();
         let flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
+        let thin = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
         let addr = self.blas[mesh as usize].addr;
         let cell = |v: f32| (v / tile).floor() as i32;
         for j in cell(cam.z - radius)..=cell(cam.z + radius) {
@@ -2502,19 +2514,30 @@ impl Renderer {
                 let (x, z) = ((i as f32 + 0.5) * tile, (j as f32 + 0.5) * tile);
                 let y = self.world.height_at(x, z);
                 let d = (Vec3::new(x, y, z) - cam).length();
-                // full height to 0.6 of the radius, gone at its edge
-                let grown = 1.0 - ((d - 0.6 * radius) / (0.4 * radius)).clamp(0.0, 1.0);
-                let grown = grown * grown * (3.0 - 2.0 * grown);
-                if grown < 0.04 || !self.world.grows_lawn(x, z) {
+                if d - 0.75 * tile > radius || !self.world.grows_lawn(x, z) {
                     continue;
                 }
+                // Towards the edge of the circle the blades go one by one (tri.rahit, which runs
+                // on the tiles that reach into that band), not shorter.
+                let band = d + 0.75 * tile > 0.5 * radius;
+                // Its height: what the layer stands at (the patches, the auto mode's grass map),
+                // which changes across a tile. The tile is as tall as its tallest place and
+                // tri.rahit trims every blade to its own: one field, no step between tiles. (A
+                // tile on even ground needs no trimming and stays opaque.)
+                let short = crate::lawn::auto_short();
+                let stands = |x: f32, z: f32| crate::lawn::patch_height(x, z) * (short + (1.0 - short) * self.world.grass_at(x, z));
                 let e = 0.5 * tile;
+                let at = [stands(x, z), stands(x - e, z - e), stands(x + e, z - e), stands(x - e, z + e), stands(x + e, z + e), stands(x - e, z), stands(x + e, z), stands(x, z - e), stands(x, z + e)];
+                let (lo, hi) = at.iter().fold((f32::MAX, 0.0f32), |(lo, hi), v| (lo.min(*v), hi.max(*v)));
+                let grown = (hi * 1.04 + 0.01).min(1.0);
+                let band = band || grown - lo > 0.03;
                 let (gx, gz) = ((self.world.height_at(x + e, z) - self.world.height_at(x - e, z)) / tile, (self.world.height_at(x, z + e) - self.world.height_at(x, z - e)) / tile);
                 let h = (i as u32).wrapping_mul(0x9E37_79B9) ^ (j as u32).wrapping_mul(0x85EB_CA6B);
                 let turn = glam::Affine3A::from_rotation_y(((h >> 13) & 3) as f32 * std::f32::consts::FRAC_PI_2);
                 let shear = glam::Affine3A::from_mat3(glam::Mat3::from_cols(Vec3::new(1.0, gx, 0.0), Vec3::new(0.0, grown, 0.0), Vec3::new(0.0, gz, 1.0)));
                 let m = glam::Affine3A::from_translation(Vec3::new(x, y - 0.004, z)) * shear * turn * glam::Affine3A::from_translation(Vec3::new(-e, 0.0, -e));
-                self.grass_insts.push(accel::make_instance(&m, mesh, 1, 0, flags, addr));
+                let (f, sbt) = if band { (thin, 2) } else { (flags, 0) };
+                self.grass_insts.push(accel::make_instance(&m, mesh, 1, sbt, f, addr));
             }
         }
         before > 0 || !self.grass_insts.is_empty()
@@ -2768,9 +2791,10 @@ impl Renderer {
                     [crate::lawn::height(), TILE, AZIMUTHS as f32, SLOPES as f32],
                     [RES as f32, GUTTER as f32, self.atlases[l.slot].mips as f32, l.slot as f32],
                     [SLOPE_MIN, SLOPE_MAX, crate::world::park() as u32 as f32, crate::lawn::near_radius()],
+                    [crate::lawn::segments() as f32, crate::lawn::auto_short(), crate::lawn::patch_low(), crate::lawn::fade_distance()],
                 ]
             }
-            _ => [[0.0; 4]; 3],
+            _ => [[0.0; 4]; 4],
         };
         // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;

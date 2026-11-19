@@ -55,6 +55,9 @@ pub struct World {
     cover: Vec<f32>,
     /// Radius of the grown forest (beyond it the ground shader paints distant forest).
     pub forest_radius: f32,
+    /// `--lawn auto`: how long the grass is (0 short .. 255 long), COVER_RES^2 over +-NEAR_HALF
+    /// (build_grass_map; empty otherwise).
+    pub grass: Vec<u8>,
 }
 
 // ------------------------------------------------------------------------------------ noise
@@ -1227,7 +1230,7 @@ impl World {
         let xs: Vec<f32> = (0..=256).map(|i| i as f32 * 12.0 - 1536.0).collect();
         let heights = vec![0.0; xs.len() * xs.len()];
         let terrain = Self::mesh(&xs, &heights, &[], &[]);
-        World { terrain, trees: Vec::new(), xs, heights, water: Vec::new(), bank: Vec::new(), depth: Vec::new(), cover: Vec::new(), forest_radius: 0.0 }
+        World { terrain, trees: Vec::new(), xs, heights, water: Vec::new(), bank: Vec::new(), depth: Vec::new(), cover: Vec::new(), forest_radius: 0.0, grass: Vec::new() }
     }
 
     fn build_terrain() -> Self {
@@ -1258,7 +1261,7 @@ impl World {
         let bank: Vec<f32> = samples.iter().map(|s| s.2).collect();
         let depth: Vec<f32> = samples.iter().map(|s| s.3).collect();
         let terrain = Self::mesh(&xs, &heights, &depth, &bank);
-        World { terrain, trees: Vec::new(), xs, heights, water, bank, depth, cover: Vec::new(), forest_radius: 0.0 }
+        World { terrain, trees: Vec::new(), xs, heights, water, bank, depth, cover: Vec::new(), forest_radius: 0.0, grass: Vec::new() }
     }
 
     fn mesh(xs: &[f32], heights: &[f32], water: &[f32], bank: &[f32]) -> MeshData {
@@ -1322,6 +1325,55 @@ impl World {
             splat(&mut cover, res, cell, t.center.x, t.center.z, rc, 0.9);
         }
         blur(&blur(&blur(&cover, res), res), res)
+    }
+
+    /// The grass map of `--lawn auto` (lawn.rs): where the grass is long and where short, the
+    /// way a park is kept. Long under and around the trees (where a mower does not go), in the
+    /// hollows (wet, rank), and in patches of rough some hundred metres across with ragged
+    /// edges; short on the open ground between, and at the start. Smooth over a few metres.
+    pub fn build_grass_map(&mut self, trees: &[TreeAsset], cat: &Catalog) {
+        let res = COVER_RES;
+        let cell = 2.0 * NEAR_HALF / res as f32;
+        let own;
+        let crowns: &[f32] = if self.cover.is_empty() {
+            own = self.splat_cover(trees, cat);
+            &own
+        } else {
+            &self.cover
+        };
+        let mut map = vec![0u8; res * res];
+        par_rows(res, res, &mut map, |j, row| {
+            for (i, v) in row.iter_mut().enumerate() {
+                let x = (i as f32 + 0.5) * cell - NEAR_HALF;
+                let z = (j as f32 + 0.5) * cell - NEAR_HALF;
+                let rough = smoothstep(0.02, 0.2, fbm(x / 130.0, z / 130.0, 3, 401) + 0.3 * fbm(x / 26.0, z / 26.0, 2, 403) - 0.08);
+                let under = smoothstep(0.06, 0.35, crowns[j * res + i]);
+                let e = 14.0;
+                let ring = 0.25 * (self.height_at(x + e, z) + self.height_at(x - e, z) + self.height_at(x, z + e) + self.height_at(x, z - e));
+                let hollow = smoothstep(0.15, 0.7, (ring - self.height_at(x, z)) / (0.06 * e));
+                let start = smoothstep(6.0, 24.0, (x * x + z * z).sqrt());
+                let long = (rough.max(0.92 * under) + 0.5 * hollow).min(1.0) * start;
+                *v = (long * 255.0 + 0.5) as u8;
+            }
+        });
+        // (soften: the grass does not change length in a step)
+        let soft = blur(&blur(&map.iter().map(|&v| v as f32 / 255.0).collect::<Vec<_>>(), res), res);
+        self.grass = soft.iter().map(|v| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8).collect();
+    }
+
+    /// How long the grass is at (x, z), 0 short .. 1 long (1 without a grass map): the map as
+    /// the terrain shader reads it (bilinear).
+    pub fn grass_at(&self, x: f32, z: f32) -> f32 {
+        if self.grass.is_empty() {
+            return 1.0;
+        }
+        let res = COVER_RES;
+        let cell = 2.0 * NEAR_HALF / res as f32;
+        let (u, v) = (((x + NEAR_HALF) / cell - 0.5).clamp(0.0, res as f32 - 1.001), ((z + NEAR_HALF) / cell - 0.5).clamp(0.0, res as f32 - 1.001));
+        let (i, j) = (u as usize, v as usize);
+        let (fu, fv) = (u - i as f32, v - j as f32);
+        let g = |i: usize, j: usize| self.grass[j * res + i] as f32 / 255.0;
+        (g(i, j) * (1.0 - fu) + g(i + 1, j) * fu) * (1.0 - fv) + (g(i, j + 1) * (1.0 - fu) + g(i + 1, j + 1) * fu) * fv
     }
 
     /// Does the lawn grow at (x, z)? Where the renderer stands real blades near the camera

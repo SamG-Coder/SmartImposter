@@ -44,7 +44,7 @@
 
 use crate::asset::MeshData;
 use glam::Vec3;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 /// With the lawn on, how much of the short card grass (the biome's `Grass::Moist` patches) the
 /// forest scene still places, as f32 bits: the lawn is the ground cover, the patches that are
@@ -64,6 +64,67 @@ pub fn short_grass() -> f32 {
 static HEIGHT: AtomicU32 = AtomicU32::new(0x3d38_51ec); // 0.045
 pub const MEADOW: f32 = 0.22;
 pub const TALL: f32 = 0.45;
+
+/// `--lawn auto`: the grass is long where it would be left to grow (around trees, in hollows, in
+/// patches of rough) and short elsewhere. One tile, baked at the long height; the world's grass
+/// map (world.rs build_grass_map) says how much of that height stands at each place, for the
+/// layer and for the real blades alike.
+static AUTO: AtomicBool = AtomicBool::new(false);
+pub const AUTO_LONG: f32 = 0.32;
+pub const AUTO_SHORT: f32 = 0.045;
+pub fn set_auto() {
+    set_height(AUTO_LONG);
+    AUTO.store(true, Ordering::Relaxed);
+}
+/// The shortest grass of the auto mode as a part of the baked height (0 = not auto).
+pub fn auto_short() -> f32 {
+    if AUTO.load(Ordering::Relaxed) {
+        AUTO_SHORT / height()
+    } else {
+        0.0
+    }
+}
+
+/// The lawn is not one height: in patches a few metres across it stands at between this part of
+/// its height and all of it (tri.rchit `tall`). A mown lawn (the park's) nearly even, unmown
+/// grass and the forest scene's much less; the auto mode has its own map.
+pub fn patch_low() -> f32 {
+    if auto_short() > 0.0 {
+        0.88
+    } else if crate::world::park() {
+        0.86 - 0.26 * wild()
+    } else {
+        0.55
+    }
+}
+
+// (shared.glsl pcg, hash2, hashf, vnoise: the same numbers on the CPU)
+fn pcg(v: u32) -> u32 {
+    let state = v.wrapping_mul(747_796_405).wrapping_add(2_891_336_453);
+    let word = ((state >> ((state >> 28) + 4)) ^ state).wrapping_mul(277_803_737);
+    (word >> 22) ^ word
+}
+fn hashf(x: f32, y: f32) -> f32 {
+    let q = ((x.floor() as i32).wrapping_add(65536) as u32, (y.floor() as i32).wrapping_add(65536) as u32);
+    pcg(q.0 ^ pcg(q.1.wrapping_add(0x9e37_79b9))) as f32 * (1.0 / 4_294_967_295.0)
+}
+fn vnoise(x: f32, y: f32) -> f32 {
+    let (ix, iy) = (x.floor(), y.floor());
+    let (fx, fy) = (x - ix, y - iy);
+    let (ux, uy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
+    let (a, b, c, d) = (hashf(ix, iy), hashf(ix + 1.0, iy), hashf(ix, iy + 1.0), hashf(ix + 1.0, iy + 1.0));
+    let (ab, cd) = (a + (b - a) * ux, c + (d - c) * ux);
+    ab + (cd - ab) * uy
+}
+
+/// The part of its height the lawn stands at around (x, z): the patches of lawnh.glsl
+/// lawnStands, for the real blades (the renderer scales a tile to the tallest of them), so they
+/// and the layer agree.
+pub fn patch_height(x: f32, z: f32) -> f32 {
+    let t = ((0.6 * vnoise(x * 0.23 + 11.3, z * 0.23 + 11.3) + 0.4 * vnoise(x * 0.9, z * 0.9) - 0.2) / 0.6).clamp(0.0, 1.0);
+    let low = patch_low();
+    low + (1.0 - low) * t * t * (3.0 - 2.0 * t)
+}
 pub fn set_height(m: f32) {
     HEIGHT.store(m.clamp(0.02, 0.6).to_bits(), Ordering::Relaxed);
 }
@@ -75,20 +136,40 @@ pub fn height() -> f32 {
 pub fn wild() -> f32 {
     ((height() - 0.08) / 0.12).clamp(0.0, 1.0)
 }
+/// Grass quality (`--grass low|medium|high|ultra`, key B): how far the grass is drawn, the real
+/// blades around the camera and the layer beyond them alike. High is the reference; ultra is
+/// twice its distances.
+pub const QUALITIES: [(&str, f32); 4] = [("low", 0.35), ("medium", 0.65), ("high", 1.0), ("ultra", 2.0)];
+static QUALITY: AtomicU32 = AtomicU32::new(2);
+pub fn set_quality(q: usize) {
+    QUALITY.store(q.min(QUALITIES.len() - 1) as u32, Ordering::Relaxed);
+}
+pub fn quality() -> usize {
+    QUALITY.load(Ordering::Relaxed) as usize
+}
+fn reach() -> f32 {
+    QUALITIES[quality()].1
+}
+
 /// Around the camera the grass is real blades (the tile as geometry) out to this distance (m),
-/// 0 = the layer only (`--lawn-near`; negative = by the height: 4 m of a lawn, 29 m of tall
-/// grass). As f32 bits.
+/// 0 = the layer only (`--lawn-near`; negative = by the height and the quality: at high, 4 m of
+/// a lawn, 29 m of tall grass). As f32 bits.
 static NEAR: AtomicU32 = AtomicU32::new(0xbf80_0000); // -1
 pub fn set_near(m: f32) {
-    NEAR.store(m.min(40.0).to_bits(), Ordering::Relaxed);
+    NEAR.store(m.min(80.0).to_bits(), Ordering::Relaxed);
 }
 pub fn near_radius() -> f32 {
     let m = f32::from_bits(NEAR.load(Ordering::Relaxed));
     if m < 0.0 {
-        (64.0 * height()).clamp(4.0, 30.0)
+        (64.0 * height()).clamp(4.0, 30.0) * reach()
     } else {
         m
     }
+}
+
+/// Beyond this distance (m) the layer has faded into the ground texture.
+pub fn fade_distance() -> f32 {
+    220.0 * reach()
 }
 
 /// Edge of the square that is baked and repeated (m): four blade heights, 1.5 mm a texel for a
@@ -109,6 +190,16 @@ pub const RES: u32 = 320;
 pub const GUTTER: u32 = 20;
 /// Blades in the tile (a lawn: 30,000 a square metre; taller grass has larger, fewer blades).
 const BLADES: usize = 5300;
+
+/// Segments of a blade (long blades arch: more of them). Each blade is 2 x this many triangles
+/// in a row in the tile's mesh (tri.rahit finds a triangle's blade from that).
+pub fn segments() -> usize {
+    if wild() > 0.3 && auto_short() == 0.0 {
+        6
+    } else {
+        4
+    }
+}
 
 /// How many copies of the tile the bake needs on each side of it: the flattest view's rays run
 /// SLOPE_MAX blade heights sideways before they reach the ground.
@@ -135,8 +226,16 @@ pub fn tile() -> MeshData {
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
     let (height, wild) = (height(), wild());
     // (blades grow with the grass: 2.4-3.6 mm wide in a lawn, 6-9 mm in tall grass)
-    let grown = (height / 0.045).sqrt().min(2.6);
-    let n = BLADES;
+    let mut grown = (height / 0.045).sqrt().min(2.6);
+    let mut n = BLADES;
+    // The auto mode's blades also stand as its short grass, at a part of their height (the tile
+    // is squashed): thin, nearly upright (an arching blade squashed lies flat) and many, so the
+    // short grass is still a lawn.
+    let auto = auto_short() > 0.0;
+    if auto {
+        grown = 1.3;
+        n = 20_000;
+    }
     // (a clump: where it stands and its shade of green, which its blades share)
     let clumps: Vec<[f32; 3]> = (0..n / 28).map(|_| [rng.f() * TILE, rng.f() * TILE, rng.f()]).collect();
     // Taller and shorter patches a hand across (wrapping round the tile): what is left of the
@@ -146,9 +245,8 @@ pub fn tile() -> MeshData {
         0.5 + 0.25 * ((2.0 * u + 1.3).sin() * (3.0 * v + 0.4).cos() + (3.0 * u - 2.0 * v + 2.1).sin())
     };
     let mut m = MeshData { name: "lawn tile".into(), positions: Vec::new(), normals: Vec::new(), uvs: Vec::new(), indices: Vec::new(), materials: Vec::new(), grid: 0 };
-    // (long blades arch: more segments)
     #[allow(non_snake_case)]
-    let SEG: usize = if wild > 0.3 { 6 } else { 4 };
+    let SEG: usize = segments();
     for _ in 0..n {
         // most blades stand in clumps a couple of centimetres across, the rest anywhere
         let (bx, bz, shade) = if rng.f() < 0.7 {
@@ -160,9 +258,12 @@ pub fn tile() -> MeshData {
         };
         // a mown lawn: blades cut to about one length, standing; unmown: every length, arching
         let (r_len, r_bend) = (rng.f(), rng.f() * rng.f());
-        let stalk = rng.f() < 0.022 * wild;
+        let stalk = rng.f() < if auto { 0.006 } else { 0.022 * wild };
         let mut length = height * ((0.5 + 0.5 * r_len.powf(0.6)) * (1.0 - wild) + (0.32 + 0.68 * r_len.powf(0.8)) * wild) * (0.78 + 0.22 * patches(bx, bz));
         let mut bend = (0.12 + 0.8 * r_bend + wild * (0.1 + 0.45 * r_len)).min(0.95); // how far the tip hangs over, x its length
+        if auto {
+            bend = 0.05 + 0.3 * r_bend;
+        }
         let az = rng.f() * std::f32::consts::TAU;
         let lean = Vec3::new(az.cos(), 0.0, az.sin());
         let twist = (rng.f() - 0.5) * 1.2;

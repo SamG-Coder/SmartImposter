@@ -14,7 +14,7 @@
 #define FLAG_LAWN 8192u   // a blade of the lawn (lawn.glsl): an impostor hit on the ground
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
-#define MAX_GROUND_TEX 80 // 3 per ground layer (26 layers); the last two slots are the far / near masks
+#define MAX_GROUND_TEX 81 // 3 per ground layer (26 layers); then the grass map (--lawn auto) and the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
 #define NEAR_HALF 2048.0
 #define TERRAIN_HALF 60000.0

@@ -30,6 +30,7 @@ struct Globals {
     vec4 lawn;      // forest scene lawn (lawn.rs): x blade height m (0 = no lawn), y tile m, zw views (azimuths, slopes)
     vec4 lawn2;     //   x texels per view, y gutter texels, z atlas levels, w atlas slot
     vec4 lawn3;     //   xy slope (cot elevation) of the steepest and flattest views, z 1 = the park (--park: watered, no dried grass), w real blades around the camera to this distance (m)
+    vec4 lawn4;     //   x segments of a blade, y auto mode: the short grass as a part of the baked height (0 = not auto), z the low end of the height patches, w the distance (m) by which the layer has faded into the ground texture
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).

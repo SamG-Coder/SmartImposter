@@ -227,6 +227,8 @@ fn parse_args() -> Args {
                 match next.as_str() {
                     "meadow" => lawn::set_height(lawn::MEADOW),
                     "tall" => lawn::set_height(lawn::TALL),
+                    // long where grass is left to grow, short elsewhere (world.rs build_grass_map)
+                    "auto" => lawn::set_auto(),
                     _ => {}
                 }
                 if a.imp.lawn {
@@ -246,6 +248,11 @@ fn parse_args() -> Args {
                     lawn::set_near(m.max(0.0));
                 }
             }
+            // `--grass low|medium|high|ultra`: how far the lawn is drawn (lawn.rs; key B)
+            "--grass" => match lawn::QUALITIES.iter().position(|q| q.0 == next) {
+                Some(q) => lawn::set_quality(q),
+                None => eprintln!("unknown --grass {next} (low, medium, high or ultra)"),
+            },
             "--species" => a.species = Some(next),
             "--lod2" => a.lod2 = next.parse().unwrap_or(100.0),
             "--lod-band" => a.lod_band = next.parse().unwrap_or(12.0),
@@ -520,7 +527,7 @@ impl App {
         };
         println!("World: {} trees, terrain {} tris ({:.2}s)", world.trees.len(), world.terrain.tri_count(), t.elapsed().as_secs_f32());
         // Walking (not on the globe; a capture run keeps the camera it was given unless asked)
-        let walk_on = !a.globe && a.walk.unwrap_or(park && a.shot.is_none() && a.bench_move == 0.0 && !a.fly);
+        let walk_on = a.walk.unwrap_or(park && a.shot.is_none() && a.bench_move == 0.0 && !a.fly);
 
         let size = window.inner_size();
         let r = Renderer::new(
@@ -864,9 +871,9 @@ impl App {
                 s.cam.pitch = s.pitch_target;
             }
             let (fwd, right, _) = s.cam.basis();
-            let walking = s.walk.on && s.geo.is_none();
+            let walking = s.walk.on;
             if walking {
-                // on foot (walk.rs): along the ground, with gravity; trunks are solid
+                // on foot (walk.rs): along the ground, with gravity
                 let keys = walk::Input {
                     forward: input.z,
                     right: input.x,
@@ -874,14 +881,27 @@ impl App {
                     run: k(KeyCode::ShiftLeft),
                     crouch: k(KeyCode::ControlLeft),
                 };
-                let world = &s.r.world;
-                let trunks = s.trunks.get_or_insert_with(|| {
-                    let t = Instant::now();
-                    let trunks = walk::Trunks::build(world, &s.r.pack, &s.r.catalog);
-                    println!("Walking: {} solid trunks ({:.2}s)", trunks.count, t.elapsed().as_secs_f32());
-                    trunks
-                });
-                s.walk.step(|x, z| (world.height_at(x, z), world.surface_at(x, z)), trunks, &mut s.cam.pos, &mut s.vel, s.cam.yaw, keys, dt);
+                if let (Some(geo), Some(scene)) = (&s.geo, &s.r.globe) {
+                    // the globe: in the camera's frame on the Earth, the ground's height relative
+                    // to where the camera is (the move then goes onto the Earth position, below)
+                    let (ecef, to_earth, r0) = (geo.ecef, geo.frame.transpose(), geo.ecef.length());
+                    let terrain = &scene.terrain;
+                    let ground = |x: f32, z: f32| {
+                        let h = (globe::tiles::ground_radius(terrain, ecef + to_earth * DVec3::new(x as f64, 0.0, z as f64)) - r0) as f32;
+                        (h, h)
+                    };
+                    s.walk.step(ground, &walk::Trunks::none(), &mut s.cam.pos, &mut s.vel, s.cam.yaw, keys, dt);
+                } else {
+                    // (the forest scene, a site, the park, the gallery: trunks are solid)
+                    let world = &s.r.world;
+                    let trunks = s.trunks.get_or_insert_with(|| {
+                        let t = Instant::now();
+                        let trunks = walk::Trunks::build(world, &s.r.pack, &s.r.catalog);
+                        println!("Walking: {} solid trunks ({:.2}s)", trunks.count, t.elapsed().as_secs_f32());
+                        trunks
+                    });
+                    s.walk.step(|x, z| (world.height_at(x, z), world.surface_at(x, z)), trunks, &mut s.cam.pos, &mut s.vel, s.cam.yaw, keys, dt);
+                }
             } else {
                 let wish = if input != Vec3::ZERO {
                     (right * input.x + Vec3::Y * input.y + fwd * input.z).normalize() * speed
@@ -894,7 +914,7 @@ impl App {
                 }
                 s.cam.pos += s.vel * dt;
             }
-            if walking {
+            if walking && s.geo.is_none() {
                 // (the walk keeps the eye over the ground itself)
             } else if let (Some(geo), Some(scene)) = (s.geo.as_mut(), &s.r.globe) {
                 // globe: the move goes onto the Earth position; the frame follows the camera
@@ -1035,7 +1055,7 @@ impl App {
             ocean: [[0.0; 4]; 3],
             cloud: [self.args.cloud_cover, if s.clouds && s.geo.is_some() { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
             biome: biome::current().ground_packed(),
-            lawn: [[0.0; 4]; 3], // (set by the renderer)
+            lawn: [[0.0; 4]; 4], // (set by the renderer)
         };
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -1135,7 +1155,7 @@ impl App {
                 format!("{} ({rate}; , . time, / speed) | {:.0} m/s", globe::sky::format_utc(geo.time), s.base_speed)
             } else if s.fly_on {
                 "AUTO fly (F to stop)".to_string()
-            } else if s.walk.on {
+            } else if s.walk.on && s.geo.is_none() {
                 format!("walking (V to fly{})", if s.captured { "" } else { ", click to look" })
             } else {
                 format!("manual {:.0} m/s{}{}", s.base_speed, if s.cinematic { ", cinematic" } else { "" }, if s.captured { "" } else { ", click to look" })
@@ -1188,8 +1208,14 @@ impl App {
                 }
             }
             KeyCode::KeyC => s.cinematic = !s.cinematic,
-            // on foot / flying (not on the globe)
-            KeyCode::KeyV if s.geo.is_none() => {
+            // grass quality: low, medium, high, ultra (how far the lawn is drawn)
+            KeyCode::KeyB => {
+                lawn::set_quality((lawn::quality() + 1) % lawn::QUALITIES.len());
+                println!("Grass: {} (real blades to {:.0} m, the layer to {:.0} m)", lawn::QUALITIES[lawn::quality()].0, lawn::near_radius(), lawn::fade_distance());
+                s.r.reset_taa();
+            }
+            // on foot / flying (any scene)
+            KeyCode::KeyV => {
                 s.walk.on = !s.walk.on;
                 s.fly_on = false;
                 s.yaw_target = s.cam.yaw;

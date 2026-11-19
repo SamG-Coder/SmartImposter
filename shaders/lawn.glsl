@@ -8,8 +8,6 @@
 //     uv = (P.xz + f.xz / f.y * (H - P.y)) / T        height = P.y / H
 // which is linear in P: a ray is a straight line in every frame, as for the plant impostors.
 
-#define LAWN_FADE 220.0 // lawn.rs FADE
-
 struct Lawn {
     uint slot;      // atlas slot
     float H, T;     // blade height (m), tile edge (m)

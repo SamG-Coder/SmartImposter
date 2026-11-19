@@ -14,9 +14,35 @@ layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[];
 layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
 layout(set = 0, binding = 12, scalar) readonly buffer Insts { InstInfo insts[]; };
 layout(set = 0, binding = 13) uniform sampler2D matTex[6 * MAX_SPECIES];
+layout(set = 0, binding = 16) uniform sampler2D groundTex[MAX_GROUND_TEX]; // (the grass map: lawnh.glsl)
+#include "lawnh.glsl"
 
 void main() {
     MeshInfo m = meshes[gl_InstanceCustomIndexEXT & 0x7FFu];
+    if ((m.flags & 2u) != 0u) {
+        // The lawn's real blades around the camera (renderer.rs place_grass).
+        // (A blade is a run of triangles and of vertices in the tile's mesh.)
+        if (g.lodParams.z < -0.5 || g.lawn3.w <= 0.0) return;
+        uint per = uint(g.lawn4.x) * 2u;
+        uint blade = gl_PrimitiveID / per;
+        vec3 root = gl_ObjectToWorldEXT * vec4(Vec3Ref(m.pos).v[blade * (per + 2u)], 1.0);
+        // Its height: a tile is one instance, scaled to the tallest its blades stand; each blade
+        // is trimmed to what the lawn stands at where its root is, the same continuous field as
+        // the layer's. No step from one tile to the next.
+        float above = (gl_ObjectRayOriginEXT.y + gl_ObjectRayDirectionEXT.y * gl_HitTEXT) * gl_ObjectToWorldEXT[1].y;
+        if (above > g.lawn.x * lawnStands(root.xz) + 0.002) {
+            ignoreIntersectionEXT;
+            return;
+        }
+        // In the band where the terrain's layer takes over, whole blades go, one by one, by how
+        // far their root is from the camera.
+        float gone = smoothstep(0.55, 0.97, distance(g.camPos.xyz, root) / g.lawn3.w);
+        // (the same for a blade wherever the camera is: its tile's place and its number)
+        ivec2 tile = ivec2(floor(root.xz / g.lawn.y));
+        uint h = pcg(blade * 2654435761u ^ pcg(uint(tile.x) * 0x9E3779B9u ^ pcg(uint(tile.y) + 0x51u)));
+        if (float(h) * (1.0 / 4294967296.0) < gone) ignoreIntersectionEXT;
+        return;
+    }
     if ((m.flags & 1u) != 0u && g.params.y > 0.5) {
         uvec3 tri = UVec3Ref(m.idx).v[gl_PrimitiveID];
         Vec2Ref UV = Vec2Ref(m.uv);
