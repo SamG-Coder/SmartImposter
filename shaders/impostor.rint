@@ -42,6 +42,31 @@ vec2 atlasUV(Ctx m, vec2 cell, vec2 uv) {
 
 bool inFrame(vec2 uv) { return all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0))); }
 
+// A small live atlas has gaps only a texel wide. Marching them as solid height-field walls
+// stretches leaves into ribbons at oblique angles. Project once using a coarse depth, then
+// test one fine coverage sample and use its depth for ordering and shadow-ray intervals.
+bool projectCrown(Ctx m, vec2 cell, vec3 o, vec3 d, float t0, float t1, inout uint seed,
+                  out float th, out vec2 uv) {
+    vec3 f = frameDir(cell, m.N), r, up;
+    frameBasis(f, r, up);
+    float df = dot(d, f);
+    if (abs(df) < 1e-5) return false;
+    float tc = dot(m.c-o, f) / df;
+    vec3 q = o + tc*d - m.c;
+    uv = 0.5 + vec2(dot(q,r),dot(q,up)) * (0.5/m.ext);
+    vec2 coarse = textureLod(depthAtlas[nonuniformEXT(m.vid)], atlasUV(m,cell,uv),max(2.0,m.lod)).rg;
+    float front = (coarse.x*2.0-1.0) * smoothstep(0.0,0.45,coarse.y);
+    uv += vec2(dot(d,r),dot(d,up)) * (0.5/m.ext) * (front*m.R/df);
+    if (!inFrame(uv)) return false;
+    // Stochastic bilinear filtering keeps empty texels' black albedo out of surviving hits.
+    vec2 levelRes = m.res * exp2(-m.marchLod);
+    vec2 jitter = vec2(rnd(seed),rnd(seed));
+    uv = (clamp(floor(uv*levelRes-0.5+jitter),vec2(0),levelRes-1.0)+0.5)/levelRes;
+    vec2 depth = textureLod(depthAtlas[nonuniformEXT(m.vid)],(cell+uv)/m.N,m.marchLod).rg;
+    th = tc + (depth.x*2.0-1.0)*m.R/df;
+    return depth.y > m.thr && th >= t0 && th <= t1;
+}
+
 // Height-field test in frame space: is the point at or behind the first surface seen from the frame?
 // thick > 0 limits the solid to a shell behind the surface (foliage clumps are not infinitely deep),
 // which stops rays seen from below from hitting the extruded underside of protruding clumps.
@@ -248,7 +273,13 @@ void main() {
         m.marchLod = floor(m.lod + 0.5);
         float th;
         vec2 uvh;
-        if (marchFrame(m, cellS, o, -d, -t1, -t0, 40, 0.0, true, true, th, uvh)) {
+        bool blocked;
+        if (info.bmax.w > 0.5) {
+            blocked = projectCrown(m,cellS,o,-d,-t1,-t0,seed,th,uvh);
+        } else {
+            blocked = marchFrame(m, cellS, o, -d, -t1, -t0, 40, 0.0, true, true, th, uvh);
+        }
+        if (blocked) {
             hit.albedoAo = 0u;
             hit.normal = 0u;
             hit.vis = 0u;
@@ -261,11 +292,17 @@ void main() {
     // frame and tree). Each sample is a crisp, single-view image of the tree; TAA averages the
     // choices over time. Blending three views per sample instead mixes slightly misaligned images:
     // ghosting and a smeared, painterly look. (Also 3x cheaper.)
-    vec2 cell = pickFrame(m, -dn, lodRand(g, tree, 3u));
+    // The whole live crown shares a view triangle. Choosing frames from individual rays
+    // in a close perspective view otherwise picks an elevated frame just for the trunk foot.
+    vec3 view = info.bmax.w > 0.5 ? normalize(Minv*(camO-po)-m.c) : -dn;
+    vec2 cell = pickFrame(m, view, lodRand(g, tree, 3u));
 
     float th;
     vec2 uvh;
-    if (!marchFrame(m, cell, o, d, t0, t1, 40, 0.0, true, false, th, uvh)) return;
+    if (info.bmax.w > 0.5) {
+        if (!projectCrown(m,cell,o,d,t0,t1,seed,th,uvh)) return;
+        m.lod = m.marchLod;
+    } else if (!marchFrame(m, cell, o, d, t0, t1, 40, 0.0, true, false, th, uvh)) return;
     vec2 auv = atlasUV(m, cell, uvh);
     vec4 a = textureLod(albedoAtlas[nonuniformEXT(vid)], auv, m.lod);
     vec2 nxy = textureLod(normalAtlas[nonuniformEXT(vid)], auv, m.lod).rg * 2.0 - 1.0;

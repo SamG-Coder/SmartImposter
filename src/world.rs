@@ -868,6 +868,13 @@ fn grow_forest_cached(world: &World, radius: f32, avail: [bool; 6], spacing: f32
 // ------------------------------------------------------------------------------------ world
 
 impl World {
+    /// One specimen at the origin for registered scan and procedural comparisons.
+    pub fn specimen(tree: &TreeAsset, variant: usize) -> Self {
+        let mut world = Self::build_flat();
+        world.trees.push(TreeInstance { xform: Affine3A::IDENTITY, center: (tree.bmin + tree.bmax) * 0.5, variant: variant as u8, seed: 0, dry: 0 });
+        world
+    }
+
     /// Flat test scene: every variant on a flat plane, one row per species.
     pub fn gallery(trees: &[TreeAsset], cat: &Catalog) -> Self {
         let mut w = Self::build_flat();

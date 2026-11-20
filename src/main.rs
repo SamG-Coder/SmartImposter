@@ -20,6 +20,7 @@ mod globe;
 mod lawn;
 mod gamepad;
 mod pilot;
+mod procedural_tree;
 mod textures;
 mod tour;
 mod walk;
@@ -42,6 +43,10 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 struct Args {
     asset: String,
+    procedural_tree: Option<String>,
+    tree_seed: u32,
+    tree_bench: u32,
+    specimen: Option<String>,
     width: u32,
     height: u32,
     shot: Option<String>,
@@ -117,6 +122,10 @@ struct Args {
 fn parse_args() -> Args {
     let mut a = Args {
         asset: "assets/black_alder.mtree".into(),
+        procedural_tree: None,
+        tree_seed: 0,
+        tree_bench: 0,
+        specimen: None,
         width: 1920,
         height: 1080,
         shot: None,
@@ -132,7 +141,7 @@ fn parse_args() -> Args {
         sun: [35.0, 38.0],
         time: None,
         time_rate: None,
-        imp: ImpostorSettings { grid: 12, texel: 0.055, max_res: 448, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12, lawn: false },
+        imp: ImpostorSettings { grid: 12, texel: 0.055, max_res: 448, ss: 3, ao_rays: 6, ao_range: 1.5, vis_rays: 12, lawn: false, memory_only: false },
         species: None,
         lod2: 100.0,
         lod_band: 12.0,
@@ -166,6 +175,15 @@ fn parse_args() -> Args {
         test_flight: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // A small live bake. Explicit resolution and view-grid arguments still take precedence.
+    if args.iter().any(|s| s == "--procedural-tree" || s == "--specimen") {
+        a.imp.memory_only = true;
+        a.imp.grid = 6;
+        a.imp.max_res = 128;
+        a.imp.ss = 2;
+        a.imp.ao_rays = 1;
+        a.imp.vis_rays = 3;
+    }
     let mut i = 0;
     let mut lawn_given = false;
     let mut at_given = false;
@@ -174,6 +192,10 @@ fn parse_args() -> Args {
         let next = args.get(i + 1).cloned().unwrap_or_default();
         match args[i].as_str() {
             "--asset" => a.asset = next,
+            "--procedural-tree" => a.procedural_tree = Some(next),
+            "--tree-seed" => a.tree_seed = next.parse().expect("expected a u32 tree seed"),
+            "--tree-bench" => a.tree_bench = next.parse().expect("expected a regrowth count"),
+            "--specimen" => a.specimen = Some(next),
             "--size" => {
                 let v: Vec<u32> = next.split('x').filter_map(|v| v.parse().ok()).collect();
                 if v.len() == 2 {
@@ -361,6 +383,9 @@ impl Camera {
 }
 
 struct State {
+    tree_recipe: Option<procedural_tree::Recipe>,
+    tree_seed: u32,
+    tree_timings: Vec<[f64; 2]>,
     window: Arc<Window>,
     r: Renderer,
     cam: Camera,
@@ -484,6 +509,19 @@ pub fn save_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<()> {
     Ok(())
 }
 
+impl State {
+    fn regrow(&mut self) -> Result<[f64; 2]> {
+        let recipe = self.tree_recipe.as_ref().expect("regrowth requires a procedural tree");
+        let seed = self.tree_seed.wrapping_add(1);
+        let times = self.r.regrow_tree(recipe, seed)?;
+        self.tree_seed = seed;
+        self.prev_cam = None;
+        self.fingerprint.clear();
+        self.trunks = None;
+        Ok(times)
+    }
+}
+
 impl App {
     fn init(&mut self, el: &ActiveEventLoop) -> Result<()> {
         let a = &self.args;
@@ -498,7 +536,32 @@ impl App {
             std::env::set_var("SI_DUMP_ATLAS", prefix);
         }
         let t = Instant::now();
-        let (pack, cat) = catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?;
+        let recipe = a.procedural_tree.as_deref().map(|p| procedural_tree::Recipe::load(p.as_ref())).transpose()?;
+        if a.imp.memory_only {
+            anyhow::ensure!(a.imp.grid >= 2 && a.imp.max_res >= 32 && a.imp.max_res % 32 == 0, "live bakes need at least two views per side and a resolution in multiples of 32");
+        }
+        let (pack, cat) = if let Some(recipe) = &recipe {
+            let start = Instant::now();
+            let pack = recipe.build(a.tree_seed);
+            let mesh_bytes: usize = pack.meshes.iter().map(|m| 4*(m.positions.len()+m.normals.len()+m.uvs.len()+m.indices.len())+m.materials.len()).sum();
+            println!("Procedural {} seed {}: {:.3} ms cold geometry, {} mesh payload bytes, {} occupied part bytes. R regrows the tree.",
+                recipe.name,a.tree_seed,start.elapsed().as_secs_f64()*1000.0,mesh_bytes,pack.trees[0].parts.len()*std::mem::size_of::<asset::TreePart>());
+            let cat = catalog::Catalog::procedural(&pack, recipe);
+            (pack,cat)
+        } else {
+            catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?
+        };
+        anyhow::ensure!(a.tree_bench == 0 || recipe.is_some(), "--tree-bench requires --procedural-tree");
+        let specimen = if let Some(name) = &a.specimen {
+            Some(pack.trees.iter().position(|t| &t.name == name).ok_or_else(|| anyhow::anyhow!("unknown specimen {name}"))?)
+        } else {
+            (recipe.is_some() && !a.globe && !a.park && !a.gallery && a.site.is_none() && a.biome.is_none() && !std::env::args().any(|s| s == "--radius")).then_some(0)
+        };
+        let specimen_cam = specimen.map(|v| {
+            let tree = &pack.trees[v];
+            let c = (tree.bmin + tree.bmax) * 0.5;
+            [c.x,c.y,c.z + (tree.bmax-tree.bmin).length()*1.1,0.0,0.0]
+        });
         let tris: usize = pack.meshes.iter().map(|m| m.tri_count() as usize).sum();
         println!(
             "Catalog: {} species, {} variants, {} unique meshes, {:.1}M unique triangles",
@@ -541,6 +604,8 @@ impl App {
         }
         let world = if a.globe {
             world::World::empty()
+        } else if let Some(v) = specimen {
+            world::World::specimen(&pack.trees[v],v)
         } else if a.gallery {
             world::World::gallery(&pack.trees, &cat)
         } else if park {
@@ -574,7 +639,7 @@ impl App {
             aircraft,
         )?;
         let start_y = r.world.surface_at(0.0, 0.0) + 1.8;
-        let cam = match a.cam {
+        let cam = match a.cam.or(specimen_cam) {
             Some(c) => Camera { pos: Vec3::new(c[0], c[1], c[2]), yaw: c[3].to_radians(), pitch: c[4].to_radians(), fov_y: 60f32.to_radians() },
             None => Camera { pos: Vec3::new(0.0, start_y, 0.0), yaw: 0.0, pitch: 0.05, fov_y: 60f32.to_radians() },
         };
@@ -597,6 +662,9 @@ impl App {
         };
         let (cam_yaw, cam_pitch) = (cam.yaw, cam.pitch);
         let mut state = State {
+            tree_recipe: recipe,
+            tree_seed: a.tree_seed,
+            tree_timings: Vec::new(),
             window,
             r,
             cam,
@@ -714,6 +782,20 @@ impl App {
         let shot_frames = self.args.frames.max(1);
         let views = self.args.views.clone();
         let Some(s) = self.state.as_mut() else { return Ok(()) };
+        // Exercise the same replacement as the R key, with a real draw between successive
+        // seeds. The requested stills start after the final replacement has settled.
+        let measuring = s.tree_timings.len() < self.args.tree_bench as usize;
+        if measuring && s.frame > 0 {
+            let sample = s.regrow()?;
+            s.tree_timings.push(sample);
+            if s.tree_timings.len() == self.args.tree_bench as usize {
+                for (column, label) in ["grow CPU", "grow + GPU atlas ready"].iter().enumerate() {
+                    s.tree_timings.sort_by(|a, b| a[column].total_cmp(&b[column]));
+                    let pct = |p: usize| s.tree_timings[(s.tree_timings.len() * p).div_ceil(100) - 1][column];
+                    println!("Tree bench {label}, {} displayed seeds: median {:.3} ms, p95 {:.3} ms, max {:.3} ms", s.tree_timings.len(), pct(50), pct(95), pct(100));
+                }
+            }
+        }
         // Multi-view capture: `frames` frames per view, then jump to the next camera.
         let view = (s.rendered / shot_frames) as usize;
         if !views.is_empty() && s.rendered % shot_frames == 0 && view < views.len() {
@@ -1139,7 +1221,7 @@ impl App {
             s.r.ac_pose = Some(p.fill(&mut g, geo.frame, geo.ecef));
         }
         let last_view = views.is_empty() || view + 1 >= views.len();
-        let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
+        let shot_due = !measuring && shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
         let capture = shot_due || s.capture_next;
         // globe: a view is only captured once its terrain and trees have streamed in
         let settling = self.args.bench_move == 0.0 && s.tour.is_none() && s.pilot.is_none() && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
@@ -1157,7 +1239,7 @@ impl App {
                 }
             }
             s.frame_times.clear();
-        } else {
+        } else if !measuring {
             s.settle = 0;
             s.rendered += 1;
         }
@@ -1295,6 +1377,12 @@ impl App {
             }
         }
         match code {
+            KeyCode::KeyR if s.tree_recipe.is_some() => {
+                match s.regrow() {
+                    Ok([cpu,ready]) => println!("Tree seed {}: grow {:.3} ms, atlas ready {:.3} ms",s.tree_seed,cpu,ready),
+                    Err(e) => { eprintln!("Tree regrowth failed: {e:#}"); el.exit(); }
+                }
+            }
             KeyCode::Escape => {
                 if s.captured {
                     s.captured = false;
