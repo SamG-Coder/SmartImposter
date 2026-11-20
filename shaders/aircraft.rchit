@@ -32,7 +32,9 @@ void main() {
 
     uint word = UintRef(m.mat).v[gl_PrimitiveID >> 2];
     AcMaterial mt = acMats[(word >> ((gl_PrimitiveID & 3u) * 8u)) & 0xFFu];
-    vec3 albedo = mt.base.rgb;
+    CraftRec craft = crafts[gl_InstanceCustomIndexEXT >> 11];
+    // (its squadron's colour on what is not the painted skin: the drones, the trucks)
+    vec3 albedo = mt.base.rgb * craft.info.yzw;
     float metal = mt.mre.x, rough = mt.mre.y;
     if (mt.mre.z > 0.5) {
         Vec2Ref T = Vec2Ref(m.uv);
@@ -46,7 +48,7 @@ void main() {
         rough = orm.g;
         metal = orm.b;
         // its squadron's colours (--battle)
-        albedo = liveryColour(int(crafts[gl_InstanceCustomIndexEXT >> 11].info.x), uv, albedo, metal);
+        albedo = liveryColour(int(craft.info.x), uv, albedo, metal);
         // The normal map's two axes: along the atlas (aft on the aircraft), and up it: to the
         // right in the drawings from above and below (the atlas's first 5248 rows of 8192,
         // counted from the bottom), upwards in the two from the side.

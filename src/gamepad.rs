@@ -31,6 +31,8 @@ pub struct Pad {
     pub zoom: f64,
     /// B / Circle or X / Square held: fire (--battle)
     pub fire: bool,
+    /// the left stick pressed in: out of the aircraft, or into another (--battle)
+    pub eject: bool,
 }
 
 /// A stick's raw position to what it asks for: nothing inside the dead zone (a stick at rest is
@@ -164,6 +166,7 @@ impl SonyState {
             restart: self.restart,
             zoom: if matches!(dpad, 0 | 1 | 7) { 1.0 } else if matches!(dpad, 3..=5) { -1.0 } else { 0.0 },
             fire: r.b0 & 0x50 != 0,
+            eject: r.b1 & 0x40 != 0,
         };
         (self.view, self.restart) = (false, false);
         pad
@@ -237,6 +240,7 @@ impl Pads {
         pad.brake = g.is_pressed(Button::South);
         pad.zoom = held(Button::DPadUp) - held(Button::DPadDown);
         pad.fire = g.is_pressed(Button::East) || g.is_pressed(Button::West);
+        pad.eject = g.is_pressed(Button::LeftThumb);
         pad
     }
 }

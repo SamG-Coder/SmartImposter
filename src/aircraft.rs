@@ -33,7 +33,8 @@ pub struct MaterialGpu {
 
 pub struct Model {
     pub parts: Vec<Part>,
-    /// one mesh per part, in the part's own frame (about its pivot); then the rocket
+    /// one mesh per part, in the part's own frame (about its pivot); then the rocket and the
+    /// other things of --battle, in the order of Craft::kind
     pub meshes: Vec<MeshData>,
     pub materials: Vec<MaterialGpu>,
     pub dir: PathBuf,
@@ -88,8 +89,9 @@ pub fn load(path: &Path) -> Result<Model> {
         meshes.push(MeshData { name: format!("aircraft {name}"), positions, normals, uvs, indices: (0..3 * n as u32).collect(), materials, grid: 0 });
         parts.push(Part { name, pivot: Vec3::new(v[0], v[1], v[2]), axis: Vec3::new(v[3], v[4], v[5]), glass: flags & 1 != 0 });
     }
-    // (after the parts: the rocket of --battle)
+    // (after the parts: the rocket of --battle, and the rest of what it draws)
     meshes.push(rocket(&mut materials));
+    meshes.extend(extras(&mut materials));
     Ok(Model { parts, meshes, materials, dir: path.parent().unwrap_or(Path::new(".")).to_path_buf() })
 }
 
@@ -174,8 +176,21 @@ impl Pose {
 pub struct Craft {
     pub pose: Pose,
     pub livery: u32,
-    pub rocket: bool,
+    /// what it is: an aircraft (0), or one of the meshes after the aircraft's parts
+    pub kind: u8,
+    /// its squadron's colour, on everything of it that is not the aircraft's painted skin
+    pub tint: [f32; 3],
 }
+
+pub const KIND_JET: u8 = 0;
+pub const KIND_ROCKET: u8 = 1;
+pub const KIND_DRONE: u8 = 2;
+pub const KIND_LAUNCHER: u8 = 3;
+pub const KIND_GUN: u8 = 4;
+/// the pilot's own, on foot: the gun's body, its barrels (which turn), the parachute
+pub const KIND_MINIGUN: u8 = 5;
+pub const KIND_BARRELS: u8 = 6;
+pub const KIND_CANOPY: u8 = 7;
 
 /// A piece of smoke or fire as fx.rint reads it (shaders/fx.glsl): a tube of Gaussian section
 /// from `a` to `b` in the renderer's frame (a ball where they are the same).
@@ -240,4 +255,228 @@ pub fn rocket(materials: &mut Vec<MaterialGpu>) -> MeshData {
     let n = mats.len();
     mats.resize((n + 3) & !3, 0);
     MeshData { name: "rocket".into(), positions, normals, uvs: vec![0.0; 6 * n], indices: (0..3 * n as u32).collect(), materials: mats, grid: 0 }
+}
+/// Triangles being put together into a mesh (the made-up things of --battle).
+struct Shape {
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    mats: Vec<u8>,
+}
+
+impl Shape {
+    fn new() -> Self {
+        Shape { positions: Vec::new(), normals: Vec::new(), mats: Vec::new() }
+    }
+
+    fn tri(&mut self, p: [Vec3; 3], n: [Vec3; 3], m: u8) {
+        for k in 0..3 {
+            self.positions.extend_from_slice(&p[k].to_array());
+            self.normals.extend_from_slice(&n[k].to_array());
+        }
+        self.mats.push(m);
+    }
+
+    /// A flat four-sided face.
+    fn quad(&mut self, p: [Vec3; 4], m: u8) {
+        let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or(Vec3::Y);
+        self.tri([p[0], p[1], p[2]], [n; 3], m);
+        self.tri([p[0], p[2], p[3]], [n; 3], m);
+    }
+
+    /// A box of half size `h` about `c`, tipped up by `pitch` (its front, -z, rising) about the
+    /// x axis through `pivot`.
+    fn boxed(&mut self, c: Vec3, h: Vec3, pivot: Vec3, pitch: f32, m: u8) {
+        let turn = Quat::from_rotation_x(pitch);
+        let at = |q: Vec3| pivot + turn * (c + q * h - pivot);
+        for (a, b, d) in [(Vec3::X, Vec3::Y, Vec3::Z), (Vec3::Y, Vec3::Z, Vec3::X), (Vec3::Z, Vec3::X, Vec3::Y)] {
+            for s in [-1.0f32, 1.0] {
+                let f = |u: f32, v: f32| at(a * s + b * u + d * v);
+                self.quad([f(-1.0, -1.0), f(1.0, -1.0), f(1.0, 1.0), f(-1.0, 1.0)], m);
+            }
+        }
+    }
+
+    /// A round tube from `a` to `b`, its radius `ra` at one end and `rb` at the other, closed.
+    fn tube(&mut self, a: Vec3, b: Vec3, ra: f32, rb: f32, seg: usize, m: u8) {
+        let u = (b - a).normalize_or(Vec3::Z);
+        let v = u.any_orthonormal_vector();
+        let w = u.cross(v);
+        let ring = |i: usize| {
+            let t = i as f32 / seg as f32 * std::f32::consts::TAU;
+            v * t.cos() + w * t.sin()
+        };
+        for i in 0..seg {
+            let (n0, n1) = (ring(i), ring(i + 1));
+            let (p0, p1, p2, p3) = (a + n0 * ra, a + n1 * ra, b + n1 * rb, b + n0 * rb);
+            self.tri([p0, p1, p2], [n0, n1, n1], m);
+            self.tri([p0, p2, p3], [n0, n1, n0], m);
+            self.tri([a, p1, p0], [-u; 3], m);
+            self.tri([b, p3, p2], [u; 3], m);
+        }
+    }
+
+    fn done(mut self, name: &str) -> MeshData {
+        let n = self.mats.len();
+        self.mats.resize((n + 3) & !3, 0);
+        MeshData { name: name.into(), positions: self.positions, normals: self.normals, uvs: vec![0.0; 6 * n], indices: (0..3 * n as u32).collect(), materials: self.mats, grid: 0 }
+    }
+}
+
+/// The rest of what `--battle` draws, in the order of Craft::kind from KIND_DRONE: a drone, a
+/// rocket launcher and an anti-aircraft gun on their trucks, the gun the pilot holds on foot (its
+/// body, then its barrels about the axis they turn on) and the parachute. All made up, all in
+/// the aircraft's frame (x right, y up, z aft: the front is -z), metres; their materials are
+/// added to the aircraft's. What is painted takes its squadron's colour (Craft::tint).
+pub fn extras(materials: &mut Vec<MaterialGpu>) -> Vec<MeshData> {
+    let first = materials.len() as u8;
+    let flat = |c: [f32; 3], metal: f32, rough: f32| MaterialGpu { base: [c[0], c[1], c[2], 1.0], mre: [metal, rough, 0.0, 0.0], emit: [0.0; 4] };
+    materials.extend([
+        flat([0.85, 0.85, 0.85], 0.0, 0.6),     // paint (tinted)
+        flat([0.035, 0.035, 0.035], 0.2, 0.55), // tyres, glass, muzzles
+        flat([0.20, 0.21, 0.23], 0.85, 0.38),   // gun metal
+        flat([0.028, 0.028, 0.03], 0.0, 0.5),   // black plastic
+        flat([0.55, 0.40, 0.12], 0.9, 0.3),     // brass
+        // the canopy's orange and its white: thin cloth, which the daylight comes through
+        MaterialGpu { base: [0.85, 0.20, 0.02, 1.0], mre: [0.0, 0.85, 0.0, 0.0], emit: [0.42, 0.095, 0.01, 0.0] },
+        MaterialGpu { base: [0.82, 0.82, 0.80, 1.0], mre: [0.0, 0.85, 0.0, 0.0], emit: [0.40, 0.40, 0.385, 0.0] },
+    ]);
+    let (paint, dark, steel, plastic, brass, orange, white) = (first, first + 1, first + 2, first + 3, first + 4, first + 5, first + 6);
+    let v = Vec3::new;
+    let o = Vec3::ZERO;
+
+    // ---- a drone: a small flying wing with a pusher propeller, 4.5 m across
+    let mut d = Shape::new();
+    let (nose, tip_r, tip_l, tail) = (v(0.0, 0.07, -1.7), v(2.25, 0.03, 1.25), v(-2.25, 0.03, 1.25), v(0.0, 0.05, 1.0));
+    for side in [1.0f32, -1.0] {
+        let up = Vec3::Y * side;
+        d.tri([nose + up * 0.04, tip_r, tail + up * 0.04], [up; 3], paint);
+        d.tri([nose + up * 0.04, tail + up * 0.04, tip_l], [up; 3], paint);
+    }
+    d.tube(v(0.0, 0.08, -1.9), v(0.0, 0.10, -0.9), 0.05, 0.22, 10, paint);
+    d.tube(v(0.0, 0.10, -0.9), v(0.0, 0.10, 0.9), 0.22, 0.18, 10, paint);
+    d.tube(v(0.0, 0.10, 0.9), v(0.0, 0.10, 1.25), 0.18, 0.07, 10, dark);
+    d.boxed(v(0.0, 0.10, 1.3), v(0.5, 0.035, 0.012), o, 0.0, dark);
+    d.tube(v(0.0, 0.0, -1.45), v(0.0, -0.14, -1.45), 0.09, 0.09, 8, dark); // its eye
+    for x in [2.2f32, -2.2] {
+        d.quad([v(x, 0.03, 0.55), v(x, 0.03, 1.3), v(x, 0.62, 1.35), v(x, 0.45, 0.95)], paint);
+    }
+    let drone = d.done("drone");
+
+    // ---- a truck: what both the launcher and the gun stand on
+    let truck = |s: &mut Shape| {
+        s.boxed(v(0.0, 1.0, 0.3), v(1.25, 0.28, 3.7), o, 0.0, paint);
+        s.boxed(v(0.0, 1.85, -2.75), v(1.2, 0.6, 0.85), o, 0.0, paint);
+        s.boxed(v(0.0, 2.05, -3.61), v(1.0, 0.25, 0.02), o, 0.0, dark);
+        for z in [-2.7f32, -0.6, 1.6, 3.0] {
+            for x in [1.12f32, -1.12] {
+                s.tube(v(x - 0.2, 0.55, z), v(x + 0.2, 0.55, z), 0.55, 0.55, 12, dark);
+            }
+        }
+    };
+
+    // ---- a rocket launcher: a pack of tubes on the bed of the truck, tipped up
+    let mut l = Shape::new();
+    truck(&mut l);
+    let hinge = v(0.0, 1.5, 3.2);
+    l.boxed(v(0.0, 2.0, 0.9), v(1.05, 0.62, 2.5), hinge, 0.62, paint);
+    l.boxed(v(0.0, 2.0, -1.62), v(0.95, 0.52, 0.03), hinge, 0.62, dark);
+    l.boxed(v(0.0, 1.45, 1.6), v(0.25, 0.55, 0.25), o, 0.0, steel);
+    let launcher = l.done("launcher");
+
+    // ---- an anti-aircraft gun: a turret with two long barrels
+    let mut g = Shape::new();
+    truck(&mut g);
+    g.tube(v(0.0, 1.28, 1.2), v(0.0, 1.6, 1.2), 1.15, 1.05, 16, steel);
+    g.boxed(v(0.0, 2.15, 1.2), v(0.8, 0.55, 0.95), o, 0.0, paint);
+    let trunnion = v(0.0, 2.3, 0.7);
+    for x in [0.42f32, -0.42] {
+        let turn = Quat::from_rotation_x(0.85);
+        let at = |z: f32| trunnion + turn * (v(x, 2.3, z) - trunnion);
+        g.tube(at(0.6), at(-3.2), 0.085, 0.07, 10, steel);
+        g.tube(at(-3.2), at(-3.6), 0.11, 0.11, 10, dark);
+    }
+    let gun = g.done("anti-aircraft gun");
+
+    // ---- the gun the pilot holds on foot: six barrels that turn. Its body:
+    let mut b = Shape::new();
+    // the housing the barrels turn in, with its bands
+    b.tube(v(0.0, 0.0, -0.27), v(0.0, 0.0, -0.05), 0.066, 0.070, 24, steel);
+    for z in [-0.26f32, -0.19, -0.12] {
+        b.tube(v(0.0, 0.0, z), v(0.0, 0.0, z + 0.022), 0.074, 0.074, 24, plastic);
+    }
+    // the receiver behind it, the motor on its right shoulder, the cover plate with its bolts
+    b.boxed(v(0.0, 0.0, 0.05), v(0.062, 0.066, 0.11), o, 0.0, steel);
+    b.tube(v(0.0, 0.0, -0.06), v(0.0, 0.0, 0.17), 0.058, 0.058, 20, steel);
+    b.tube(v(0.062, 0.062, -0.02), v(0.062, 0.062, 0.20), 0.034, 0.034, 16, plastic);
+    b.tube(v(0.062, 0.062, 0.20), v(0.062, 0.062, 0.23), 0.026, 0.02, 12, steel);
+    b.boxed(v(-0.064, 0.0, 0.05), v(0.004, 0.045, 0.08), o, 0.0, plastic);
+    for (y, z) in [(0.035f32, -0.02f32), (0.035, 0.12), (-0.035, -0.02), (-0.035, 0.12)] {
+        b.tube(v(-0.066, y, z), v(-0.072, y, z), 0.006, 0.006, 8, steel);
+    }
+    // the carrying handle over the top
+    b.tube(v(0.0, 0.066, -0.10), v(0.0, 0.125, -0.08), 0.008, 0.008, 8, steel);
+    b.tube(v(0.0, 0.066, 0.12), v(0.0, 0.125, 0.10), 0.008, 0.008, 8, steel);
+    b.tube(v(0.0, 0.125, -0.085), v(0.0, 0.125, 0.105), 0.012, 0.012, 10, plastic);
+    // the feeder on the right, and the belt of rounds coming up into it from below
+    b.boxed(v(0.085, -0.01, 0.03), v(0.024, 0.05, 0.07), o, 0.0, steel);
+    for k in 0..9 {
+        let t = k as f32 / 8.0;
+        let at = v(0.10 + 0.13 * t, -0.07 - 0.36 * t * t, 0.03 + 0.05 * t);
+        b.tube(at + v(0.0, 0.0, -0.045), at + v(0.0, 0.0, 0.03), 0.0085, 0.0085, 8, brass);
+        b.tube(at + v(0.0, 0.0, -0.07), at + v(0.0, 0.0, -0.045), 0.003, 0.0085, 8, steel);
+        b.boxed(at + v(0.0, 0.0, -0.005), v(0.011, 0.004, 0.012), at, 0.0, plastic);
+    }
+    // the two grips at the back, on their yoke, and the trigger bar between them
+    b.tube(v(0.0, 0.0, 0.16), v(0.0, 0.0, 0.215), 0.03, 0.022, 12, steel);
+    b.tube(v(-0.085, 0.0, 0.215), v(0.085, 0.0, 0.215), 0.012, 0.012, 10, steel);
+    for x in [0.085f32, -0.085] {
+        b.tube(v(x, 0.06, 0.215), v(x, -0.07, 0.235), 0.019, 0.021, 12, plastic);
+    }
+    b.tube(v(-0.085, 0.045, 0.24), v(0.085, 0.045, 0.24), 0.007, 0.007, 8, steel);
+    let body = b.done("minigun");
+    // and its barrels, about the z axis
+    let mut r = Shape::new();
+    for k in 0..6 {
+        let a = k as f32 / 6.0 * std::f32::consts::TAU;
+        let c = v(0.040 * a.cos(), 0.040 * a.sin(), 0.0);
+        r.tube(c + v(0.0, 0.0, -0.25), c + v(0.0, 0.0, -0.97), 0.0125, 0.0115, 12, steel);
+        r.tube(c + v(0.0, 0.0, -0.97), c + v(0.0, 0.0, -0.975), 0.0075, 0.0075, 8, dark);
+    }
+    for z in [-0.40f32, -0.66, -0.93] {
+        r.tube(v(0.0, 0.0, z), v(0.0, 0.0, z - 0.018), 0.060, 0.060, 24, steel); // the clamps
+        r.tube(v(0.0, 0.0, z - 0.018), v(0.0, 0.0, z - 0.024), 0.060, 0.052, 24, plastic);
+    }
+    r.tube(v(0.0, 0.0, -0.25), v(0.0, 0.0, -0.94), 0.017, 0.017, 10, steel); // the spindle
+    let barrels = r.done("minigun barrels");
+
+    // ---- the parachute: a round canopy in orange and white gores, 8 m across, its rim 6 m
+    // above the eye (the origin), and the lines down from it
+    let mut c = Shape::new();
+    const GORES: usize = 20;
+    const RINGS: usize = 7;
+    let dome = |i: usize, k: usize| {
+        let a = i as f32 / GORES as f32 * std::f32::consts::TAU;
+        let e = k as f32 / RINGS as f32 * 1.42; // from the rim up to the vent
+        v(4.0 * e.cos() * a.cos(), 6.0 + 2.6 * e.sin(), 4.0 * e.cos() * a.sin())
+    };
+    let out = |p: Vec3| v(p.x / 16.0, (p.y - 6.0) / 6.76, p.z / 16.0).normalize_or(Vec3::Y);
+    for i in 0..GORES {
+        let m = if i % 2 == 0 { orange } else { white };
+        for k in 0..RINGS {
+            let (p0, p1, p2, p3) = (dome(i, k), dome(i + 1, k), dome(i + 1, k + 1), dome(i, k + 1));
+            c.tri([p0, p1, p2], [out(p0), out(p1), out(p2)], m);
+            c.tri([p0, p2, p3], [out(p0), out(p2), out(p3)], m);
+        }
+        // the line from the rim to the risers, well above the shoulders
+        let rim = dome(i, 0);
+        let riser = v(if rim.x > 0.0 { 0.32 } else { -0.32 }, 0.95, 0.12);
+        let w = v(-rim.z, 0.0, rim.x).normalize_or(Vec3::X) * 0.004;
+        c.quad([rim - w, rim + w, riser + w, riser - w], white);
+    }
+    for x in [0.32f32, -0.32] {
+        c.boxed(v(x, 0.72, 0.12), v(0.011, 0.23, 0.002), o, 0.0, plastic); // the risers
+    }
+    let canopy = c.done("parachute");
+
+    vec![drone, launcher, gun, body, barrels, canopy]
 }

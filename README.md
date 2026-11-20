@@ -882,6 +882,8 @@ cargo run --release -- --battle 120      # a skirmish
 
 ![The eight squadrons' paint](docs/images/battle_squadrons.jpg)
 
+![On foot with the gun, under the parachute, a swarm of drones, a launcher, an anti-aircraft gun, rockets coming up from the ground](docs/images/battle_ground.jpg)
+
 - **The fight.** They chase the nearest aircraft of another squadron, fire rockets that home
   on it and guns at close range, throw flares and break away when a rocket is after them, and
   burn, tumble and fall when hit. Those shot down come back at the edge of the fight, so the
@@ -890,7 +892,22 @@ cargo run --release -- --battle 120      # a skirmish
 - **You** fly the same aircraft with the same controls, and fire rockets (F or Enter; B /
   Circle or X / Square on a controller) at whatever is nearest your nose. Shot down, or flown
   into the ground, you go on in another aircraft: one of another squadron, half the fight away.
-  V gives the view to a camera that follows the fight instead of you.
+  V gives the view to a camera that follows the aircraft, then one with a swarm of drones, then
+  one that goes round a truck.
+- **The war below** (`--drones n`, 1000; `--trucks n`, 120). Drones fly in swarms of 25, each
+  swarm for the nearest truck of another squadron: over it, one after another goes down into
+  it, and after six the truck burns out (and another is stood somewhere else). Half the trucks
+  carry rocket launchers, which send rockets up after aircraft within 5 km; half carry
+  anti-aircraft guns, which fire bursts at the aircraft and the drones within 2 km. Trucks
+  stand on open ground only: not on water, in woods (the land cover says which) or on a slope.
+- **Out of the aircraft** (`src/foot.rs`). E gets you out: the aircraft falls, a parachute opens
+  over you, and you come down at about 7 m/s with a six-barrelled gun in your hands, seen through
+  your own eyes. The mouse aims, its left button (or F, or the right trigger) fires 50 rounds a
+  second; pointed within three degrees of an aircraft or a drone of another squadron, the
+  rounds are sent ahead of it for you, and three hits bring an aircraft down. W A S D steer the
+  parachute a little, and walk once you are down. E or R puts you in another aircraft. Nothing
+  shoots at you on foot. The gun, the parachute, the drones and the trucks are made-up shapes
+  built in code (`aircraft.rs` `extras`), ray traced like the aircraft.
 - **What it stresses.** Every aircraft is the full model, nine instances of its ~80,000
   triangles in the acceleration structure, rebuilt every frame. Every rocket trail, afterburner
   flame, tracer, flare, fireball, smoke cloud and wing-tip vapour trail is a volume: a tube of
@@ -919,6 +936,10 @@ over Lake Como with the fight 20 s old (frame times vary with what is in view: p
 | 1000 | 12.0 ms | 8.7 ms | 1.6 ms | 41,517 | 20,528 |
 | 2000 | 13.2 ms | 8.6 ms | 3.3 ms | 71,199 | 41,183 |
 | 4000 | 17.9 ms | 9.5 ms | 6.6 ms | 137,909 | 90,025 |
+
+That table is the aircraft alone (`--drones 0 --trucks 0`). With the war below as well, measured
+the same way: 12.0 ms (8.9 ms of it GPU) for the default 1000 aircraft, 1000 drones and 120
+trucks; 18.1 ms (9.6 ms GPU) for 4000 aircraft, 3000 drones and 600 trucks.
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
@@ -1033,6 +1054,7 @@ cargo run --release
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
 | `--battle [n]` | the test flight in the middle of a fight between `n` other aircraft (1000; up to 4000): a stress test (see [Battle](#the-earth-a-11-globe-and-real-places)). V watches the fight, F fires |
+| `--drones n`, `--trucks n` | with `--battle`: drones in swarms (1000; up to 3000) and trucks with rocket launchers and anti-aircraft guns (120; up to 600) |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |
@@ -1109,7 +1131,9 @@ cargo run --release
 | C | view: chase, cockpit, fly-by |
 | R | back to the start |
 | F or Enter (`--battle`) | fire a rocket at the aircraft of another squadron nearest your nose |
-| V (`--battle`) | the camera watches the fight / follows you |
+| V (`--battle`) | the camera: with you, watching the aircraft, with the drones, at the trucks |
+| E (`--battle`) | out of the aircraft on a parachute, with a gun; E or R again: into another aircraft |
+| mouse, left button (on foot) | aim, fire (F and Enter fire too); W A S D steer the parachute and walk, Shift runs |
 | **controller** (`--test-flight`) | a PlayStation controller (DualSense, DualShock 4: read directly over USB or Bluetooth) or any gamepad the system reports (Xbox); the layout is Grand Theft Auto V's too; it flies only while the window is in front |
 | right / left trigger | faster / slower (held past idle: speed brakes) |
 | left stick | the stick: forward nose down, back nose up, sideways roll (gentle near the centre, all the aircraft can do at the rim) |
@@ -1120,6 +1144,7 @@ cargo run --release
 | D-pad up / down | chase distance |
 | Menu / Start | back to the start |
 | B / Circle or X / Square (`--battle`) | fire a rocket |
+| left stick pressed in (`--battle`) | out of the aircraft; again: into another. On foot: right stick aims, right trigger fires, left stick moves |
 
 ## Tools
 
@@ -1169,7 +1194,8 @@ src/
   flight.rs     the flight model: atmosphere, forces, engine, fly-by-wire control laws
   pilot.rs      keys to stick and throttle, the chase / cockpit / fly-by cameras, the wake
   gamepad.rs    a game controller for the test flight (PlayStation over HID, the rest through gilrs)
-  battle.rs     --battle: the other aircraft, their rockets, the smoke and fire, the watching camera
+  battle.rs     --battle: the other aircraft, their rockets, the drones and trucks, the smoke and fire
+  foot.rs       --battle on foot: the parachute, the first-person view, the gun
   globe/        the 1:1 Earth as a mode of the renderer:
     scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
     tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
@@ -1220,6 +1246,11 @@ tours/   tour files for --tour
   the canopy is an opaque gold mirror. Only the DLSS path has the aircraft's motion vectors:
   under TAA it will probably smear (not tried). The effects are tuned by eye, not measured.
   Trees and fine terrain may still be streaming in under a fast, low aircraft.
+- **Battle on the ground:** the drones and trucks are simple made-up shapes, and the trucks do
+  not drive. Trees do not stop anything: rounds, rockets and drones pass through them, and so
+  does the pilot on foot. On foot there is no body, only the gun; the dot it aims by is a small
+  light 40 m out, not a sight. Flown fast, the war below streams past: trucks and swarms left
+  behind are stood again ahead.
 - **Battle (`--battle`):** the smoke and fire have no shadows and light nothing but themselves;
   they are not seen in reflections; against clouds they are placed by one distance a pixel (their
   middle), so a trail that passes through a cloud is all in front of it or all behind. Only the

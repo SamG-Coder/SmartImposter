@@ -26,7 +26,7 @@ struct HitPayload {
 
 // Each aircraft or rocket in the air (renderer.rs CraftRec, binding 38; the first is the one
 // flown): where a point of it now was a frame ago (rows; motion vectors), and its paint scheme.
-struct CraftRec { vec4 back0; vec4 back1; vec4 back2; vec4 info; };
+struct CraftRec { vec4 back0; vec4 back1; vec4 back2; vec4 info; }; // info: x paint scheme, yzw its squadron's colour
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.
 struct ImpHit {

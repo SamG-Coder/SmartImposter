@@ -624,6 +624,8 @@ pub struct Renderer {
     pub ac_pose: Option<crate::aircraft::Pose>,
     /// its paint scheme (shaders/livery.glsl; 0 the grey it was painted in)
     pub ac_livery: u32,
+    /// the pilot is not in it (on foot, --battle): it is not drawn
+    pub ac_hidden: bool,
     /// `--battle` (battle.rs), set each frame: the other aircraft and the rockets, and the smoke
     /// and fire (shaders/fx.glsl), each piece an instance of one unit box (fx_blas)
     pub crafts: Vec<crate::aircraft::Craft>,
@@ -1531,6 +1533,7 @@ impl Renderer {
             ac_first,
             ac_pose: None,
             ac_livery: 0,
+            ac_hidden: false,
             crafts: Vec::new(),
             fx: Vec::new(),
             craft_recs: Vec::new(),
@@ -3001,16 +3004,20 @@ impl Renderer {
                     [[m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z]]
                 };
                 let none = InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 };
-                let flown = [crate::aircraft::Craft { pose, livery: self.ac_livery, rocket: false }];
+                let flown = [crate::aircraft::Craft { pose, livery: self.ac_livery, kind: 0, tint: [1.0; 3] }];
                 let others = self.crafts.len().min(MAX_CRAFT - 1);
-                let rocket = self.ac_first + self.ac_parts.len();
                 for (k, c) in flown.iter().chain(self.crafts[..others].iter()).enumerate() {
-                    self.craft_recs.push(CraftRec { back: rows(&c.pose.back), info: [c.livery as f32, 0.0, 0.0, 0.0] });
+                    self.craft_recs.push(CraftRec { back: rows(&c.pose.back), info: [c.livery as f32, c.tint[0], c.tint[1], c.tint[2]] });
+                    if k == 0 && self.ac_hidden {
+                        continue;
+                    }
                     // (the one flown has a mask bit of its own, 4: the rays its shock waves bend
                     // look past it, main.rgen; the others 16. Which aircraft: above the mesh.)
                     let (mask, id) = (if k == 0 { 4 } else { 16 }, (k as u32) << 11);
-                    if c.rocket {
-                        self.insts.push(accel::make_instance(&c.pose.xform, rocket as u32 | id, mask, 4, opaque, self.blas[rocket].addr));
+                    if c.kind > 0 {
+                        // (one of the meshes after the aircraft's parts: a rocket, a drone, ...)
+                        let mesh = self.ac_first + self.ac_parts.len() + c.kind as usize - 1;
+                        self.insts.push(accel::make_instance(&c.pose.xform, mesh as u32 | id, mask, 4, opaque, self.blas[mesh].addr));
                         self.inst_data.push(none);
                         continue;
                     }
