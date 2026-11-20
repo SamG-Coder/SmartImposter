@@ -867,12 +867,13 @@ The model as Blender renders it (`tools/make_f16.py --renders`):
   the lane it leaves in thin or broken cloud is subtle.
 
 **Battle** (`--battle [n]`, `src/battle.rs`): a stress test in the shape of a game. The test
-flight, in the middle of a fight between `n` other aircraft (120 unless a number is given, up to
+flight, in the middle of a fight between `n` other aircraft (1000 unless a number is given, up to
 4000): eight made-up squadrons, each in its own paint, every one against the other seven.
 
 ```
-cargo run --release -- --battle          # 120 other aircraft
-cargo run --release -- --battle 1000
+cargo run --release -- --battle          # 1000 other aircraft
+cargo run --release -- --battle 4000     # as many as it takes
+cargo run --release -- --battle 120      # a skirmish
 ```
 
 ![The pilot's view: a wingman in afterburner, rocket trails, a wreck going down](docs/images/battle.jpg)
@@ -1031,7 +1032,7 @@ cargo run --release
 | `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
-| `--battle [n]` | the test flight in the middle of a fight between `n` other aircraft (120; up to 4000): a stress test (see [Battle](#the-earth-a-11-globe-and-real-places)). V watches the fight, F fires |
+| `--battle [n]` | the test flight in the middle of a fight between `n` other aircraft (1000; up to 4000): a stress test (see [Battle](#the-earth-a-11-globe-and-real-places)). V watches the fight, F fires |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |

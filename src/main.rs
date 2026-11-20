@@ -114,7 +114,7 @@ struct Args {
     /// starting at `--at` (lat, lon, height above the ground, heading)
     test_flight: bool,
     /// `--battle [n]`: the test flight in the middle of a fight between n other aircraft
-    /// (battle.rs): a stress test
+    /// (battle.rs; 1000 unless a number is given): a stress test
     battle: Option<usize>,
 }
 
@@ -341,7 +341,7 @@ fn parse_args() -> Args {
                 match next.parse::<usize>() {
                     Ok(n) => a.battle = Some(n.min(4000)),
                     Err(_) => {
-                        a.battle = Some(120);
+                        a.battle = Some(1000);
                         i -= 1;
                     }
                 }
