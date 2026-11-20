@@ -21,7 +21,12 @@ struct HitPayload {
     vec3 wtan;    // globe water: world direction of the first Earth-fixed coordinate (pl.trans.xy)
     float wlevel; // globe water: height of the water surface above this point (m)
     float wfloor; // globe water: depth of the sea floor (m, ETOPO; coastal vs open-ocean water)
+    uint craft;   // an aircraft hit (FLAG_AIRCRAFT): which one (CraftRec)
 };
+
+// Each aircraft or rocket in the air (renderer.rs CraftRec, binding 38; the first is the one
+// flown): where a point of it now was a frame ago (rows; motion vectors), and its paint scheme.
+struct CraftRec { vec4 back0; vec4 back1; vec4 back2; vec4 info; }; // info: x paint scheme, yzw its squadron's colour
 
 // Impostor hit attributes passed from the intersection to the closest-hit shader.
 struct ImpHit {
@@ -30,7 +35,11 @@ struct ImpHit {
     uint vis;      // unorm4x8: directional self-visibility a, b/3 + 0.5
 };
 
-// Custom index layout: low 8 bits mesh/variant id, bits 8..10 impostor mask colour, bits 11..23 seed.
+// Custom index layout: low 8 bits mesh/variant id, bits 8..10 impostor mask colour, bits 11..23 seed
+// (an aircraft's parts: the mesh in the low 11 bits, which aircraft above them; the smoke and
+// fire of --battle: all of it the index into their list, fx.glsl).
+// Instance masks: 1 meshes and terrain, 2 impostors, 4 the aircraft flown, 8 smoke and fire (seen
+// by the ray that gathers them only: every other ray leaves that bit out), 16 the other aircraft.
 uint instSeed(uint ci) { return ci >> 11; }
 
 // Every plant's impostor is one AABB primitive of a cluster BLAS; its record (renderer.rs

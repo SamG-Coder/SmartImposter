@@ -1,0 +1,27 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : require
+#include "fx.glsl"
+
+// Any-hit for the smoke and fire of --battle: adds what fx.rint found to the ray's sums, and
+// lets the ray go on (nothing here stops it).
+layout(set = 0, binding = 39, scalar) readonly buffer FxPrims { FxPrim prims[]; };
+layout(location = 2) rayPayloadInEXT FxPayload fp;
+hitAttributeEXT vec3 fxHit;
+
+void main() {
+    FxPrim p = prims[gl_InstanceCustomIndexEXT];
+    float w = fxHit.x * p.c.w;
+    if (p.d.x < 0.5) {
+        fp.od += w;
+        fp.scat += p.c.rgb * w;
+    } else {
+        // (a fire is brightest, and whitest, where it is deepest)
+        float a = 1.0 - exp(-w);
+        fp.emit += p.c.rgb * a * (1.0 + 0.6 * a * a);
+    }
+    fp.wsum += w;
+    fp.tsum += w * fxHit.y;
+    ignoreIntersectionEXT;
+}

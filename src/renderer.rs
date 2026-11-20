@@ -76,9 +76,7 @@ pub struct Globals {
     /// `--test-flight` (the aircraft; main.rgen, aircraft.glsl, clouds.glsl): the renderer's frame
     /// -> the aircraft's model frame (rows, w the translation)
     pub ac_inv: [[f32; 4]; 3],
-    /// a point on the aircraft this frame -> where it was last frame (rows): motion vectors
-    pub ac_prev: [[f32; 4]; 3],
-    /// x 1 = an aircraft is flying, y afterburner 0..1, z Mach number, w vapour cone 0..1
+    /// x 1 = an aircraft is flying (2 in `--battle`: there is smoke and fire to gather), y afterburner 0..1, z Mach number, w vapour cone 0..1
     pub ac_state: [f32; 4],
     /// x vapour over the wings 0..1, y points in the wake, z air density / sea level's, w seconds flown
     pub ac_state2: [f32; 4],
@@ -92,6 +90,20 @@ pub struct Globals {
 
 /// Points of the aircraft's wake kept for the shaders (globals.glsl).
 pub const WAKE_POINTS: usize = 32;
+
+/// An aircraft or a rocket in the air as the shaders read it (rt.glsl CraftRec, binding 38): a
+/// point of it this frame -> where it was last frame (rows), and its paint scheme.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct CraftRec {
+    back: [[f32; 4]; 3],
+    info: [f32; 4],
+}
+
+/// The most aircraft and rockets drawn at once (which one a part belongs to is 13 bits of its
+/// instance's custom index), and the most pieces of smoke and fire (shaders/fx.glsl).
+pub const MAX_CRAFT: usize = 8192;
+pub const MAX_FX: usize = 1 << 18;
 
 /// Render-resolution targets: this frame's sample + hit distance, and the TAA history ping-pong.
 struct Targets {
@@ -610,6 +622,19 @@ pub struct Renderer {
     ac_parts: Vec<crate::aircraft::Part>,
     ac_first: usize,
     pub ac_pose: Option<crate::aircraft::Pose>,
+    /// its paint scheme (shaders/livery.glsl; 0 the grey it was painted in)
+    pub ac_livery: u32,
+    /// the pilot is not in it (on foot, --battle): it is not drawn
+    pub ac_hidden: bool,
+    /// `--battle` (battle.rs), set each frame: the other aircraft and the rockets, and the smoke
+    /// and fire (shaders/fx.glsl), each piece an instance of one unit box (fx_blas)
+    pub crafts: Vec<crate::aircraft::Craft>,
+    pub fx: Vec<crate::aircraft::FxGpu>,
+    craft_recs: Vec<CraftRec>,
+    craft_buf: Buffer,
+    fx_buf: Buffer,
+    fx_blas: Accel,
+    fx_drawn: usize,
     /// Globe mode: plant records currently drawn as meshes (1 both / 2 mesh only).
     globe_states: std::collections::HashMap<u32, u32>,
     /// Globe mode: trees in the TLAS last frame (window title).
@@ -681,6 +706,9 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         gpu.shader_module(spv!("globe.rchit"))?,
         gpu.shader_module(spv!("aircraft.rchit"))?,
         gpu.shader_module(spv!("aircraft.rahit"))?,
+        gpu.shader_module(spv!("fx.rint"))?,
+        gpu.shader_module(spv!("fx.rahit"))?,
+        gpu.shader_module(spv!("fx.rmiss"))?,
     ];
     let kinds = [
         vk::ShaderStageFlags::RAYGEN_KHR,
@@ -693,6 +721,9 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::ANY_HIT_KHR,
+        vk::ShaderStageFlags::INTERSECTION_KHR,
+        vk::ShaderStageFlags::ANY_HIT_KHR,
+        vk::ShaderStageFlags::MISS_KHR,
     ];
     let stages: Vec<_> = modules
         .iter()
@@ -710,7 +741,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     let u = vk::SHADER_UNUSED_KHR;
     // Hit records (instance SBT offset): 0 opaque triangles, 1 impostor AABBs,
     // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve), 3 globe terrain,
-    // 4 the aircraft (its glass is seen through by the any-hit).
+    // 4 the aircraft (its glass is seen through by the any-hit), 5 the smoke and fire of --battle
+    // (fx.glsl: summed by the any-hit, with a miss shader of its own, the third).
     let groups = [
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 0, u, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 1, u, u, u),
@@ -720,6 +752,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 3, 6, u),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 7, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 8, 9, u),
+        group(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP, u, u, 11, 10),
+        group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 12, u, u, u),
     ];
     let info = vk::RayTracingPipelineCreateInfoKHR::default()
         .stages(&stages)
@@ -735,21 +769,22 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         unsafe { gpu.device.destroy_shader_module(m, None) };
     }
 
-    // Shader binding table: raygen | miss, shadow miss | triangle hit, impostor hit, dissolving triangle hit, globe terrain hit.
+    // Shader binding table: raygen | miss, shadow miss, smoke and fire miss | triangle hit, impostor
+    // hit, dissolving triangle hit, globe terrain hit, aircraft hit, smoke and fire hit.
     let hs = gpu.rt.handle_size as u64;
     let stride = align_up(hs, gpu.rt.handle_alignment as u64);
     let ba = gpu.rt.base_alignment as u64;
     let off_miss = align_up(stride, ba);
-    let off_hit = align_up(off_miss + 2 * stride, ba);
-    let total = off_hit + 5 * stride;
-    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 8, 8 * hs as usize)? };
+    let off_hit = align_up(off_miss + 3 * stride, ba);
+    let total = off_hit + 6 * stride;
+    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 10, 10 * hs as usize)? };
     let mut sbt = gpu.create_buffer(total + ba, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR, MemoryLocation::CpuToGpu, "sbt")?;
     let base = align_up(sbt.addr, ba);
     let shift = (base - sbt.addr) as usize;
     {
         let m = sbt.mapped();
         for (group, off) in
-            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride), (7, off_hit + 4 * stride)]
+            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (9, off_miss + 2 * stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride), (7, off_hit + 4 * stride), (8, off_hit + 5 * stride)]
         {
             let dst = shift + off as usize;
             m[dst..dst + hs as usize].copy_from_slice(&handles[group * hs as usize..(group + 1) * hs as usize]);
@@ -759,8 +794,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     Ok(RtPipeline {
         pipe,
         rgen: region(0, stride),
-        miss: region(off_miss, 2 * stride),
-        hit: region(off_hit, 5 * stride),
+        miss: region(off_miss, 3 * stride),
+        hit: region(off_hit, 6 * stride),
         _sbt: sbt,
     })
 }
@@ -1122,6 +1157,18 @@ impl Renderer {
             ),
         };
         let ac_parts: Vec<crate::aircraft::Part> = aircraft.map(|a| a.parts).unwrap_or_default();
+        // the aircraft in the air (binding 38), the smoke and fire of --battle (binding 39) and
+        // the box each piece of it is traced in
+        let mut craft_buf = gpu.create_buffer((MAX_CRAFT * std::mem::size_of::<CraftRec>()) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "craft records")?;
+        craft_buf.mapped().fill(0);
+        let fx_buf = gpu.create_buffer((MAX_FX * std::mem::size_of::<crate::aircraft::FxGpu>()) as u64, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "smoke and fire")?;
+        let fx_blas = {
+            let unit: [f32; 6] = [-1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+            let mut b = gpu.upload_buffer(bytemuck::cast_slice(&unit), vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR, "unit box")?;
+            let a = accel::build_blases(&gpu, &[(accel::volume_geometry(b.addr), 1)])?.remove(0);
+            gpu.destroy_buffer(&mut b);
+            a
+        };
         const _: () = assert!(std::mem::size_of::<Globals>() <= 2048);
         let ubo = gpu.create_buffer(2048, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globals")?;
         let mat_sampler = unsafe {
@@ -1186,6 +1233,9 @@ impl Renderer {
             // the aircraft (aircraft.rchit): its skin's three maps, its materials
             b(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 3, rt_all),
             b(37, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            // every aircraft and rocket in the air; the smoke and fire of --battle (fx.rint)
+            b(38, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            b(39, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -1482,6 +1532,15 @@ impl Renderer {
             ac_parts,
             ac_first,
             ac_pose: None,
+            ac_livery: 0,
+            ac_hidden: false,
+            crafts: Vec::new(),
+            fx: Vec::new(),
+            craft_recs: Vec::new(),
+            craft_buf,
+            fx_buf,
+            fx_blas,
+            fx_drawn: 0,
             globe_states: std::collections::HashMap::new(),
             globe_trees: 0,
         };
@@ -1820,6 +1879,7 @@ impl Renderer {
         let ground_tex = tex(&self.ground_tex, MAX_GROUND_TEX);
         let ac_tex = tex(&self.ac_tex, 3);
         let ac_mats = buf(&self.ac_mats);
+        let (craft_buf, fx_buf) = (buf(&self.craft_buf), buf(&self.fx_buf));
         let sampled = |pick: fn(&BcAtlas) -> vk::ImageView| -> Vec<vk::DescriptorImageInfo> {
             (0..MAX_VARIANTS)
                 .map(|i| {
@@ -1863,6 +1923,8 @@ impl Renderer {
             w(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_detail),
             w(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ac_tex),
             w(37, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ac_mats),
+            w(38, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&craft_buf),
+            w(39, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&fx_buf),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -2622,6 +2684,10 @@ impl Renderer {
         }
         let bytes: &[u8] = bytemuck::cast_slice(&self.inst_data);
         self.inst_info.mapped()[..bytes.len()].copy_from_slice(bytes);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.craft_recs);
+        self.craft_buf.mapped()[..bytes.len()].copy_from_slice(bytes);
+        let bytes: &[u8] = bytemuck::cast_slice(&self.fx[..self.fx_drawn]);
+        self.fx_buf.mapped()[..bytes.len()].copy_from_slice(bytes);
         self.tlas_dirty = true;
         self.upload_pending = false;
         self.profile.cpu_lod_parts[2] += t.elapsed().as_secs_f64() * 1000.0;
@@ -2926,16 +2992,58 @@ impl Renderer {
                     }
                 });
             }
-            // the aircraft: one instance per part, the moving surfaces turned about their hinges
-            if let Some(pose) = &self.ac_pose {
+            // The aircraft: one instance per part, the moving surfaces turned about their hinges.
+            // After it the other aircraft and the rockets of --battle, then its smoke and fire.
+            self.craft_recs.clear();
+            self.fx_drawn = 0;
+            if let Some(pose) = self.ac_pose {
                 let opaque = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_OPAQUE;
                 let seen_through = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
-                for (k, part) in self.ac_parts.iter().enumerate() {
-                    let mesh = self.ac_first + k;
-                    let m = pose.xform * pose.part(part);
-                    // (mask 4, its own bit: the rays its shock waves bend look past it, main.rgen)
-                    self.insts.push(accel::make_instance(&m, mesh as u32, 4, 4, if part.glass { seen_through } else { opaque }, self.blas[mesh].addr));
-                    self.inst_data.push(InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 });
+                let rows = |a: &glam::Affine3A| {
+                    let (m, t) = (a.matrix3, a.translation);
+                    [[m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z]]
+                };
+                let none = InstInfo { center: [0.0, -1e9, 0.0], data: 0, flags: 0 };
+                let flown = [crate::aircraft::Craft { pose, livery: self.ac_livery, kind: 0, tint: [1.0; 3] }];
+                let others = self.crafts.len().min(MAX_CRAFT - 1);
+                for (k, c) in flown.iter().chain(self.crafts[..others].iter()).enumerate() {
+                    self.craft_recs.push(CraftRec { back: rows(&c.pose.back), info: [c.livery as f32, c.tint[0], c.tint[1], c.tint[2]] });
+                    if k == 0 && self.ac_hidden {
+                        continue;
+                    }
+                    // (the one flown has a mask bit of its own, 4: the rays its shock waves bend
+                    // look past it, main.rgen; the others 16. Which aircraft: above the mesh.)
+                    let (mask, id) = (if k == 0 { 4 } else { 16 }, (k as u32) << 11);
+                    if c.kind > 0 {
+                        // (one of the meshes after the aircraft's parts: a rocket, a drone, ...)
+                        let mesh = self.ac_first + self.ac_parts.len() + c.kind as usize - 1;
+                        self.insts.push(accel::make_instance(&c.pose.xform, mesh as u32 | id, mask, 4, opaque, self.blas[mesh].addr));
+                        self.inst_data.push(none);
+                        continue;
+                    }
+                    for (j, part) in self.ac_parts.iter().enumerate() {
+                        let mesh = self.ac_first + j;
+                        let m = c.pose.xform * c.pose.part(part);
+                        self.insts.push(accel::make_instance(&m, mesh as u32 | id, mask, 4, if part.glass { seen_through } else { opaque }, self.blas[mesh].addr));
+                        self.inst_data.push(none);
+                    }
+                }
+                // each piece of smoke or fire: the unit box, stretched over its tube (fx.rint
+                // looks no further from the axis than three radii)
+                self.fx_drawn = self.fx.len().min(MAX_FX);
+                for (k, f) in self.fx[..self.fx_drawn].iter().enumerate() {
+                    let (a, b) = (Vec3::new(f.a[0], f.a[1], f.a[2]), Vec3::new(f.b[0], f.b[1], f.b[2]));
+                    let r = 3.05 * f.a[3].max(f.b[3]);
+                    let len = (b - a).length();
+                    let m = if len < 1e-3 {
+                        glam::Affine3A::from_scale_rotation_translation(Vec3::splat(r), glam::Quat::IDENTITY, a)
+                    } else {
+                        let u = (b - a) / len;
+                        let v = u.any_orthonormal_vector();
+                        glam::Affine3A::from_mat3_translation(glam::Mat3::from_cols(u * (0.5 * len + 0.01), v * r, u.cross(v) * r), 0.5 * (a + b))
+                    };
+                    self.insts.push(accel::make_instance(&m, k as u32, 8, 5, vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE, self.fx_blas.addr));
+                    self.inst_data.push(none);
                 }
             }
             globe_cpu = [p[0], p[1], t2.elapsed().as_secs_f64() * 1e3];

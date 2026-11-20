@@ -44,6 +44,12 @@ pub fn aabb_geometry(aabb_addr: u64) -> vk::AccelerationStructureGeometryKHR<'st
         })
 }
 
+/// One box that a volume is traced in (the smoke and fire of --battle, fx.rint): never opaque,
+/// and its any-hit shader runs once a ray, since it adds what it finds to the ray's sums.
+pub fn volume_geometry(aabb_addr: u64) -> vk::AccelerationStructureGeometryKHR<'static> {
+    aabb_geometry(aabb_addr).flags(vk::GeometryFlagsKHR::NO_DUPLICATE_ANY_HIT_INVOCATION)
+}
+
 pub fn create_accel(gpu: &Gpu, ty: vk::AccelerationStructureTypeKHR, size: u64) -> Result<Accel> {
     let buf = gpu.create_buffer(size, vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR, MemoryLocation::GpuOnly, "accel")?;
     unsafe {

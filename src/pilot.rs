@@ -74,6 +74,10 @@ pub struct Pilot {
     auto_bank: bool,
     /// SI_FLIGHT (a testing aid): controls held without the keys, for scripted captures
     hold: Option<Controls>,
+    /// `--battle`: hitting the ground does not put the aircraft back at the start; it is `down`,
+    /// and the battle puts the pilot in another one (take_over)
+    pub battle: bool,
+    pub down: bool,
 }
 
 impl Pilot {
@@ -81,7 +85,7 @@ impl Pilot {
         let sim = Sim::new(pos, heading, speed);
         let (cam_fwd, cam_up) = (sim.att * DVec3::X, pos.normalize());
         let stick = Controls { throttle: 0.6, ..Default::default() };
-        let mut p = Pilot { sim, stick, hands: (0.0, 0.0, 0.0), view: View::Chase, cam_fwd, cam_up, look: (0.0, 0.0), dist: 19.0, flyby_at: None, wake: VecDeque::new(), time: 0.0, samples: 0, prev: None, was_super: false, mouse_fly: false, mouse_stick: (0.0, 0.0), look_idle: 9.0, auto_bank: false, hold: None };
+        let mut p = Pilot { sim, stick, hands: (0.0, 0.0, 0.0), view: View::Chase, cam_fwd, cam_up, look: (0.0, 0.0), dist: 19.0, flyby_at: None, wake: VecDeque::new(), time: 0.0, samples: 0, prev: None, was_super: false, mouse_fly: false, mouse_stick: (0.0, 0.0), look_idle: 9.0, auto_bank: false, hold: None, battle: false, down: false };
         p.sim.arcade = true;
         // SI_FLIGHT="throttle=1,pitch=0.4,roll=0,yaw=0,brake=0,view=flyby,look=1.2,dist=30": hold these
         if let Ok(script) = std::env::var("SI_FLIGHT") {
@@ -129,6 +133,19 @@ impl Pilot {
         self.wake.clear();
         self.prev = None;
         self.flyby_at = None;
+    }
+
+    /// `--battle`: the pilot is in another aircraft now, at `pos`, level on `heading` (degrees
+    /// from north) at `speed` m/s.
+    pub fn take_over(&mut self, pos: DVec3, heading: f64, speed: f64) {
+        self.sim = Sim::new(pos, heading, speed);
+        self.sim.arcade = true;
+        self.sim.power = 0.8;
+        self.reset();
+        self.stick.throttle = 0.8;
+        self.look = (0.0, 0.0);
+        self.mouse_stick = (0.0, 0.0);
+        self.down = false;
     }
 
     /// The mouse moved: it turns the view about the aircraft, or, with the left button held, it is
@@ -234,7 +251,9 @@ impl Pilot {
         for _ in 0..steps {
             self.sim.step(&self.stick, g, dt / steps as f64);
         }
-        if self.sim.crashed {
+        if self.sim.crashed && self.battle {
+            self.down = true;
+        } else if self.sim.crashed {
             println!("Hit the ground at {:.0} m/s. Back to the start.", self.sim.tas);
             self.reset();
         }
@@ -352,12 +371,8 @@ impl Pilot {
         let inv = now.inverse();
         let (pr, pp) = self.prev.unwrap_or((model, s.pos));
         let back = to_frame(pr, pp) * inv;
-        let rows = |a: &Affine3A| {
-            let (m, t) = (a.matrix3, a.translation);
-            [[m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z]]
-        };
-        g.ac_inv = rows(&inv);
-        g.ac_prev = rows(&back);
+        let (m, t) = (inv.matrix3, inv.translation);
+        g.ac_inv = [[m.x_axis.x, m.y_axis.x, m.z_axis.x, t.x], [m.x_axis.y, m.y_axis.y, m.z_axis.y, t.y], [m.x_axis.z, m.y_axis.z, m.z_axis.z, t.z]];
         self.prev = Some((model, s.pos));
         g.ac_state = [1.0, s.ab as f32, s.mach as f32, s.vapour_cone() as f32];
         let flow = model.transpose() * (-s.vel.normalize_or(DVec3::X));
@@ -382,7 +397,7 @@ impl Pilot {
         g.ac_state[1] = (s.ab as f32).max(0.0);
         g.ac_vel[3] = (s.power as f32).clamp(0.0, 1.0);
         let f = |v: f64| v as f32;
-        Pose { xform: now, lef: f(s.surf.lef), flaperon: [f(s.surf.flaperon[0]), f(s.surf.flaperon[1])], tail: [f(s.surf.tail[0]), f(s.surf.tail[1])], rudder: f(s.surf.rudder) }
+        Pose { xform: now, back, lef: f(s.surf.lef), flaperon: [f(s.surf.flaperon[0]), f(s.surf.flaperon[1])], tail: [f(s.surf.tail[0]), f(s.surf.tail[1])], rudder: f(s.surf.rudder) }
     }
 
     /// The instruments, for the window's title.

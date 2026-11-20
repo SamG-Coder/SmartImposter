@@ -7,6 +7,7 @@
 mod accel;
 mod aircraft;
 mod atlas;
+mod battle;
 mod biome;
 mod asset;
 mod bc7;
@@ -16,6 +17,7 @@ mod dlss;
 mod erosion;
 mod flight;
 mod flypath;
+mod foot;
 mod globe;
 mod lawn;
 mod gamepad;
@@ -112,6 +114,13 @@ struct Args {
     /// `--test-flight`: fly the F-16 (tools/make_f16.py) over the globe (flight.rs, pilot.rs),
     /// starting at `--at` (lat, lon, height above the ground, heading)
     test_flight: bool,
+    /// `--battle [n]`: the test flight in the middle of a fight between n other aircraft
+    /// (battle.rs; 1000 unless a number is given): a stress test
+    battle: Option<usize>,
+    /// `--drones n`, `--trucks n`: the war below the battle (drones in swarms; trucks with
+    /// rocket launchers and anti-aircraft guns on them, half each)
+    drones: usize,
+    trucks: usize,
 }
 
 fn parse_args() -> Args {
@@ -164,6 +173,9 @@ fn parse_args() -> Args {
         dlss: Some(1),
         sharpen: 0.5,
         test_flight: false,
+        battle: None,
+        drones: 1000,
+        trucks: 120,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -329,6 +341,20 @@ fn parse_args() -> Args {
                 a.globe = true;
                 i -= 1;
             }
+            "--drones" => a.drones = next.parse::<usize>().unwrap_or(1000).min(3000),
+            "--trucks" => a.trucks = next.parse::<usize>().unwrap_or(120).min(600),
+            "--battle" => {
+                a.test_flight = true;
+                a.globe = true;
+                // (the number of aircraft is optional)
+                match next.parse::<usize>() {
+                    Ok(n) => a.battle = Some(n.min(4000)),
+                    Err(_) => {
+                        a.battle = Some(1000);
+                        i -= 1;
+                    }
+                }
+            }
             other => eprintln!("unknown argument {other}"),
         }
         i += 2;
@@ -415,6 +441,22 @@ struct State {
     pilot: Option<pilot::Pilot>,
     /// --test-flight: the game controllers
     pads: Option<gamepad::Pads>,
+    /// --battle: everything else in the air; and the camera watches the fight, not the pilot (V)
+    battle: Option<battle::Battle>,
+    /// (0 the pilot's own view; 1 the aircraft, 2 the drones, 3 the trucks)
+    watch: u8,
+    /// --battle: the pilot is out of the aircraft (foot.rs); E was pressed (out, or into another);
+    /// the controller's button for it was down last frame
+    foot: Option<foot::Foot>,
+    get_out: bool,
+    pad_out: bool,
+    /// SI_BATTLE eject=, look=, lookup=, shoot= (a testing aid): out of the aircraft after that
+    /// many seconds, looking that way, firing
+    script_out: Option<(f64, f64, f64, bool)>,
+    /// SI_BATTLE die= (a testing aid): the pilot is lost after that many seconds
+    script_die: Option<f64>,
+    /// milliseconds the fight has taken on the CPU (its step, its picture) and the worst frame, since the last report
+    battle_ms: (f64, f64, f64, u32),
 }
 
 /// A `--tour` in progress: the shot being loaded (black, waiting for streaming) or played.
@@ -641,6 +683,14 @@ impl App {
             clock: 0.0,
             pilot: None,
             pads: None,
+            battle: None,
+            watch: 0,
+            foot: None,
+            get_out: false,
+            pad_out: false,
+            script_out: None,
+            script_die: None,
+            battle_ms: (0.0, 0.0, 0.0, 0),
         };
         if let (true, Some(geo)) = (a.test_flight, state.geo.as_ref()) {
             // 450 knots, level, on the heading given
@@ -661,6 +711,57 @@ impl App {
             println!("             C view (chase, cockpit, fly-by), wheel distance, R restart");
             println!("             Controller: right trigger faster, left slower; left stick nose and roll (forward: nose down); bumpers turn;");
             println!("             right stick look round; A / Cross speed brakes; View / Select or Y / Triangle view; D-pad distance; Menu / Start restart");
+        }
+        if let (Some(n), Some(geo), Some(scene), Some(p)) = (a.battle, state.geo.as_ref(), state.r.globe.as_ref(), state.pilot.as_mut()) {
+            let terrain = scene.terrain.clone();
+            let ground = |pos: DVec3| globe::tiles::ground_radius(&terrain, pos);
+            let water = |pos: DVec3| {
+                // (water or woods within 60 m: no place for a truck)
+                let (lat, lon) = globe::tiles::lat_lon(pos);
+                terrain.cover.fractions(lat, lon, 60.0).map(|f| f[globe::landcover::WATER] > 0.15 || f[globe::landcover::TREE] > 0.15).unwrap_or(false)
+            };
+            let mut b = battle::Battle::new(geo.ecef, a.at[3], n, a.drones, a.trucks, &ground);
+            p.battle = true;
+            // SI_BATTLE="warm=20,immortal=1" (a testing aid): the fight has been going on for
+            // that many seconds when the picture starts; the pilot is never hit
+            let mut immortal = false;
+            let mut out = (-1.0, 0.0, 0.0, false);
+            if let Ok(script) = std::env::var("SI_BATTLE") {
+                for (k, v) in script.split(',').filter_map(|kv| kv.split_once('=')) {
+                    let x: f64 = v.parse().unwrap_or(0.0);
+                    match k.trim() {
+                        "warm" => {
+                            b.immortal = true;
+                            // (the pilot has been flying straight here all that time)
+                            let steps = (x * 30.0) as usize;
+                            for k in 0..steps {
+                                let pos = p.sim.pos - p.sim.vel * ((steps - k) as f64 / 30.0);
+                                b.step(1.0 / 30.0, &battle::Flown { pos, vel: p.sim.vel, rot: p.sim.model_rot(), fire: false }, &ground, &water);
+                            }
+                            b.news.clear();
+                        }
+                        "immortal" => immortal = x > 0.5,
+                        "team" => b.set_team(x as u8),
+                        "watch" => state.watch = (x as u8).min(3),
+                        "eject" => out.0 = x,
+                        "die" => state.script_die = Some(x),
+                        "look" => out.1 = x,
+                        "lookup" => out.2 = x,
+                        "shoot" => out.3 = x > 0.5,
+                        _ => {}
+                    }
+                }
+            }
+            b.immortal = immortal;
+            state.script_out = (out.0 >= 0.0).then_some((b.time + out.0, out.1, out.2, out.3));
+            state.script_die = state.script_die.map(|t| b.time + t);
+            println!("Battle: {n} other aircraft in eight squadrons, each against the other seven. You fly with {} squadron.", battle::SQUADRONS[b.team() as usize]);
+            println!("        F or Enter (B / Circle, X / Square on a controller) fires a rocket at whatever is nearest your nose.");
+            println!("        Shot down, you go on in another aircraft at a random place on the globe, and the fight goes with you. V: a camera that watches the aircraft, the drones, the trucks.");
+            println!("        E (the left stick pressed in): out of the aircraft on a parachute, with a gun: the mouse aims, its left button");
+            println!("        (or F, or the right trigger) fires, W A S D steer the parachute and walk. E or R again: into another aircraft.");
+            println!("        Below: {} drones in swarms, and {} trucks with rocket launchers and anti-aircraft guns.", a.drones, a.trucks);
+            state.battle = Some(b);
         }
         if let Some(path) = &a.tour {
             let shots = tour::load(path)?;
@@ -995,7 +1096,98 @@ impl App {
             let step = if self.args.shot.is_some() { 1.0 / 60.0 } else { dt as f64 };
             // (a controller flies it only while this is the window in front)
             let pad = s.pads.as_mut().map(|c| c.poll()).filter(|_| s.window.has_focus() || self.args.shot.is_some()).unwrap_or_default();
-            let view = p.update(&s.keys, &pad, step, s.looking, |pos| globe::tiles::ground_radius(terrain, pos));
+            let ground = |pos: DVec3| globe::tiles::ground_radius(terrain, pos);
+            let water = |pos: DVec3| {
+                // (water or woods within 60 m: no place for a truck)
+                let (lat, lon) = globe::tiles::lat_lon(pos);
+                terrain.cover.fractions(lat, lon, 60.0).map(|f| f[globe::landcover::WATER] > 0.15 || f[globe::landcover::TREE] > 0.15).unwrap_or(false)
+            };
+            let fire = pad.fire || ((s.keys.contains(&KeyCode::KeyF) || s.keys.contains(&KeyCode::Enter)) && s.window.has_focus());
+            // --battle: E gets the pilot out of the aircraft, and, on foot, into another
+            let scripted = s.script_out.filter(|o| s.battle.as_ref().map(|b| b.time >= o.0).unwrap_or(false));
+            if scripted.is_some() {
+                s.script_out = None;
+            }
+            let asked = std::mem::take(&mut s.get_out) || (pad.eject && !s.pad_out) || scripted.is_some();
+            s.pad_out = pad.eject;
+            if let (true, Some(b)) = (asked, s.battle.as_mut()) {
+                if s.foot.is_some() {
+                    let (pos, heading, speed) = b.take_over();
+                    p.take_over(pos, heading, speed);
+                    s.foot = None;
+                } else if !b.down() {
+                    b.eject();
+                    let mut f = foot::Foot::new(p.sim.pos, p.sim.vel);
+                    if let Some((_, round, lift, shoot)) = scripted {
+                        f.script(round, lift, shoot);
+                    }
+                    s.foot = Some(f);
+                    s.watch = 0;
+                }
+            }
+            let mut view = match s.foot.as_mut() {
+                Some(f) => f.update(&s.keys, &pad, fire || pad.rt > 0.5, step, ground),
+                None => p.update(&s.keys, &pad, step, s.looking, ground),
+            };
+            if let Some(b) = s.battle.as_mut() {
+                // --battle: everything else in the air moves a step; shot down (or into the
+                // ground), the pilot goes on in another aircraft
+                if (p.down || s.script_die.map(|t| b.time >= t).unwrap_or(false)) && s.foot.is_none() {
+                    b.crashed(p.sim.pos);
+                    s.script_die = None;
+                }
+                let flown = match &s.foot {
+                    // (on foot the fight stays round where the pilot stands)
+                    Some(f) => battle::Flown { pos: f.pos, vel: f.vel, rot: p.sim.model_rot(), fire: false },
+                    None => battle::Flown { pos: p.sim.pos, vel: p.sim.vel, rot: p.sim.model_rot(), fire },
+                };
+                let t = Instant::now();
+                b.step(step, &flown, &ground, &water);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                s.battle_ms = (s.battle_ms.0 + ms, s.battle_ms.1, s.battle_ms.2.max(ms), s.battle_ms.3 + 1);
+                if let Some(f) = s.foot.as_mut() {
+                    f.shoot(b, step);
+                } else if b.down() {
+                    // Shot down (or into the ground): the pilot goes on at a random place on the
+                    // globe, over land, in another squadron's aircraft, and the fight is there too.
+                    let mut at = (0.0, 0.0);
+                    for _ in 0..400 {
+                        at = ((2.0 * b.chance() - 1.0).asin().to_degrees(), 360.0 * b.chance() - 180.0);
+                        let dry = terrain.height(at.0, at.1) > 2.0 && !terrain.cover.water_at(at.0, at.1, 300.0).unwrap_or(false);
+                        // (not so far south or north that the sun is down all day in June)
+                        if dry && (-45.0..68.0).contains(&at.0) {
+                            break;
+                        }
+                    }
+                    let heading = 360.0 * b.chance();
+                    let pos = geo_place(terrain, at.0, at.1, 2500.0);
+                    b.move_to(pos, heading, &ground);
+                    p.take_over(pos, heading, 240.0);
+                    // (the clock is put to between half past nine and half past three there, by the sun)
+                    let hour = 9.5 + 6.0 * b.chance();
+                    geo.time = globe::sky::parse_utc("2026-06-21").unwrap() + (hour - at.1 / 15.0).rem_euclid(24.0) * 3600.0;
+                    geo.frame = globe::scene::frame_at(pos);
+                    geo.prev = None;
+                    println!(
+                        "Now over {:.2} {}, {:.2} {} with {} squadron (--at {:.4},{:.4},2500,{:.0},0).",
+                        at.0.abs(),
+                        if at.0 >= 0.0 { "N" } else { "S" },
+                        at.1.abs(),
+                        if at.1 >= 0.0 { "E" } else { "W" },
+                        battle::SQUADRONS[b.team() as usize],
+                        at.0,
+                        at.1,
+                        heading
+                    );
+                    view = p.update(&s.keys, &gamepad::Pad::default(), 1e-4, s.looking, ground);
+                }
+                for line in b.news.drain(..) {
+                    println!("{line}");
+                }
+                if s.watch > 0 {
+                    view = b.watch(step, s.watch);
+                }
+            }
             geo.ecef = view.pos;
             geo.frame = globe::scene::transport(geo.frame, geo.ecef);
             (fwd, right, up) = ((geo.frame * view.fwd).as_vec3(), (geo.frame * view.right).as_vec3(), (geo.frame * view.up).as_vec3());
@@ -1136,7 +1328,35 @@ impl App {
             ..Default::default()
         };
         if let (Some(p), Some(geo)) = (s.pilot.as_mut(), s.geo.as_ref()) {
-            s.r.ac_pose = Some(p.fill(&mut g, geo.frame, geo.ecef));
+            match &s.foot {
+                None => {
+                    s.r.ac_pose = Some(p.fill(&mut g, geo.frame, geo.ecef));
+                    s.r.ac_hidden = false;
+                }
+                Some(_) => {
+                    // on foot: no aircraft of the pilot's own is drawn, and what the shaders do
+                    // round one (its flame, its vapour, its shock waves) is put far out of sight
+                    let far = glam::Affine3A::from_translation(Vec3::new(0.0, -1.0e7, 0.0));
+                    s.r.ac_pose = Some(aircraft::Pose { xform: far, back: glam::Affine3A::IDENTITY, lef: 0.0, flaperon: [0.0; 2], tail: [0.0; 2], rudder: 0.0 });
+                    s.r.ac_hidden = true;
+                    g.ac_inv = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 1.0e7], [0.0, 0.0, 1.0, 0.0]];
+                    g.ac_state = [1.0, 0.0, 0.0, 0.0];
+                    g.ac_state2 = [0.0, 0.0, 1.0, 0.0];
+                    g.ac_vel = [0.0, 0.0, 1.0, 0.0];
+                }
+            }
+            if let Some(b) = s.battle.as_mut() {
+                // the others, the rockets, the smoke and the fire (main.rgen gathers them: 2)
+                g.ac_state[0] = 2.0;
+                s.r.ac_livery = b.team() as u32;
+                let t = Instant::now();
+                b.draw(geo.frame, geo.ecef, &mut s.r.crafts, &mut s.r.fx);
+                if let Some(f) = s.foot.as_mut() {
+                    // (the gun in the pilot's hands, the parachute overhead)
+                    f.draw(geo.frame, geo.ecef, &mut s.r.crafts, &mut s.r.fx);
+                }
+                s.battle_ms.1 += t.elapsed().as_secs_f64() * 1e3;
+            }
         }
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -1192,6 +1412,28 @@ impl App {
                     );
                 }
                 println!("{}", s.r.profile.line());
+                if let Some(b) = &s.battle {
+                    // (the stress test's own numbers, as of this frame)
+                    let rockets = s.r.crafts.iter().filter(|c| c.kind == aircraft::KIND_ROCKET).count();
+                    let n = s.battle_ms.3.max(1) as f64;
+                    println!(
+                        "battle: {} aircraft, {} rockets, {} drones and {} trucks drawn, {} pieces of smoke and fire, {} flying ({} within 1 km of the pilot, {} within 2 km; formation at {:?} m); {} trucks burnt out, {} rockets from the ground; cpu: step {:.2} ms (worst {:.2}), picture {:.2} ms",
+                        s.r.crafts.iter().filter(|c| c.kind == aircraft::KIND_JET).count() + 1,
+                        rockets,
+                        b.below().0,
+                        b.below().1,
+                        s.r.fx.len(),
+                        b.flying(),
+                        b.near(1000.0).0,
+                        b.near(2000.0).0,
+                        b.near(0.0).1,
+                        b.razed,
+                        b.from_ground,
+                        s.battle_ms.0 / n,
+                        s.battle_ms.2,
+                        s.battle_ms.1 / n
+                    );
+                }
                 if std::env::var("SI_MEM").is_ok() {
                     print!("{}", s.r.gpu.memory_report());
                 }
@@ -1224,7 +1466,12 @@ impl App {
         let el_t = s.fps_time.elapsed().as_secs_f32();
         if let (Some(p), true) = (&s.pilot, el_t > 0.1) {
             // --test-flight: the instruments
-            s.window.set_title(&format!("{} | {:.0} fps", p.hud(), s.fps_frames as f32 / el_t));
+            let fight = s.battle.as_ref().map(|b| format!("{} | ", b.hud())).unwrap_or_default();
+            let own = match (&s.foot, &s.r.globe) {
+                (Some(f), Some(scene)) => f.hud(globe::tiles::ground_radius(&scene.terrain, f.pos)),
+                _ => p.hud(),
+            };
+            s.window.set_title(&format!("{fight}{own} | {:.0} fps", s.fps_frames as f32 / el_t));
             s.fps_time = Instant::now();
             s.fps_frames = 0;
         } else if el_t > 0.5 {
@@ -1287,9 +1534,22 @@ impl App {
             // --test-flight: the keys that fly are the pilot's
             match code {
                 KeyCode::KeyC => return p.next_view(),
+                KeyCode::KeyE if s.battle.is_some() => {
+                    s.get_out = true;
+                    return;
+                }
+                KeyCode::KeyR if s.foot.is_some() => {
+                    s.get_out = true;
+                    return;
+                }
                 KeyCode::KeyR => return p.reset(),
+                KeyCode::KeyV if s.battle.is_some() => {
+                    s.watch = (s.watch + 1) % 4;
+                    println!("Camera: {}", ["with the pilot", "watching the aircraft", "with the drones", "at the trucks"][s.watch as usize]);
+                    return;
+                }
                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::KeyV | KeyCode::KeyF | KeyCode::KeyB => return,
-                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Space => return,
+                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Space | KeyCode::Enter => return,
                 KeyCode::Numpad4 | KeyCode::Numpad5 | KeyCode::Numpad6 | KeyCode::Numpad8 => return,
                 _ => {}
             }
@@ -1483,6 +1743,9 @@ impl ApplicationHandler for App {
                             s.window.set_cursor_visible(false);
                         } else {
                             p.mouse_fly = state == ElementState::Pressed;
+                            if let Some(f) = s.foot.as_mut() {
+                                f.trigger = state == ElementState::Pressed;
+                            }
                         }
                     }
                     match button {
@@ -1538,7 +1801,9 @@ impl ApplicationHandler for App {
                     // --test-flight: the mouse looks round the aircraft, as in GTA V (the view
                     // goes back behind it a moment after the mouse stops); with the left button
                     // held it is the stick
-                    if s.captured || s.looking || p.mouse_fly {
+                    if let Some(f) = s.foot.as_mut() {
+                        f.mouse(delta.0, delta.1);
+                    } else if s.captured || s.looking || p.mouse_fly {
                         p.mouse(delta.0, delta.1);
                     }
                 } else if s.looking || s.captured {
