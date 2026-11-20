@@ -453,6 +453,8 @@ struct State {
     /// SI_BATTLE eject=, look=, lookup=, shoot= (a testing aid): out of the aircraft after that
     /// many seconds, looking that way, firing
     script_out: Option<(f64, f64, f64, bool)>,
+    /// SI_BATTLE die= (a testing aid): the pilot is lost after that many seconds
+    script_die: Option<f64>,
     /// milliseconds the fight has taken on the CPU (its step, its picture) and the worst frame, since the last report
     battle_ms: (f64, f64, f64, u32),
 }
@@ -687,6 +689,7 @@ impl App {
             get_out: false,
             pad_out: false,
             script_out: None,
+            script_die: None,
             battle_ms: (0.0, 0.0, 0.0, 0),
         };
         if let (true, Some(geo)) = (a.test_flight, state.geo.as_ref()) {
@@ -741,6 +744,7 @@ impl App {
                         "team" => b.set_team(x as u8),
                         "watch" => state.watch = (x as u8).min(3),
                         "eject" => out.0 = x,
+                        "die" => state.script_die = Some(x),
                         "look" => out.1 = x,
                         "lookup" => out.2 = x,
                         "shoot" => out.3 = x > 0.5,
@@ -750,9 +754,10 @@ impl App {
             }
             b.immortal = immortal;
             state.script_out = (out.0 >= 0.0).then_some((b.time + out.0, out.1, out.2, out.3));
+            state.script_die = state.script_die.map(|t| b.time + t);
             println!("Battle: {n} other aircraft in eight squadrons, each against the other seven. You fly with {} squadron.", battle::SQUADRONS[b.team() as usize]);
             println!("        F or Enter (B / Circle, X / Square on a controller) fires a rocket at whatever is nearest your nose.");
-            println!("        Shot down, you go on in another aircraft somewhere else in the fight. V: a camera that watches the aircraft, the drones, the trucks.");
+            println!("        Shot down, you go on in another aircraft at a random place on the globe, and the fight goes with you. V: a camera that watches the aircraft, the drones, the trucks.");
             println!("        E (the left stick pressed in): out of the aircraft on a parachute, with a gun: the mouse aims, its left button");
             println!("        (or F, or the right trigger) fires, W A S D steer the parachute and walk. E or R again: into another aircraft.");
             println!("        Below: {} drones in swarms, and {} trucks with rocket launchers and anti-aircraft guns.", a.drones, a.trucks);
@@ -1127,8 +1132,9 @@ impl App {
             if let Some(b) = s.battle.as_mut() {
                 // --battle: everything else in the air moves a step; shot down (or into the
                 // ground), the pilot goes on in another aircraft
-                if p.down && s.foot.is_none() {
+                if (p.down || s.script_die.map(|t| b.time >= t).unwrap_or(false)) && s.foot.is_none() {
                     b.crashed(p.sim.pos);
+                    s.script_die = None;
                 }
                 let flown = match &s.foot {
                     // (on foot the fight stays round where the pilot stands)
@@ -1142,8 +1148,37 @@ impl App {
                 if let Some(f) = s.foot.as_mut() {
                     f.shoot(b, step);
                 } else if b.down() {
-                    let (pos, heading, speed) = b.take_over();
-                    p.take_over(pos, heading, speed);
+                    // Shot down (or into the ground): the pilot goes on at a random place on the
+                    // globe, over land, in another squadron's aircraft, and the fight is there too.
+                    let mut at = (0.0, 0.0);
+                    for _ in 0..400 {
+                        at = ((2.0 * b.chance() - 1.0).asin().to_degrees(), 360.0 * b.chance() - 180.0);
+                        let dry = terrain.height(at.0, at.1) > 2.0 && !terrain.cover.water_at(at.0, at.1, 300.0).unwrap_or(false);
+                        // (not so far south or north that the sun is down all day in June)
+                        if dry && (-45.0..68.0).contains(&at.0) {
+                            break;
+                        }
+                    }
+                    let heading = 360.0 * b.chance();
+                    let pos = geo_place(terrain, at.0, at.1, 2500.0);
+                    b.move_to(pos, heading, &ground);
+                    p.take_over(pos, heading, 240.0);
+                    // (the clock is put to between half past nine and half past three there, by the sun)
+                    let hour = 9.5 + 6.0 * b.chance();
+                    geo.time = globe::sky::parse_utc("2026-06-21").unwrap() + (hour - at.1 / 15.0).rem_euclid(24.0) * 3600.0;
+                    geo.frame = globe::scene::frame_at(pos);
+                    geo.prev = None;
+                    println!(
+                        "Now over {:.2} {}, {:.2} {} with {} squadron (--at {:.4},{:.4},2500,{:.0},0).",
+                        at.0.abs(),
+                        if at.0 >= 0.0 { "N" } else { "S" },
+                        at.1.abs(),
+                        if at.1 >= 0.0 { "E" } else { "W" },
+                        battle::SQUADRONS[b.team() as usize],
+                        at.0,
+                        at.1,
+                        heading
+                    );
                     view = p.update(&s.keys, &gamepad::Pad::default(), 1e-4, s.looking, ground);
                 }
                 for line in b.news.drain(..) {

@@ -891,7 +891,8 @@ cargo run --release -- --battle 120      # a skirmish
   with you. The fight stays round you, at your height and your speed, wherever you fly.
 - **You** fly the same aircraft with the same controls, and fire rockets (F or Enter; B /
   Circle or X / Square on a controller) at whatever is nearest your nose. Shot down, or flown
-  into the ground, you go on in another aircraft: one of another squadron, half the fight away.
+  into the ground, you go on at a random place on the globe: over land, in daylight there, in
+  an aircraft of another squadron, and the whole fight is there with you (the console says where).
   V gives the view to a camera that follows the aircraft, then one with a swarm of drones, then
   one that goes round a truck.
 - **The war below** (`--drones n`, 1000; `--trucks n`, 120). Drones fly in swarms of 25, each

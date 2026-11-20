@@ -404,38 +404,20 @@ impl Battle {
         let ahead = north * c + east * s;
         let own = b.fresh(centre, ahead * 230.0, 0);
         b.jets.push(own);
+        // (the squadrons take them in turn; where each of them starts: `gather`)
         for i in 0..n {
-            // the pilot's squadron comes in behind the pilot; the others from all round
-            let team = ((i + 1) % 8) as u8;
-            let bearing = heading.to_radians() + std::f64::consts::PI + team as f64 * std::f64::consts::TAU / 8.0;
-            let out = north * bearing.cos() + east * bearing.sin();
-            let side = out.cross(up);
-            let dist = if team == 0 { b.rng.range(120.0, 900.0) } else { b.radius * b.rng.range(0.5, 0.9) };
-            let p = centre + out * dist + side * b.rng.range(-0.12, 0.12) * b.radius.max(4.0 * dist.min(2000.0));
-            let p = p.normalize() * (centre.length() + b.rng.range(-700.0, 700.0)).max(ground(p) + 600.0);
-            let to = if team == 0 { ahead } else { (centre - p).normalize() };
-            let to = (to - p.normalize() * to.dot(p.normalize())).normalize();
-            let speed = b.rng.range(260.0, 330.0);
-            let mut j = b.fresh(p, to * speed, team);
-            j.ground = ground(p);
-            j.fire = b.rng.range(4.0, 11.0);
+            let j = b.fresh(centre, ahead * 230.0, ((i + 1) % 8) as u8);
             b.jets.push(j);
         }
         // the drones, 25 to a swarm, the swarms shared out among the squadrons
         const SWARM: usize = 25;
         for w in 0..drones.div_ceil(SWARM) {
-            let out = b.rng.dir();
-            let out = (out - up * out.dot(up)).normalize_or(east);
-            let p = centre + out * b.radius * b.rng.range(0.3, 1.0);
             let height = b.rng.range(220.0, 520.0);
-            let g = ground(p);
-            let pos = p.normalize() * (g + height);
-            let vel = -out.cross(up) * 78.0;
-            b.swarms.push(Swarm { pos, vel, team: (w % 8) as u8, goal: None, wander: DVec3::ZERO, think: 0.0, peel: 0.0, ground: g, ground_at: 0.0, height });
+            b.swarms.push(Swarm { pos: centre, vel: ahead * 78.0, team: (w % 8) as u8, goal: None, wander: DVec3::ZERO, think: 0.0, peel: 0.0, ground: 0.0, ground_at: 0.0, height });
             for k in 0..SWARM.min(drones - w * SWARM) {
                 let place = DVec3::new(((k % 5) as f64 - 2.0) * 16.0, ((k / 5) % 2) as f64 * 9.0, (k / 5) as f64 * 14.0);
                 let phase = b.rng.range(0.0, 6.0);
-                b.drones.push(Drone { pos: pos + place, vel, prev: None, swarm: w, place, alive: true, since: 0.0, dive: None, ground: 0.0, ground_at: phase * 0.15, phase });
+                b.drones.push(Drone { pos: centre + place, vel: ahead * 78.0, prev: None, swarm: w, place, alive: true, since: 0.0, dive: None, ground: 0.0, ground_at: 0.0, phase });
             }
         }
         // the trucks: they are stood on the ground in the first steps (ground_war)
@@ -443,7 +425,82 @@ impl Battle {
             let kind = if k % 2 == 0 { SiteKind::Launcher } else { SiteKind::Gun };
             b.sites.push(Site { kind, team: ((k / 2) % 8) as u8, pos: centre, up, rot: DMat3::IDENTITY, prev: None, placed: false, hp: 4, burning: None, aim: None, think: 0.0, fire: 0.0, burst: 0.0, round: 0.0 });
         }
+        b.gather(heading, ground);
         b
+    }
+
+    /// Everything is put round the middle of the fight, as at the start: the pilot's squadron
+    /// close behind the pilot (who heads `heading` degrees), the other squadrons coming in from
+    /// all round, the swarms anywhere in it. The trucks are stood on the ground again in the
+    /// steps that follow (ground_war).
+    fn gather(&mut self, heading: f64, ground: &dyn Fn(DVec3) -> f64) {
+        let centre = self.centre;
+        let up = centre.normalize();
+        let east = DVec3::Z.cross(up).normalize_or(DVec3::X);
+        let north = up.cross(east);
+        let (s, c) = heading.to_radians().sin_cos();
+        let ahead = north * c + east * s;
+        let own = self.jets[0].team;
+        for i in 1..self.jets.len() {
+            let team = self.jets[i].team;
+            let bearing = heading.to_radians() + std::f64::consts::PI + ((team + 8 - own) % 8) as f64 * std::f64::consts::TAU / 8.0;
+            let out = north * bearing.cos() + east * bearing.sin();
+            let side = out.cross(up);
+            let dist = if team == own { self.rng.range(120.0, 900.0) } else { self.radius * self.rng.range(0.5, 0.9) };
+            let p = centre + out * dist + side * self.rng.range(-0.12, 0.12) * self.radius.max(4.0 * dist.min(2000.0));
+            let p = p.normalize() * (centre.length() + self.rng.range(-700.0, 700.0)).max(ground(p) + 600.0);
+            let to = if team == own { ahead } else { (centre - p).normalize() };
+            let to = (to - p.normalize() * to.dot(p.normalize())).normalize();
+            let speed = self.rng.range(260.0, 330.0);
+            let mut j = self.fresh(p, to * speed, team);
+            j.ground = ground(p);
+            j.fire = self.time + self.rng.range(4.0, 11.0);
+            self.jets[i] = j;
+        }
+        for w in 0..self.swarms.len() {
+            let out = self.rng.dir();
+            let out = (out - up * out.dot(up)).normalize_or(east);
+            let p = centre + out * self.radius * self.rng.range(0.3, 1.0);
+            let g = ground(p);
+            let sw = &mut self.swarms[w];
+            (sw.ground, sw.ground_at, sw.think, sw.goal, sw.wander) = (g, self.time, self.time, None, DVec3::ZERO);
+            sw.pos = p.normalize() * (g + sw.height);
+            sw.vel = -out.cross(up) * 78.0;
+        }
+        for d in self.drones.iter_mut() {
+            let sw = &self.swarms[d.swarm];
+            (d.pos, d.vel, d.prev, d.alive, d.dive) = (sw.pos + d.place, sw.vel, None, true, None);
+            (d.ground, d.ground_at) = (0.0, self.time + 0.15 * d.phase);
+        }
+        for s in self.sites.iter_mut() {
+            (s.placed, s.burning, s.aim, s.prev) = (false, None, None, None);
+        }
+    }
+
+    /// The pilot goes on somewhere else altogether (shot down: a random place on the globe), at
+    /// `centre` heading `heading` degrees, in an aircraft of another squadron. The fight is
+    /// there too: everything in it is put round the new place as at the start, and what was in
+    /// the air where it was is gone.
+    pub fn move_to(&mut self, centre: DVec3, heading: f64, ground: &dyn Fn(DVec3) -> f64) {
+        self.centre = centre;
+        self.rockets.clear();
+        self.sparks.clear();
+        self.blasts.clear();
+        self.ghosts.clear();
+        self.wing.clear();
+        self.watching = None;
+        let team = (self.jets[0].team + 1 + (self.rng.next() * 7.0) as u8 % 7) % 8;
+        let up = centre.normalize();
+        let east = DVec3::Z.cross(up).normalize_or(DVec3::X);
+        let (s, c) = heading.to_radians().sin_cos();
+        self.jets[0] = self.fresh(centre, (up.cross(east) * c + east * s) * 240.0, team);
+        self.gather(heading, ground);
+        self.shield = self.time + 5.0;
+    }
+
+    /// A number from 0 to 1 by chance (where on the globe the pilot goes on).
+    pub fn chance(&mut self) -> f64 {
+        self.rng.next()
     }
 
     fn fresh(&mut self, pos: DVec3, vel: DVec3, team: u8) -> Jet {
@@ -1712,6 +1769,31 @@ mod tests {
         // the old aircraft is still there, falling
         assert_eq!(b.jets.iter().filter(|j| j.state == State::Falling).count(), 1);
         assert_eq!(b.jets.len(), 25);
+    }
+
+    #[test]
+    fn the_fight_goes_with_the_pilot_to_another_place() {
+        // shot down, the pilot goes on a quarter of the way round the globe: in another
+        // squadron, with all of the fight round the new place and none of it left behind
+        let mut b = run(40, 20.0);
+        let team = b.team();
+        let ground = |_: DVec3| R_EARTH;
+        b.sites.extend((0..8).map(|k| Site { kind: SiteKind::Gun, team: k as u8, pos: b.centre, up: DVec3::X, rot: DMat3::IDENTITY, prev: None, placed: true, hp: 4, burning: None, aim: None, think: 0.0, fire: 0.0, burst: 0.0, round: 0.0 }));
+        let there = DVec3::Y * (R_EARTH + 2500.0);
+        b.move_to(there, 90.0, &ground);
+        assert!(!b.down() && b.team() != team);
+        assert!(b.rockets.is_empty() && b.sparks.is_empty() && b.blasts.is_empty());
+        assert_eq!(b.jets.len(), 41);
+        for j in &b.jets {
+            assert!(j.state == State::Flying && (j.pos - there).length() < 2.0 * b.radius, "{:.0} m from the new place", (j.pos - there).length());
+        }
+        assert!(b.sites.iter().all(|s| !s.placed));
+        // and it goes on from there
+        let flown = Flown { pos: there, vel: DVec3::Z * 240.0, rot: rot_of(DVec3::Z, DVec3::Y), fire: false };
+        for _ in 0..600 {
+            b.step(1.0 / 60.0, &flown, &ground, &|_| false);
+        }
+        assert!(b.sites.iter().filter(|s| s.placed).count() >= 6 && b.flying() >= 30);
     }
 
     #[test]
