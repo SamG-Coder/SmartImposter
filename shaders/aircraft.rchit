@@ -1,6 +1,7 @@
 #version 460
 #extension GL_GOOGLE_include_directive : require
 #include "rt.glsl"
+#include "livery.glsl"
 
 // Closest hit for the aircraft of --test-flight (src/aircraft.rs). Its materials are flat colours
 // with a metalness and a roughness, except the painted skin: one atlas in which the aircraft is
@@ -16,6 +17,7 @@ layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[];
 layout(set = 0, binding = 36) uniform sampler2D acTex[3];
 struct AcMaterial { vec4 base; vec4 mre; vec4 emit; };
 layout(set = 0, binding = 37, scalar) readonly buffer AcMats { AcMaterial acMats[]; };
+layout(set = 0, binding = 38, scalar) readonly buffer Crafts { CraftRec crafts[]; };
 
 void main() {
     MeshInfo m = meshes[gl_InstanceCustomIndexEXT & 0x7FFu];
@@ -43,6 +45,8 @@ void main() {
         vec3 orm = textureLod(acTex[1], uv, max(lod - 1.0, 0.0)).rgb;
         rough = orm.g;
         metal = orm.b;
+        // its squadron's colours (--battle)
+        albedo = liveryColour(int(crafts[gl_InstanceCustomIndexEXT >> 11].info.x), uv, albedo, metal);
         // The normal map's two axes: along the atlas (aft on the aircraft), and up it: to the
         // right in the drawings from above and below (the atlas's first 5248 rows of 8192,
         // counted from the bottom), upwards in the two from the side.
@@ -65,4 +69,5 @@ void main() {
     pl.trans = vec3(rough, metal, mt.base.a);
     pl.wtan = mt.emit.rgb;
     pl.wdepth = 0.0;
+    pl.craft = gl_InstanceCustomIndexEXT >> 11;
 }

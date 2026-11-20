@@ -866,6 +866,59 @@ The model as Blender renders it (`tools/make_f16.py --renders`):
   path. Inside a thick deck that tube is what keeps the aircraft in sight of the chase camera;
   the lane it leaves in thin or broken cloud is subtle.
 
+**Battle** (`--battle [n]`, `src/battle.rs`): a stress test in the shape of a game. The test
+flight, in the middle of a fight between `n` other aircraft (120 unless a number is given, up to
+4000): eight made-up squadrons, each in its own paint, every one against the other seven.
+
+```
+cargo run --release -- --battle          # 120 other aircraft
+cargo run --release -- --battle 1000
+```
+
+![The pilot's view: a wingman in afterburner, rocket trails, a wreck going down](docs/images/battle.jpg)
+
+![The camera that watches the fight (V), and the pilot's view with 1000 aircraft](docs/images/battle_views.jpg)
+
+![The eight squadrons' paint](docs/images/battle_squadrons.jpg)
+
+- **The fight.** They chase the nearest aircraft of another squadron, fire rockets that home
+  on it and guns at close range, throw flares and break away when a rocket is after them, and
+  burn, tumble and fall when hit. Those shot down come back at the edge of the fight, so the
+  number in the air stays about what was asked for. Four of your own squadron fly in formation
+  with you. The fight stays round you, at your height and your speed, wherever you fly.
+- **You** fly the same aircraft with the same controls, and fire rockets (F or Enter; B /
+  Circle or X / Square on a controller) at whatever is nearest your nose. Shot down, or flown
+  into the ground, you go on in another aircraft: one of another squadron, half the fight away.
+  V gives the view to a camera that follows the fight instead of you.
+- **What it stresses.** Every aircraft is the full model, nine instances of its ~80,000
+  triangles in the acceleration structure, rebuilt every frame. Every rocket trail, afterburner
+  flame, tracer, flare, fireball, smoke cloud and wing-tip vapour trail is a volume: a tube of
+  Gaussian section (or a ball), an instance of one unit box with its own mask bit and its own
+  intersection and any-hit shaders (`shaders/fx.glsl`, `fx.rint`, `fx.rahit`). One extra ray a
+  pixel gathers all of them in front of what the pixel shows; no sorting, the sums do not
+  depend on the order.
+- **The paint** (`shaders/livery.glsl`) is worked out in the hit shader from where on the
+  aircraft a point is, which the skin's texture coordinate says: camouflage in place of the
+  greys, an emblem on the wings and the fin. The panel lines, the wear and the bare metal of
+  the painted skin show through. It is one airframe in eight schemes: the squadrons and their
+  emblems are invented, not any country's.
+- **The other aircraft do not fly the flight model.** They are points that turn at a limited g
+  (6 to 9, by the pilot's skill) and bank the way the turn asks. They do not collide with each
+  other. The rockets and guns are a game's, not models of real weapons.
+
+Measured on an RTX 5080 at 1600x900, DLSS Quality, one scripted run each of 900 frames, level
+over Lake Como with the fight 20 s old (frame times vary with what is in view: p95 was 17 to
+27 ms):
+
+| other aircraft | frame, average | of it GPU | the fight on the CPU | instances traced | pieces of smoke and fire |
+|---|---|---|---|---|---|
+| none (`--test-flight`) | 10.6 ms | 8.1 ms | | 11,985 | 0 |
+| 120 | 11.1 ms | 8.3 ms | 0.2 ms | 16,172 | 3,102 |
+| 400 | 11.2 ms | 8.6 ms | 0.7 ms | 24,275 | 8,688 |
+| 1000 | 12.0 ms | 8.7 ms | 1.6 ms | 41,517 | 20,528 |
+| 2000 | 13.2 ms | 8.6 ms | 3.3 ms | 71,199 | 41,183 |
+| 4000 | 17.9 ms | 9.5 ms | 6.6 ms | 137,909 | 90,025 |
+
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
 
@@ -978,6 +1031,7 @@ cargo run --release
 | `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
+| `--battle [n]` | the test flight in the middle of a fight between `n` other aircraft (120; up to 4000): a stress test (see [Battle](#the-earth-a-11-globe-and-real-places)). V watches the fight, F fires |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
 | `--debug N` | 1 LOD view, 2 normals, 3 albedo, 4 AO, 5 sun visibility, 6/7 TAA history, 8 leaf transmission, 9 sheen (x16), 10 diffuse, 11 ground layers |
 | `--biome temperate\|boreal\|rainforest\|savanna\|desert\|tundra\|mediterranean\|alpine` | what grows on the generated (eroded) terrain, its ground, treeline and light (see [Biomes](#7-terrain-rivers-forest-growth-and-ground)); `--sun` and `--haze` override the biome's |
@@ -1053,6 +1107,8 @@ cargo run --release
 | Space | speed brakes (hold) |
 | C | view: chase, cockpit, fly-by |
 | R | back to the start |
+| F or Enter (`--battle`) | fire a rocket at the aircraft of another squadron nearest your nose |
+| V (`--battle`) | the camera watches the fight / follows you |
 | **controller** (`--test-flight`) | a PlayStation controller (DualSense, DualShock 4: read directly over USB or Bluetooth) or any gamepad the system reports (Xbox); the layout is Grand Theft Auto V's too; it flies only while the window is in front |
 | right / left trigger | faster / slower (held past idle: speed brakes) |
 | left stick | the stick: forward nose down, back nose up, sideways roll (gentle near the centre, all the aircraft can do at the rim) |
@@ -1062,6 +1118,7 @@ cargo run --release
 | View / Select (or Y / Triangle) | view: chase, cockpit, fly-by |
 | D-pad up / down | chase distance |
 | Menu / Start | back to the start |
+| B / Circle or X / Square (`--battle`) | fire a rocket |
 
 ## Tools
 
@@ -1111,6 +1168,7 @@ src/
   flight.rs     the flight model: atmosphere, forces, engine, fly-by-wire control laws
   pilot.rs      keys to stick and throttle, the chase / cockpit / fly-by cameras, the wake
   gamepad.rs    a game controller for the test flight (PlayStation over HID, the rest through gilrs)
+  battle.rs     --battle: the other aircraft, their rockets, the smoke and fire, the watching camera
   globe/        the 1:1 Earth as a mode of the renderer:
     scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
     tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
@@ -1123,8 +1181,9 @@ native/
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rchit  aircraft.rchit  aircraft.rahit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl,
-  lawnh.glsl, globe.glsl, atmosphere.glsl, clouds.glsl, aircraft.glsl)
+  globe.rchit  aircraft.rchit  aircraft.rahit  fx.rint  fx.rahit  fx.rmiss  (+ rt.glsl,
+  globals.glsl, shared.glsl, lawn.glsl, lawnh.glsl, globe.glsl, atmosphere.glsl, clouds.glsl,
+  aircraft.glsl, livery.glsl, fx.glsl)
 tools/   asset converters, the Earth data downloader, comparisons, tour recording (see Tools)
 tours/   tour files for --tour
 ```
@@ -1160,6 +1219,12 @@ tours/   tour files for --tour
   the canopy is an opaque gold mirror. Only the DLSS path has the aircraft's motion vectors:
   under TAA it will probably smear (not tried). The effects are tuned by eye, not measured.
   Trees and fine terrain may still be streaming in under a fast, low aircraft.
+- **Battle (`--battle`):** the smoke and fire have no shadows and light nothing but themselves;
+  they are not seen in reflections; against clouds they are placed by one distance a pixel (their
+  middle), so a trail that passes through a cloud is all in front of it or all behind. Only the
+  one you fly has the speed effects of the test flight (vapour cone, shock waves, a wake in the
+  clouds). Past 262,144 pieces of smoke and fire the wing-tip vapour is dropped first. The
+  speeds, ranges and hit chances are tuned for a busy sky, not taken from anything real.
 - **Instance budget order:** past the 8M-instance budget, plants are demoted to impostors in
   scatter order, not nearest first. Only very long mesh distances reach it.
 

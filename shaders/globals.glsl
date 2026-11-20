@@ -34,10 +34,7 @@ struct Globals {
     vec4 acInv0;    // --test-flight, the aircraft: the renderer's frame -> its model frame (rows, w the translation)
     vec4 acInv1;
     vec4 acInv2;
-    vec4 acPrev0;   //   a point on the aircraft this frame -> where it was last frame (rows): motion vectors
-    vec4 acPrev1;
-    vec4 acPrev2;
-    vec4 acState;   //   x 1 = an aircraft is flying, y afterburner 0..1, z Mach number, w vapour cone 0..1
+    vec4 acState;   //   x 1 = an aircraft is flying (2: in --battle, with smoke and fire to gather), y afterburner 0..1, z Mach number, w vapour cone 0..1
     vec4 acState2;  //   x vapour over the wings 0..1, y points in the wake, z air density / sea level's, w seconds flown
     vec4 acVel;     //   xyz which way the air goes past the aircraft (model frame, unit), w engine power 0..1
     vec4 wake[32];  //   where the aircraft has been, newest first (the renderer's frame); w age (s)

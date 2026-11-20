@@ -7,6 +7,7 @@
 mod accel;
 mod aircraft;
 mod atlas;
+mod battle;
 mod biome;
 mod asset;
 mod bc7;
@@ -112,6 +113,9 @@ struct Args {
     /// `--test-flight`: fly the F-16 (tools/make_f16.py) over the globe (flight.rs, pilot.rs),
     /// starting at `--at` (lat, lon, height above the ground, heading)
     test_flight: bool,
+    /// `--battle [n]`: the test flight in the middle of a fight between n other aircraft
+    /// (battle.rs): a stress test
+    battle: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -164,6 +168,7 @@ fn parse_args() -> Args {
         dlss: Some(1),
         sharpen: 0.5,
         test_flight: false,
+        battle: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -329,6 +334,18 @@ fn parse_args() -> Args {
                 a.globe = true;
                 i -= 1;
             }
+            "--battle" => {
+                a.test_flight = true;
+                a.globe = true;
+                // (the number of aircraft is optional)
+                match next.parse::<usize>() {
+                    Ok(n) => a.battle = Some(n.min(4000)),
+                    Err(_) => {
+                        a.battle = Some(120);
+                        i -= 1;
+                    }
+                }
+            }
             other => eprintln!("unknown argument {other}"),
         }
         i += 2;
@@ -415,6 +432,11 @@ struct State {
     pilot: Option<pilot::Pilot>,
     /// --test-flight: the game controllers
     pads: Option<gamepad::Pads>,
+    /// --battle: everything else in the air; and the camera watches the fight, not the pilot (V)
+    battle: Option<battle::Battle>,
+    watch: bool,
+    /// milliseconds the fight has taken on the CPU (its step, its picture) and the worst frame, since the last report
+    battle_ms: (f64, f64, f64, u32),
 }
 
 /// A `--tour` in progress: the shot being loaded (black, waiting for streaming) or played.
@@ -641,6 +663,9 @@ impl App {
             clock: 0.0,
             pilot: None,
             pads: None,
+            battle: None,
+            watch: false,
+            battle_ms: (0.0, 0.0, 0.0, 0),
         };
         if let (true, Some(geo)) = (a.test_flight, state.geo.as_ref()) {
             // 450 knots, level, on the heading given
@@ -661,6 +686,41 @@ impl App {
             println!("             C view (chase, cockpit, fly-by), wheel distance, R restart");
             println!("             Controller: right trigger faster, left slower; left stick nose and roll (forward: nose down); bumpers turn;");
             println!("             right stick look round; A / Cross speed brakes; View / Select or Y / Triangle view; D-pad distance; Menu / Start restart");
+        }
+        if let (Some(n), Some(geo), Some(scene), Some(p)) = (a.battle, state.geo.as_ref(), state.r.globe.as_ref(), state.pilot.as_mut()) {
+            let terrain = scene.terrain.clone();
+            let ground = |pos: DVec3| globe::tiles::ground_radius(&terrain, pos);
+            let mut b = battle::Battle::new(geo.ecef, a.at[3], n, &ground);
+            p.battle = true;
+            // SI_BATTLE="warm=20,immortal=1" (a testing aid): the fight has been going on for
+            // that many seconds when the picture starts; the pilot is never hit
+            let mut immortal = false;
+            if let Ok(script) = std::env::var("SI_BATTLE") {
+                for (k, v) in script.split(',').filter_map(|kv| kv.split_once('=')) {
+                    let x: f64 = v.parse().unwrap_or(0.0);
+                    match k.trim() {
+                        "warm" => {
+                            b.immortal = true;
+                            // (the pilot has been flying straight here all that time)
+                            let steps = (x * 30.0) as usize;
+                            for k in 0..steps {
+                                let pos = p.sim.pos - p.sim.vel * ((steps - k) as f64 / 30.0);
+                                b.step(1.0 / 30.0, &battle::Flown { pos, vel: p.sim.vel, rot: p.sim.model_rot(), fire: false }, &ground);
+                            }
+                            b.news.clear();
+                        }
+                        "immortal" => immortal = x > 0.5,
+                        "team" => b.set_team(x as u8),
+                        "watch" => state.watch = x > 0.5,
+                        _ => {}
+                    }
+                }
+            }
+            b.immortal = immortal;
+            println!("Battle: {n} other aircraft in eight squadrons, each against the other seven. You fly with {} squadron.", battle::SQUADRONS[b.team() as usize]);
+            println!("        F or Enter (B / Circle, X / Square on a controller) fires a rocket at whatever is nearest your nose.");
+            println!("        Shot down, you go on in another aircraft somewhere else in the fight. V: a camera that watches the fight.");
+            state.battle = Some(b);
         }
         if let Some(path) = &a.tour {
             let shots = tour::load(path)?;
@@ -995,7 +1055,31 @@ impl App {
             let step = if self.args.shot.is_some() { 1.0 / 60.0 } else { dt as f64 };
             // (a controller flies it only while this is the window in front)
             let pad = s.pads.as_mut().map(|c| c.poll()).filter(|_| s.window.has_focus() || self.args.shot.is_some()).unwrap_or_default();
-            let view = p.update(&s.keys, &pad, step, s.looking, |pos| globe::tiles::ground_radius(terrain, pos));
+            let mut view = p.update(&s.keys, &pad, step, s.looking, |pos| globe::tiles::ground_radius(terrain, pos));
+            if let Some(b) = s.battle.as_mut() {
+                // --battle: everything else in the air moves a step; shot down (or into the
+                // ground), the pilot goes on in another aircraft
+                let ground = |pos: DVec3| globe::tiles::ground_radius(terrain, pos);
+                let fire = pad.fire || ((s.keys.contains(&KeyCode::KeyF) || s.keys.contains(&KeyCode::Enter)) && s.window.has_focus());
+                if p.down {
+                    b.crashed(p.sim.pos);
+                }
+                let t = Instant::now();
+                b.step(step, &battle::Flown { pos: p.sim.pos, vel: p.sim.vel, rot: p.sim.model_rot(), fire }, &ground);
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                s.battle_ms = (s.battle_ms.0 + ms, s.battle_ms.1, s.battle_ms.2.max(ms), s.battle_ms.3 + 1);
+                if b.down() {
+                    let (pos, heading, speed) = b.take_over();
+                    p.take_over(pos, heading, speed);
+                    view = p.update(&s.keys, &gamepad::Pad::default(), 1e-4, s.looking, ground);
+                }
+                for line in b.news.drain(..) {
+                    println!("{line}");
+                }
+                if s.watch {
+                    view = b.watch(step);
+                }
+            }
             geo.ecef = view.pos;
             geo.frame = globe::scene::transport(geo.frame, geo.ecef);
             (fwd, right, up) = ((geo.frame * view.fwd).as_vec3(), (geo.frame * view.right).as_vec3(), (geo.frame * view.up).as_vec3());
@@ -1137,6 +1221,14 @@ impl App {
         };
         if let (Some(p), Some(geo)) = (s.pilot.as_mut(), s.geo.as_ref()) {
             s.r.ac_pose = Some(p.fill(&mut g, geo.frame, geo.ecef));
+            if let Some(b) = s.battle.as_mut() {
+                // the others, the rockets, the smoke and the fire (main.rgen gathers them: 2)
+                g.ac_state[0] = 2.0;
+                s.r.ac_livery = b.team() as u32;
+                let t = Instant::now();
+                b.draw(geo.frame, geo.ecef, &mut s.r.crafts, &mut s.r.fx);
+                s.battle_ms.1 += t.elapsed().as_secs_f64() * 1e3;
+            }
         }
         let last_view = views.is_empty() || view + 1 >= views.len();
         let shot_due = shot.is_some() && if views.is_empty() { s.rendered + 1 >= shot_frames } else { (s.rendered + 1) % shot_frames == 0 };
@@ -1192,6 +1284,24 @@ impl App {
                     );
                 }
                 println!("{}", s.r.profile.line());
+                if let Some(b) = &s.battle {
+                    // (the stress test's own numbers, as of this frame)
+                    let rockets = s.r.crafts.iter().filter(|c| c.rocket).count();
+                    let n = s.battle_ms.3.max(1) as f64;
+                    println!(
+                        "battle: {} aircraft and {} rockets drawn, {} pieces of smoke and fire, {} flying ({} within 1 km of the pilot, {} within 2 km; formation at {:?} m); cpu: step {:.2} ms (worst {:.2}), picture {:.2} ms",
+                        s.r.crafts.len() - rockets + 1,
+                        rockets,
+                        s.r.fx.len(),
+                        b.flying(),
+                        b.near(1000.0).0,
+                        b.near(2000.0).0,
+                        b.near(0.0).1,
+                        s.battle_ms.0 / n,
+                        s.battle_ms.2,
+                        s.battle_ms.1 / n
+                    );
+                }
                 if std::env::var("SI_MEM").is_ok() {
                     print!("{}", s.r.gpu.memory_report());
                 }
@@ -1224,7 +1334,8 @@ impl App {
         let el_t = s.fps_time.elapsed().as_secs_f32();
         if let (Some(p), true) = (&s.pilot, el_t > 0.1) {
             // --test-flight: the instruments
-            s.window.set_title(&format!("{} | {:.0} fps", p.hud(), s.fps_frames as f32 / el_t));
+            let fight = s.battle.as_ref().map(|b| format!("{} | ", b.hud())).unwrap_or_default();
+            s.window.set_title(&format!("{fight}{} | {:.0} fps", p.hud(), s.fps_frames as f32 / el_t));
             s.fps_time = Instant::now();
             s.fps_frames = 0;
         } else if el_t > 0.5 {
@@ -1288,8 +1399,13 @@ impl App {
             match code {
                 KeyCode::KeyC => return p.next_view(),
                 KeyCode::KeyR => return p.reset(),
+                KeyCode::KeyV if s.battle.is_some() => {
+                    s.watch = !s.watch;
+                    println!("Camera: {}", if s.watch { "watching the fight" } else { "with the pilot" });
+                    return;
+                }
                 KeyCode::KeyW | KeyCode::KeyA | KeyCode::KeyS | KeyCode::KeyD | KeyCode::KeyQ | KeyCode::KeyE | KeyCode::KeyV | KeyCode::KeyF | KeyCode::KeyB => return,
-                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Space => return,
+                KeyCode::ArrowLeft | KeyCode::ArrowRight | KeyCode::ArrowUp | KeyCode::ArrowDown | KeyCode::Space | KeyCode::Enter => return,
                 KeyCode::Numpad4 | KeyCode::Numpad5 | KeyCode::Numpad6 | KeyCode::Numpad8 => return,
                 _ => {}
             }

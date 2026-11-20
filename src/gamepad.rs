@@ -29,6 +29,8 @@ pub struct Pad {
     pub restart: bool,
     /// the D-pad, up minus down: the chase camera nearer or further
     pub zoom: f64,
+    /// B / Circle or X / Square held: fire (--battle)
+    pub fire: bool,
 }
 
 /// A stick's raw position to what it asks for: nothing inside the dead zone (a stick at rest is
@@ -161,6 +163,7 @@ impl SonyState {
             view: self.view,
             restart: self.restart,
             zoom: if matches!(dpad, 0 | 1 | 7) { 1.0 } else if matches!(dpad, 3..=5) { -1.0 } else { 0.0 },
+            fire: r.b0 & 0x50 != 0,
         };
         (self.view, self.restart) = (false, false);
         pad
@@ -233,6 +236,7 @@ impl Pads {
         pad.rudder = held(Button::RightTrigger) - held(Button::LeftTrigger);
         pad.brake = g.is_pressed(Button::South);
         pad.zoom = held(Button::DPadUp) - held(Button::DPadDown);
+        pad.fire = g.is_pressed(Button::East) || g.is_pressed(Button::West);
         pad
     }
 }
@@ -318,7 +322,7 @@ mod tests {
         s.view = true;
         let p = s.take();
         assert!(p.left.1 > 0.99 && p.left.0.abs() < 0.02 && p.right.0 > 0.99, "{:?} {:?}", p.left, p.right);
-        assert!(p.rt == 1.0 && p.brake && p.rudder == 1.0 && p.zoom == 1.0 && p.view);
+        assert!(p.rt == 1.0 && p.brake && p.rudder == 1.0 && p.zoom == 1.0 && p.view && !p.fire);
         // (a press is acted on once)
         assert!(!s.take().view);
     }

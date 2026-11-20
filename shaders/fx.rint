@@ -1,0 +1,94 @@
+#version 460
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_ray_tracing : require
+#extension GL_EXT_scalar_block_layout : require
+#include "fx.glsl"
+
+// Intersection for the smoke and fire of --battle (fx.glsl): how much of this tube (or ball) the
+// ray passes through, as the depth of a Gaussian section integrated along the ray up to
+// whatever solid thing the ray has already found. Reported with that depth; fx.rahit adds it up.
+layout(set = 0, binding = 39, scalar) readonly buffer FxPrims { FxPrim prims[]; };
+hitAttributeEXT vec3 fxHit; // depth (m), distance along the ray, unused
+
+float hash3(ivec3 p) {
+    uint h = uint(p.x) * 0x8da6b343u ^ uint(p.y) * 0xd8163841u ^ uint(p.z) * 0xcb1ab31fu;
+    h = (h ^ (h >> 13)) * 0x5bd1e995u;
+    h = (h ^ (h >> 15)) * 0x846ca68bu;
+    return float(h ^ (h >> 16)) * (1.0 / 4294967295.0);
+}
+float noise3(vec3 p) {
+    ivec3 i = ivec3(floor(p));
+    vec3 f = fract(p);
+    vec3 u = f * f * (3.0 - 2.0 * f);
+    float a = mix(hash3(i), hash3(i + ivec3(1, 0, 0)), u.x);
+    float b = mix(hash3(i + ivec3(0, 1, 0)), hash3(i + ivec3(1, 1, 0)), u.x);
+    float c = mix(hash3(i + ivec3(0, 0, 1)), hash3(i + ivec3(1, 0, 1)), u.x);
+    float d = mix(hash3(i + ivec3(0, 1, 1)), hash3(i + ivec3(1, 1, 1)), u.x);
+    return mix(mix(a, b, u.y), mix(c, d, u.y), u.z);
+}
+
+float erfA(float x) {
+    float a = abs(x);
+    if (a < 0.5) return 1.1283792 * x * (1.0 - x * x * (0.33333333 - 0.1 * x * x));
+    float t = 1.0 / (1.0 + 0.3275911 * a);
+    float y = 1.0 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * exp(-a * a);
+    return x < 0.0 ? -y : y;
+}
+
+void main() {
+    FxPrim p = prims[gl_InstanceCustomIndexEXT];
+    vec3 ro = gl_WorldRayOriginEXT, rd = gl_WorldRayDirectionEXT;
+    float tmax = gl_RayTmaxEXT;
+    vec3 ab = p.b.xyz - p.a.xyz;
+    float len = length(ab);
+    float depth, tc, R, fall; // (fall: to nothing at three radii, where this stops looking)
+    vec3 q; // where the smoke's raggedness is looked up: fixed in the smoke, not in the view
+    if (len < 1e-3) {
+        // a ball
+        R = p.a.w;
+        vec3 oc = ro - p.a.xyz;
+        tc = -dot(oc, rd);
+        vec3 off = oc + rd * tc;
+        float d2 = dot(off, off) / (R * R);
+        if (d2 > 9.0) return;
+        fall = 1.0 - d2 / 9.0;
+        depth = exp(-d2) * 0.8862269 * R * (erfA((tmax - tc) / R) - erfA(-tc / R));
+        q = off / R * 1.6 + p.d.y * 37.0;
+    } else {
+        // a tube: the stretch of the ray abreast of it
+        vec3 u = ab / len;
+        float c = dot(rd, u);
+        float s2 = max(1.0 - c * c, 1e-6);
+        vec3 w = ro - p.a.xyz;
+        float wr = dot(w, rd), wu = dot(w, u);
+        float t0 = (c * wu - wr) / s2; // where the ray passes closest to the axis
+        float along = wu + c * t0;
+        R = mix(p.a.w, p.b.w, clamp(along / len, 0.0, 1.0));
+        vec3 off = w + rd * t0 - u * along;
+        float d2 = dot(off, off) / (R * R);
+        if (d2 > 9.0) return;
+        fall = 1.0 - d2 / 9.0;
+        float ta = 0.0, tb = tmax;
+        if (abs(c) > 1e-5) {
+            float t1 = -wu / c, t2 = (len - wu) / c;
+            ta = max(ta, min(t1, t2));
+            tb = min(tb, max(t1, t2));
+        } else if (wu < 0.0 || wu > len) {
+            return;
+        }
+        if (tb <= ta) return;
+        float k = sqrt(s2) / R;
+        depth = exp(-d2) * 0.8862269 / k * (erfA((tb - t0) * k) - erfA((ta - t0) * k));
+        tc = clamp(t0, ta, tb);
+        q = (off + u * (0.45 * (p.d.z + clamp(along, 0.0, len)))) / max(R, 0.3) * 0.8 + p.d.y * 37.0; // (drawn out along the trail)
+    }
+    if (p.d.w > 0.0) {
+        // billows: thick in places, nearly clear in others
+        float n = 0.65 * noise3(q) + 0.35 * noise3(q * 2.7 + 5.1);
+        depth *= mix(1.0, 2.6 * smoothstep(0.22, 0.80, n), p.d.w);
+    }
+    depth *= fall * fall;
+    if (depth * p.c.w < 2e-4) return;
+    fxHit = vec3(depth, max(tc, 0.0), 0.0);
+    reportIntersectionEXT(clamp(tc, gl_RayTminEXT, tmax), 0u);
+}
