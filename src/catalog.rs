@@ -49,6 +49,7 @@ pub struct GroundMaterial {
 }
 
 pub struct Catalog {
+    pub tree_palette: Option<[[u8;3];2]>,
     pub species: Vec<Species>,
     pub variants: Vec<Variant>,
     /// Texture set (= species index) of every mesh in the merged pack.
@@ -60,6 +61,21 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    pub fn procedural(pack: &TreePack, recipe: &crate::procedural_tree::Recipe) -> Self {
+        let tree = &pack.trees[0];
+        let height = recipe.reference_height;
+        let (lod_scale, cull) = lod_for(height);
+        Self {
+            tree_palette: Some(recipe.palette),
+            species: vec![Species {
+                name: tree.name.clone(), kind: Kind::Tree, textures: Default::default(),
+                leaf_tint: [0.5;3], bark_tint: [0.5;3], trans_tint: [0.21,0.27,0.12], variants: 0..1,
+            }],
+            variants: vec![Variant {species: 0, kind: Kind::Tree, height, lod_scale, cull, texel_scale: 1.0}],
+            mesh_species: vec![0;pack.meshes.len()], mesh_alpha: vec![false;pack.meshes.len()], ground: find_ground(),
+        }
+    }
+
     /// Variants of the species whose name contains `key`.
     pub fn variants_of(&self, key: &str) -> Vec<usize> {
         self.species.iter().filter(|s| s.name.contains(key)).flat_map(|s| s.variants.clone()).collect()
@@ -96,7 +112,7 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         jsons.retain(|p| only.split(',').any(|k| p.file_stem().unwrap().to_string_lossy().contains(k)));
     }
     let mut pack = TreePack { meshes: Vec::new(), trees: Vec::new() };
-    let mut cat = Catalog { species: Vec::new(), variants: Vec::new(), mesh_species: Vec::new(), mesh_alpha: Vec::new(), ground: find_ground() };
+    let mut cat = Catalog { tree_palette: None, species: Vec::new(), variants: Vec::new(), mesh_species: Vec::new(), mesh_alpha: Vec::new(), ground: find_ground() };
 
     if jsons.is_empty() {
         // Legacy single-species scene.

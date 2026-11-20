@@ -769,6 +769,8 @@ void main() {
     // This frame's sample and hit distance; taa.comp blends it into the history.
     // eye adaptation before the 16-bit targets (moonlit radiance would flush to zero in them)
     if (globe() && dbg == 0u) col *= g.sunTrue.w;
+    // Specimen comparisons: a coverage mask independent of lighting, shadows and materials.
+    if (dbg == 12u) col = vec3(pl.t > 0.0 && ((pl.flags & 3u) != MAT_TERRAIN) ? 1.0 : 0.0);
     imageStore(curImg, ivec2(px), vec4(col, 1.0));
     imageStore(depthImg, ivec2(px), vec4(pl.t < 0.0 ? 10.0 * farRay() : pl.t));
     if (g.lodParams.z > 0.5) {

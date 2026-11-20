@@ -464,6 +464,34 @@ type SpeciesTextures = (Vec<Image>, Vec<(f32, f32)>, bool);
 
 /// `used`: the species the scene shows; the others keep their slots as 1x1 placeholders.
 pub fn load_species(gpu: &Gpu, cat: &crate::catalog::Catalog, used: &[bool]) -> Result<SpeciesTextures> {
+    if let Some([leaf,bark]) = cat.tree_palette {
+        let mut maps = Vec::new();
+        for (slot, &(_,format,_,fill)) in SLOTS.iter().enumerate() {
+            if slot != 0 && slot != 3 {
+                maps.push(upload_with_mips(gpu,1,1,&fill,format,"tree material constant")?);
+                continue;
+            }
+            let mut pixels = Vec::with_capacity(64*64*4);
+            for y in 0..64 {
+                for x in 0..64 {
+                    let (u,v) = ((x as f32+0.5)/64.0,(y as f32+0.5)/64.0);
+                    let (rgb,gain) = if slot == 0 {
+                        let rib = (1.0-(u-0.5).abs()*42.0).max(0.0);
+                        let vein = ((v*7.0-(u-0.5).abs()*2.5)*std::f32::consts::TAU).cos().max(0.0).powi(9);
+                        (leaf,0.97+0.18*rib+0.09*vein)
+                    } else {
+                        let phase = std::f32::consts::TAU;
+                        let grain = (phase*(u*13.0+0.17*(phase*v).sin()+0.12*(phase*(3.0*u+v)).cos())).sin();
+                        (bark,1.09-0.32*grain.max(0.0).powi(3))
+                    };
+                    pixels.extend(rgb.map(|c| (c as f32*gain).round() as u8));
+                    pixels.push(255);
+                }
+            }
+            maps.push(upload_with_mips(gpu,64,64,&pixels,format,"grown tree colour")?);
+        }
+        return Ok((maps,vec![(1.0,0.33)],true));
+    }
     let mut jobs = Vec::new();
     for (i, s) in cat.species.iter().enumerate() {
         for &(src, format, enc, fill) in &SLOTS {

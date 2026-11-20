@@ -276,6 +276,8 @@ struct BakePush {
 /// rounded to a multiple of 32 and clamped to [32, max_res]. Mip-mapping serves the far field.
 #[derive(Clone, Copy)]
 pub struct ImpostorSettings {
+    /// Small live atlases are installed directly from GPU encoder output and remain resident.
+    pub memory_only: bool,
     pub grid: u32,
     pub texel: f32,
     pub max_res: u32,
@@ -381,6 +383,8 @@ impl Used {
                 }
             }
         }
+        // Another seed can choose a shoot prototype absent from a small initial crown.
+        if catalog.tree_palette.is_some() && u.variant[0] { u.mesh.fill(true); }
         // tri.rchit groundMaterial: a slot shows the biome's scan, its own one where that scan is
         // not downloaded, or (river slots) scans 0 / 1; scan 0 also sets the texel size
         let has = |i: usize| catalog.ground.get(i).is_some_and(|g| g.is_some());
@@ -921,6 +925,12 @@ impl Renderer {
                 meshes[i].idx = Buffer::none();
             }
         }
+        if catalog.tree_palette.is_some() {
+            let tree_buffers: u64 = meshes[..pack.meshes.len()].iter().flat_map(|m| [&m.pos,&m.nrm,&m.uv,&m.idx,&m.mat])
+                .chain(blas[..pack.meshes.len()].iter().map(|b| &b.buf)).filter_map(|b| b.alloc.as_ref()).map(|a| a.size()).sum();
+            let materials: u64 = mat_tex.iter().filter_map(|i| i.alloc.as_ref()).map(|a| a.size()).sum();
+            println!("Tree Vulkan allocations: geometry and BLAS {tree_buffers} bytes, materials {materials} bytes");
+        }
         println!("BLAS: {} meshes built in {:.2}s", built.len(), t0.elapsed().as_secs_f32());
 
         // ---- impostor proxies and atlases: one per plant variant, resolution from its size
@@ -943,7 +953,7 @@ impl Renderer {
             std::env::var("SI_IMPOSTOR_MB").ok().and_then(|v| v.parse::<u64>().ok()).map(|mb| mb << 20).unwrap_or(vram / 4)
         };
         // (full atlases stream in on the globe only)
-        let atlas_staging = match on_globe {
+        let atlas_staging = match on_globe && !imp.memory_only {
             true => Some(gpu.create_buffer(ATLAS_STAGING, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "atlas uploads")?),
             false => None,
         };
@@ -964,7 +974,7 @@ impl Renderer {
         // How far every plant reaches from the centre of its bounding box (its frame: frame_res),
         // on every core: the outer parts' vertices are walked. Every variant, also those this
         // scene does not show: the frame is part of the cache key.
-        let reach: Vec<(f32, f32)> = {
+        let reach: Vec<(f32, f32)> = if imp.memory_only { Vec::new() } else {
             let bounds: Vec<(Vec3, Vec3)> = pack.meshes.iter().map(|m| m.bounds()).collect();
             let next = std::sync::atomic::AtomicUsize::new(0);
             let out: Vec<std::sync::Mutex<(f32, f32)>> = pack.trees.iter().map(|_| std::sync::Mutex::new((0.0, 0.0))).collect();
@@ -992,7 +1002,10 @@ impl Renderer {
             let square = imp.res_for(r / vi.texel_scale, vi.lod_scale);
             let mips = atlas_mips(square);
             let texels = square as f32 / (2.0 * r);
-            let (res, crop) = frame_res(square, mips, reach[v].0 * texels, reach[v].1 * texels);
+            let (res, crop) = if imp.memory_only {
+                // A live tree can change shape after the first frame. Keep its whole envelope.
+                ([square,square],[0,0])
+            } else { frame_res(square, mips, reach[v].0 * texels, reach[v].1 * texels) };
             square_bytes += atlas_bytes(imp.grid, [square, square]);
             imp_infos.push(ImpostorInfo {
                 center_radius: [c.x, c.y, c.z, r],
@@ -1008,7 +1021,7 @@ impl Renderer {
                         _ => 0.0,
                     },
                 ],
-                bmax: [hi.x, hi.y, hi.z, 0.0],
+                bmax: [hi.x, hi.y, hi.z, (imp.memory_only && vi.kind == crate::catalog::Kind::Tree) as u32 as f32],
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
                 grid: imp.grid,
@@ -1019,7 +1032,7 @@ impl Renderer {
             });
             let skip = crate::atlas::skip_for(mips);
             let base_res = [res[0] >> skip, res[1] >> skip];
-            let base = match on_globe {
+            let base = match on_globe && !imp.memory_only {
                 true => Some(create_bc_atlas(&gpu, &t.name, imp.grid, base_res, mips - skip)?),
                 false => None,
             };
@@ -1552,7 +1565,7 @@ impl Renderer {
         r.write_set(r.main_set, r.tlas.accel.raw, None);
         r.write_resolve_set();
         r.create_dlss_feature()?;
-        r.bake_impostors()?;
+        r.bake_impostors(None)?;
         // the atlases the bake installed (full ones outside the globe)
         r.write_set(r.main_set, r.tlas.accel.raw, None);
         println!("Renderer ready in {:.2}s", t0.elapsed().as_secs_f32());
@@ -1880,7 +1893,7 @@ impl Renderer {
     /// coverage-weighted mips, then BC-compress every level on the GPU (bcenc.comp) into the
     /// sampled atlases: BC3 albedo+AO, BC5 normal, BC5 depth+coverage, BC3 visibility at half
     /// resolution. The uncompressed scratch atlas is shared by all variants and freed afterwards.
-    fn bake_impostors(&mut self) -> Result<()> {
+    fn bake_impostors(&mut self, only: Option<usize>) -> Result<()> {
         let t_all = Instant::now();
         let imp = self.imp;
         // only what the cache (atlas.rs) does not hold yet, or everything with SI_REBAKE
@@ -1888,17 +1901,18 @@ impl Renderer {
         let missing: Vec<usize> = (0..self.atlases.len())
             .filter(|&v| {
                 let a = &self.atlases[v];
-                self.used_variant[v] && (rebake || !crate::atlas::valid(&a.path, a.key, a.grid, a.res, a.mips))
+                only.is_none_or(|slot| slot == v) && self.used_variant[v] && (imp.memory_only || rebake || !crate::atlas::valid(&a.path, a.key, a.grid, a.res, a.mips))
             })
             .collect();
         if missing.is_empty() {
+            if imp.memory_only { return Ok(()); }
             println!("Impostor atlases: all {} in the cache ({})", self.used_variant.iter().filter(|&&u| u).count(), crate::atlas::DIR);
             return self.load_base_atlases(t_all);
         }
         let max_w = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res[0]).max().unwrap_or(32);
         let max_h = missing.iter().map(|&v| self.atlases[v].grid * self.atlases[v].res[1]).max().unwrap_or(32);
         let smips = missing.iter().map(|&v| self.atlases[v].mips).max().unwrap_or(1);
-        let st = vk::ImageUsageFlags::STORAGE;
+        let st = vk::ImageUsageFlags::STORAGE | if self.dump_prefix.is_some() { vk::ImageUsageFlags::TRANSFER_SRC } else { vk::ImageUsageFlags::empty() };
         let mut scratch = [
             self.gpu.create_image(max_w, max_h, smips, vk::Format::R8G8B8A8_UNORM, st, "bake albedo")?,
             self.gpu.create_image(max_w, max_h, smips, vk::Format::R16G16B16A16_SFLOAT, st, "bake normal-depth")?,
@@ -1926,7 +1940,9 @@ impl Renderer {
             MemoryLocation::GpuOnly,
             "bc blocks",
         )?;
-        let mut enc_host = self.gpu.create_buffer(enc_size, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "bc blocks readback")?;
+        let mut enc_host = if imp.memory_only { None } else {
+            Some(self.gpu.create_buffer(enc_size, vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuToCpu, "bc blocks readback")?)
+        };
 
         // Transient descriptor sets: mip level L-1 -> L, and encoder inputs at level L.
         let d = self.gpu.device.clone();
@@ -2010,6 +2026,11 @@ impl Renderer {
                 _ => unreachable!(),
             };
             let mut tlas = Tlas::new(&self.gpu, insts.len() as u32)?;
+            if imp.memory_only && only.is_none() {
+                let temp: u64 = scratch.iter().filter_map(|i| i.alloc.as_ref()).map(|a| a.size()).sum::<u64>()
+                    + enc.alloc.as_ref().unwrap().size() + tlas.allocation_bytes();
+                println!("Live bake transient image, block-buffer and TLAS allocations: {temp} bytes");
+            }
             tlas.write(&insts);
             self.gpu.one_time(|cb| tlas.cmd_build(&self.gpu, cb, insts.len() as u32))?;
             self.write_set(self.bake_set, tlas.accel.raw, Some(bake_views));
@@ -2041,7 +2062,9 @@ impl Renderer {
             bg.lod_params[2] = -1.0; // bake: tri.rahit only alpha-tests, no LOD dissolve
             self.ubo.mapped()[..std::mem::size_of::<Globals>()].copy_from_slice(bytemuck::bytes_of(&bg));
             let mut push = BakePush { center_radius: centre, grid, res: square, frame_offset: 0, ss: imp.ss, ao_rays: imp.ao_rays, ao_range, vis_rays: imp.vis_rays, pad: mode, size: res, crop };
-            for row in 0..grid {
+            // Small live atlases fit in a single dispatch. Keep large bakes split into rows.
+            let rows = if imp.memory_only && u64::from(grid).pow(2)*u64::from(res[0])*u64::from(res[1]) <= 1_048_576 { grid } else { 1 };
+            for row in (0..grid).step_by(rows as usize) {
                 push.frame_offset = row * grid;
                 self.gpu.one_time(|cb| unsafe {
                     d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::RAY_TRACING_KHR, self.bake_pipe.pipe);
@@ -2055,7 +2078,7 @@ impl Renderer {
                         &vk::StridedDeviceAddressRegionKHR::default(),
                         res[0],
                         res[1],
-                        grid,
+                        rows * grid,
                     );
                 })?;
             }
@@ -2064,6 +2087,9 @@ impl Renderer {
             let regions = crate::atlas::layout(grid, res, mips);
             let stream = crate::atlas::stream_bytes(grid, res, mips);
             assert!(stream <= enc_size, "bc block buffer too small");
+            if imp.memory_only && self.atlases[v].full.is_none() {
+                self.atlases[v].full = Some(create_bc_atlas(&self.gpu,&name,grid,res,mips)?);
+            }
             self.gpu.one_time(|cb| unsafe {
                 let rw = vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
                 let cs = vk::PipelineStageFlags2::COMPUTE_SHADER;
@@ -2087,10 +2113,23 @@ impl Renderer {
                     d.cmd_dispatch(cb, bx.div_ceil(8), by.div_ceil(8), 1);
                 }
                 self.gpu.memory_barrier(cb, cs, vk::AccessFlags2::SHADER_WRITE, vk::PipelineStageFlags2::TRANSFER, vk::AccessFlags2::TRANSFER_READ);
-                d.cmd_copy_buffer(cb, enc.raw, enc_host.raw, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: stream }]);
+                if let Some(host) = &enc_host {
+                    d.cmd_copy_buffer(cb, enc.raw, host.raw, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: stream }]);
+                } else {
+                    self.cmd_upload_atlas(cb,self.atlases[v].full.as_ref().unwrap(),&regions,enc.raw,0,0);
+                }
             })?;
-            let a = &self.atlases[v];
-            crate::atlas::write(&a.path, a.key, grid, res, mips, &enc_host.mapped()[..stream as usize])?;
+            if let Some(host) = &mut enc_host {
+                let a = &self.atlases[v];
+                crate::atlas::write(&a.path, a.key, grid, res, mips, &host.mapped()[..stream as usize])?;
+            } else {
+                self.set_atlas_info(v);
+                if only.is_none() {
+                    let a = self.atlases[v].full.as_ref().unwrap();
+                    let bytes: u64 = [&a.albedo,&a.normal,&a.depth,&a.vis].iter().filter_map(|i| i.alloc.as_ref()).map(|a| a.size()).sum();
+                    println!("Live atlas Vulkan image allocations: {bytes} bytes");
+                }
+            }
             if v == 0 {
                 if let Some(prefix) = self.dump_prefix.clone() {
                     self.dump_scratch(&scratch[0], size, &prefix)?;
@@ -2120,7 +2159,14 @@ impl Renderer {
             self.gpu.destroy_image(s);
         }
         self.gpu.destroy_buffer(&mut enc);
-        self.gpu.destroy_buffer(&mut enc_host);
+        if let Some(mut host) = enc_host { self.gpu.destroy_buffer(&mut host); }
+        if imp.memory_only {
+            let payload: u64 = missing.iter().map(|&v| {
+                let a = &self.atlases[v]; crate::atlas::stream_bytes(a.grid,a.res,a.mips)
+            }).sum();
+            println!("Live bake: {} compressed bytes, {:.3} ms through GPU install",payload,t_all.elapsed().as_secs_f64()*1000.0);
+            return Ok(());
+        }
         println!(
             "Baked {} impostors ({:.0}M source triangles) into {} in {:.1}s",
             missing.len(),
@@ -2362,6 +2408,19 @@ impl Renderer {
         let base = self.atlases.iter().filter_map(|a| a.base.as_ref()).map(|a| a.bytes()).sum();
         let full: Vec<_> = self.atlases.iter().filter_map(|a| a.full.as_ref()).collect();
         (base, full.iter().map(|a| a.bytes()).sum(), full.len())
+    }
+
+    /// Replace the single procedural crown between frames. Its acceleration structures for
+    /// the five shared meshes and the sampled images survive successive seeds.
+    pub fn regrow_tree(&mut self, recipe: &crate::procedural_tree::Recipe, seed: u32) -> Result<[f64;2]> {
+        let start = Instant::now();
+        recipe.grow(seed, &mut self.pack.trees[0].parts);
+        let grow = start.elapsed().as_secs_f64()*1000.0;
+        unsafe { self.gpu.device.device_wait_idle()?; }
+        self.bake_impostors(Some(0))?;
+        self.first_update = true;
+        self.reset_taa();
+        Ok([grow,start.elapsed().as_secs_f64()*1000.0])
     }
 
     /// Debug: write the albedo of the first baked variant (uncompressed scratch) as a PNG.
@@ -2961,7 +3020,7 @@ impl Renderer {
             self.gpu.destroy_buffer(&mut old_info);
             self.write_set(self.main_set, self.tlas.accel.raw, None);
         }
-        if self.globe.is_some() {
+        if self.globe.is_some() && !self.imp.memory_only {
             let (_, h) = self.extent();
             self.update_atlases(2.0 * globals.cam_up[3] / h as f32)?;
         }

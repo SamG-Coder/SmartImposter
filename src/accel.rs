@@ -215,6 +215,10 @@ pub struct Tlas {
 }
 
 impl Tlas {
+    pub fn allocation_bytes(&self) -> u64 {
+        [&self.accel.buf, &self.instances, &self.scratch].iter().filter_map(|b| b.alloc.as_ref()).map(|a| a.size()).sum()
+    }
+
     pub fn new(gpu: &Gpu, capacity: u32) -> Result<Self> {
         let capacity = capacity.max(16);
         let instances = gpu.create_buffer(
