@@ -525,7 +525,7 @@ impl Battle {
         }
         if mine {
             self.kills += 1;
-            self.news.push(format!("Shot down a {} aircraft. {} so far.", SQUADRONS[team as usize], self.kills));
+            self.news.push(format!("Shot down {} {} aircraft. {} so far.", if team == 5 { "an" } else { "a" }, SQUADRONS[team as usize], self.kills));
         }
         if i == 0 {
             self.lost += 1;
@@ -903,7 +903,7 @@ impl Battle {
         (d.alive, d.since, d.dive) = (false, self.time, None);
         if mine {
             self.kills += 1;
-            self.news.push(format!("Shot down a {} drone. {} so far.", SQUADRONS[team as usize], self.kills));
+            self.news.push(format!("Shot down {} {} drone. {} so far.", if team == 5 { "an" } else { "a" }, SQUADRONS[team as usize], self.kills));
         }
     }
 
