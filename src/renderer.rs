@@ -1563,6 +1563,7 @@ impl Renderer {
                             height: t.bmax.y,
                             residential: t.name.contains("Residential"),
                             slim: t.name.contains("Residential_Slim"),
+                            office: t.name.contains("Office"),
                         });
                     }
                 }

@@ -28,10 +28,11 @@ pub struct ArchRef {
     pub size: [f32; 2],
     pub height: f32,
     /// a residential tower (balconies, a podium with its amenity deck, a crown), not an office
-    #[allow(dead_code)]
     pub residential: bool,
     /// a slender one (30-45 storeys on 26-34 m): the waterfront's
     pub slim: bool,
+    /// an office block (glass, ribbon windows): downtown's, rare elsewhere
+    pub office: bool,
 }
 
 struct Core {
@@ -51,7 +52,7 @@ struct City {
 }
 
 /// Most cores a city has (the shader's globals hold this many).
-pub const MAX_CORES: usize = 10;
+pub const MAX_CORES: usize = 14;
 
 /// Miami: downtown and Brickell on the west shore of Biscayne Bay, Edgewater north of them, the
 /// high-rises along Miami Beach across the bay.
@@ -72,6 +73,10 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 2400.0 }, // downtown's fringe
         // the beach's west end, round the canals: packed mid-rise
         Core { lat: 25.7860, lon: -80.1500, strength: 0.42, radius: 750.0 },
+        // the islands across the bay (the causeway's chain, the islands south of it): built
+        // up, apartment blocks and towers among their trees, not thin strips of houses
+        Core { lat: 25.7905, lon: -80.1680, strength: 0.34, radius: 1500.0 },
+        Core { lat: 25.7800, lon: -80.1530, strength: 0.3, radius: 900.0 },
     ],
 }];
 
@@ -1021,6 +1026,16 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 // (the waterfront's towers are residential: white balcony bands over a podium,
                 // where one fits)
                 if water_tower && lot == 0 && !r.slim {
+                    continue;
+                }
+                // (outside the downtown cores a tower is an apartment tower, white banded, where
+                // one fits: the glass office towers stand downtown)
+                if class == Class::Tower && z < 3 && !r.residential && archs.iter().any(|o| o.class == Class::Tower && o.residential && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
+                    continue;
+                }
+                // (and its mid-rises apartments, condos and stucco blocks: an office block one
+                // lot in five)
+                if r.office && z < 3 && bu(i, j, 7700 + lot) < 0.8 && archs.iter().any(|o| o.class == class && !o.office && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
                     continue;
                 }
                 let (ax, az) = (r.size[0] as f64, r.size[1] as f64);

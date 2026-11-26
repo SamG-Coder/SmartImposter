@@ -461,7 +461,8 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
         let core = inset(poly, 3.0);
         let (lo, hi) = core.iter().fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(l, h), p| (l.min(*p), h.max(*p)));
         if hi.x - lo.x > 4.0 && hi.y - lo.y > 4.0 {
-            for _ in 0..(3 + rng.pick(6)) {
+            let boxes = if matches!(fac, Fac::Curtain { .. }) { 3 + rng.pick(6) } else { 1 + rng.pick(3) };
+            for _ in 0..boxes {
                 let (sx, sz) = (rng.range(1.5, ((hi.x - lo.x) * 0.35).max(1.6)), rng.range(1.5, ((hi.y - lo.y) * 0.35).max(1.6)));
                 let cx = rng.range(lo.x + sx * 0.5, hi.x - sx * 0.5);
                 let cz = rng.range(lo.y + sz * 0.5, hi.y - sz * 0.5);
