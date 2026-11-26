@@ -707,14 +707,14 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         volume(&mut b, &crown, h, h + 5.0, 0.0, 5.0, Fac::Ribbon { win: 0.5, col: 2.0 }, &pal, true, &mut rng);
         push(b, format!("Building_Residential_{k}"), h + 6.0, &mut meshes, &mut archs);
     }
-    // slender residential towers, 30-45 storeys on 26-34 m footprints: white balcony bands
+    // slender residential towers, 15-45 storeys on 24-34 m footprints: white balcony bands
     // (solid parapets), a low parking podium inside the lot on some, a crown of white fins
-    for k in 0..6 {
+    for k in 0..10 {
         let mut b = B::new();
-        let pal = Pal { wall: 0, glass: [5, 4, 2, 5, 1, 4][k], frame: 2 };
-        let h = [105.0f32, 125.0, 140.0, 115.0, 145.0, 98.0][k];
-        let (w, d) = [(28.0f32, 24.0f32), (32.0, 26.0), (26.0, 26.0), (34.0, 28.0), (30.0, 22.0), (28.0, 28.0)][k];
-        let (chamfer, round) = [(0.0f32, 0usize), (6.0, 3), (8.0, 4), (0.0, 0), (4.0, 0), (9.0, 5)][k];
+        let pal = Pal { wall: 0, glass: [5, 4, 2, 5, 1, 4, 2, 5, 4, 1][k], frame: 2 };
+        let h = [105.0f32, 125.0, 140.0, 115.0, 145.0, 98.0, 52.0, 66.0, 80.0, 88.0][k];
+        let (w, d) = [(28.0f32, 24.0f32), (32.0, 26.0), (26.0, 26.0), (34.0, 28.0), (30.0, 22.0), (28.0, 28.0), (26.0, 22.0), (30.0, 24.0), (24.0, 24.0), (32.0, 22.0)][k];
+        let (chamfer, round) = [(0.0f32, 0usize), (6.0, 3), (8.0, 4), (0.0, 0), (4.0, 0), (9.0, 5), (0.0, 0), (5.0, 0), (7.0, 4), (0.0, 0)][k];
         let mut y0 = 0.0;
         if k % 2 == 0 {
             let pod = footprint(w + 10.0, d + 10.0, 0.0, 0);

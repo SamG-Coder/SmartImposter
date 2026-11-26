@@ -73,6 +73,12 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 2400.0 }, // downtown's fringe
         // the beach's west end, round the canals: packed mid-rise
         Core { lat: 25.7860, lon: -80.1500, strength: 0.42, radius: 750.0 },
+        // the island in the middle of the bay west of it: apartment blocks and a few towers
+        // (broad, mid-rise; its two built-up ends, a block or two each, reach tower density:
+        // one or two towers; its middle is a park)
+        Core { lat: 25.7910, lon: -80.1490, strength: 0.36, radius: 550.0 },
+        Core { lat: 25.79176, lon: -80.14887, strength: 0.41, radius: 150.0 },
+        Core { lat: 25.79051, lon: -80.14783, strength: 0.41, radius: 150.0 },
         // the islands across the bay (the causeway's chain, the islands south of it): built
         // up, apartment blocks and towers among their trees, not thin strips of houses
         Core { lat: 25.7905, lon: -80.1680, strength: 0.34, radius: 1500.0 },
@@ -837,7 +843,12 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     };
     // a waterfront mid-rise block now and then has a slender tower of 25-40 storeys at its
     // corner, as Miami's residential towers line its bay and river (its first lot)
-    let water_tower = z == 2 && bu(i, j, 8100) < 0.4 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 70.0);
+    // (they come in clusters: in two 3 x 3 block cells in five a few waterfront blocks have one,
+    // elsewhere hardly any, so some islands have a few together and some none)
+    let cluster = bu(i.div_euclid(3), j.div_euclid(3), 8200) < 0.42;
+    let water_tower = z == 2
+        && bu(i, j, 8100) < if cluster { 0.28 } else { 0.04 }
+        && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 70.0);
     let tower_cls: &[Class] = &[Class::Tower];
     if need > 0.0 && tallest(if water_tower { tower_cls } else { classes }) < need && tallest(classes) < need {
         return out;
@@ -1070,7 +1081,8 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 let mut want = if z == 3 {
                     70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot))
                 } else if water_tower {
-                    85.0 + 45.0 * bu(i, j, 90 + lot)
+                    // (15 to 45 storeys, most of them mid-height)
+                    50.0 + 100.0 * bu(i, j, 90 + lot).powf(1.3)
                 } else {
                     55.0 + 35.0 * bu(i, j, 90 + lot)
                 };
