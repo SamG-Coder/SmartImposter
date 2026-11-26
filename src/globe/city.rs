@@ -900,15 +900,36 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 (2, 1)
             }
         }
+        // (the mid-rise and walk-up blocks vary: a whole-block slab or court now and then, a
+        // few big lots, or many small ones; never the same grain block after block)
         2 => {
-            if bu(i, j, 7) < 0.45 {
-                (3, 2)
-            } else {
+            let u = bu(i, j, 7);
+            if u < 0.1 {
+                (1, 1)
+            } else if u < 0.25 {
+                (2, 1)
+            } else if u < 0.6 {
                 (2, 2)
+            } else {
+                (3, 2)
             }
         }
-        _ => (4, 3),
+        _ => {
+            let u = bu(i, j, 7);
+            if u < 0.05 {
+                (1, 1)
+            } else if u < 0.3 {
+                (2, 2)
+            } else if u < 0.6 {
+                (3, 2)
+            } else {
+                (4, 3)
+            }
+        }
     };
+    // (one or two big lots only away from the water: by it the drive and the banks take a
+    // bite out of a big building's lot, and the block would stand empty)
+    let (nx, ny) = if z <= 2 && nx * ny <= 2 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 40.0) { (3, 2) } else { (nx, ny) };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     for ly in 0..ny {
         for lx in 0..nx {
@@ -964,7 +985,12 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 }
                 best
             } else {
-                fits[(bh(i, j, 12 + lot) as usize) % fits.len()]
+                // a building that fills its lot (a big lot is one big building, not a small
+                // one lost in it), any of them where none does
+                let room = (lw - 4.0) * (lh - 4.0);
+                let big: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| (archs[a].size[0] * archs[a].size[1]) as f64 >= 0.4 * room).collect();
+                let from = if big.is_empty() { &fits } else { &big };
+                from[(bh(i, j, 12 + lot) as usize) % from.len()]
             };
             let r = &archs[pick.0];
             if r.height < need {
@@ -972,7 +998,10 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
             }
             let quarter = pick.1 + if bu(i, j, 20 + lot) < 0.5 { 2 } else { 0 };
             let (hx, hy) = if quarter % 2 == 0 { (r.size[0] as f64 * 0.5, r.size[1] as f64 * 0.5) } else { (r.size[1] as f64 * 0.5, r.size[0] as f64 * 0.5) };
-            let scale = 0.93 + 0.1 * bu(i, j, 40 + lot);
+            // (a building with room to spare in its lot is built a little larger, up to a fifth:
+            // the lot filled, not a small block in a lawn; towers keep their size)
+            let room = if class == Class::Tower { 1.0 } else { ((lw - 4.0) / (2.0 * hx)).min((lh - 4.0) / (2.0 * hy)) * 0.97 };
+            let scale = (0.93 + 0.1 * bu(i, j, 40 + lot)) * room.clamp(1.0, 1.2);
             // slack in the lot: set back from the street by a random amount
             let sx = (lw * 0.5 - 2.0 - hx * scale).max(0.0);
             let sy = (lh * 0.5 - 2.0 - hy * scale).max(0.0);
