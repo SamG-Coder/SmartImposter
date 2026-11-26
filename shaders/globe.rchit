@@ -463,7 +463,10 @@ bool cityNear(vec3 p) {
 // (below) and the water side (seawall: deep, no foam; the others shelve and lap) agree.
 int cityEdge(vec2 uvm) {
     float e = fbmN(uvm * 0.004 + 211.0, 2) + 0.15 * fbmN(uvm * 0.02 + 5.0, 2) - 0.075;
-    return e < 0.47 ? 0 : e < 0.58 ? 1 : e < 0.7 ? 2 : 3;
+    // (a city's canals and bay are held by seawalls, riprap and mangroves: its sand is on the
+    // ocean side, the land cover's own beaches; the patches of sand along the canals read as
+    // wedges of white)
+    return e < 0.47 ? 0 : e < 0.58 ? 1 : e < 0.7 ? 2 : 0;
 }
 
 // The street lamps' light on the ground (globe/city.rs streets puts the lamps: every 30 m
@@ -488,7 +491,7 @@ float cLampPool(float d, float s, float len, float h0, float h1, float kerb) {
 }
 vec3 cityLamp = vec3(0.0); // set by cityGround: the lamps' light here (main.rgen adds it at dusk)
 
-float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, float sd, out vec3 alb) {
+float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, float sd, float sdSlope, out vec3 alb) {
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
     vec3 v = p - gg.cityO.xyz;
@@ -642,8 +645,20 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // under scattered shade, with paths, never the bare native soil showing through
     float shade = smoothstep(0.55, 0.75, fbmN(c * 0.06 + 31.0, 3) * 0.7 + fbmN(c * 0.4 + 2.0, 2) * 0.3);
     vec3 park = mix(lawnC * 1.05, lawnC * vec3(0.6, 0.72, 0.55), shade);
+    // the lawn mown and worn: lighter and drier in broad patches, mowing stripes up close
+    park *= mix(0.82, 1.22, fbmN(c * 0.025 + 61.0, 3));
+    park = mix(park, park * vec3(1.35, 1.2, 0.85), smoothstep(0.6, 0.8, fbmN(c * 0.04 + 7.0, 2)) * 0.6);
+    park *= 1.0 + 0.06 * sign(sin(c.x * 0.52 + c.y * 0.3)) * shown;
+    // winding paths (two families of noise contours, ~2.5 m wide) and a few straight ones
+    {
+        float pa = fbmN(c * 0.007 + 13.0, 2), pb = fbmN(c * 0.009 + 71.0, 2);
+        float wa = abs(pa - 0.5) / max(0.0105, 1e-4), wb = abs(pb - 0.5) / max(0.0135, 1e-4);
+        float path = max(1.0 - smoothstep(1.0, 1.0 + fw * 0.8, wa), 1.0 - smoothstep(1.0, 1.0 + fw * 0.8, wb));
+        vec3 pathC = vec3(0.27, 0.25, 0.21) * mix(0.85, 1.08, n1);
+        park = mix(park, pathC, path * (1.0 - smoothstep(0.6, 2.0, fw)));
+    }
     vec2 pp = abs(fract(c / vec2(37.0, 29.0)) - 0.5);
-    park = mix(park, vec3(0.24, 0.225, 0.2), (1.0 - smoothstep(0.012, 0.012 + fw / 37.0, min(pp.x, pp.y))) * shown * 0.6);
+    park = mix(park, vec3(0.24, 0.225, 0.2), (1.0 - smoothstep(0.012, 0.012 + fw / 37.0, min(pp.x, pp.y))) * shown * 0.25);
     // (seen from afar the parks and grounds are under their trees' canopy too, as the lots are)
     {
         float cmP = smoothstep(0.38, 0.6, fbmN(c * 0.03 + 47.0, 3) * 0.7 + fbmN(c * 0.11 + 9.0, 2) * 0.3);
@@ -678,6 +693,9 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         wf = mix(wf, walk, smoothstep(D + 12.4, D + 12.4 + fw, sd));
         float cover = 1.0 - smoothstep(D + 15.5, D + 15.5 + fw, sd);
         cover *= 1.0 - roadW * (1.0 - smoothstep(D - 1.0, D, sd)); // the streets run through
+        // (only where the smoothed shore is a clean edge: where its level sets wander, round a
+        // point or past the field's reach, there is no drive, never a loop of asphalt)
+        cover *= smoothstep(0.55, 0.8, sdSlope);
         alb = mix(alb, wf, cover);
     }
     // inside the interchanges: landscaped ground (globe/city.rs CLEAR)
@@ -754,18 +772,24 @@ void main() {
     float sd = shoreDist(V, tuv);
     // the city's waterfront drive follows a low-passed shore: the field (before its noise)
     // averaged over a ring of 30 m round the point
-    float sdSmooth = sd;
+    float sdSmooth = sd, sdSlope = 1.0;
     if (cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT)) {
         // (two rings, 30 m and 60 m: the drive's lines are level sets of this, smooth curves)
         float acc = sd;
+        vec2 gs = vec2(0.0);
         for (int ring = 1; ring <= 2; ++ring) {
             float ru = 30.0 * float(ring) / max(cellM * float(FIELD), 1.0);
             for (int k = 0; k < 12; ++k) {
                 float a = float(k) * 0.5235988 + float(ring) * 0.26;
-                acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+                float sk = shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+                acc += sk;
+                gs += sk * vec2(cos(a), sin(a));
             }
         }
         sdSmooth = acc / 25.0;
+        // (a linear field of slope G gives |gs| = 6 (30 + 60) G: the slope in m per m, 1 where
+        // the shore is a clean edge, less where it folds or the field runs out of reach)
+        sdSlope = length(gs) / 540.0;
     }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     bool inCity = cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT);
@@ -868,7 +892,7 @@ void main() {
     } else if (cover || cityNear(p)) {
         // (in a city also where the land cover has no data: a former pond, the plan covers it)
         vec3 cityAlb;
-        float urban = cityGround(p, footprint, min(B.x + 0.5 * (A.x + A.z), 1.0), B.w, C.x, sdSmooth, cityAlb);
+        float urban = cityGround(p, footprint, min(B.x + 0.5 * (A.x + A.z), 1.0), B.w, C.x, sdSmooth, sdSlope, cityAlb);
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
         // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
         // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.

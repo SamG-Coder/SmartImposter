@@ -1101,14 +1101,14 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let mut b = B::new();
         let hw = width * 0.5;
         let (x0, x1) = (-10.5f32, 10.5f32);
-        b.bx(Vec3::new(x0, 2.3, -hw), Vec3::new(x1, 2.9, hw), m(SLAB, 0), false);
+        b.bx(Vec3::new(x0, 2.3, -hw), Vec3::new(x1, 2.9, hw), m(SLAB, 1), false);
         b.bx(Vec3::new(x0, 1.5, -hw + 0.6), Vec3::new(x1, 2.3, -hw + 1.6), m(GARAGE, 2), false);
         b.bx(Vec3::new(x0, 1.5, hw - 1.6), Vec3::new(x1, 2.3, hw - 0.6), m(GARAGE, 2), false);
         b.cap(&ccw(vec![Vec2::new(x0, -hw), Vec2::new(x1, -hw), Vec2::new(x1, hw), Vec2::new(x0, hw)]), 2.3, false, m(GARAGE, 2));
         b.quad([Vec3::new(x0, 2.92, -hw + 0.6), Vec3::new(x1, 2.92, -hw + 0.6), Vec3::new(x1, 2.92, hw - 0.6), Vec3::new(x0, 2.92, hw - 0.6)], m(ASPHALT, k as u8));
         for zs in [-1.0f32, 1.0] {
             let z = zs * (hw - 0.15);
-            b.bx(Vec3::new(x0, 2.9, z - 0.15), Vec3::new(x1, 3.7, z + 0.15), m(SLAB, 0), false);
+            b.bx(Vec3::new(x0, 2.9, z - 0.15), Vec3::new(x1, 3.7, z + 0.15), m(SLAB, 1), false);
             b.bx(Vec3::new(x0, 3.85, z - 0.04), Vec3::new(x1, 3.93, z + 0.04), m(FRAME, 1), false);
             // the lamp: a post, an arm out over the road, the head
             let zi = z - zs * 0.1;
@@ -1116,10 +1116,10 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             b.bx(Vec3::new(-0.06, 11.3, zi - zs * 2.2), Vec3::new(0.06, 11.45, zi), m(FRAME, 1), false);
             b.bx(Vec3::new(-0.3, 11.1, zi - zs * 2.5 - 0.18), Vec3::new(0.3, 11.35, zi - zs * 2.5 + 0.18), m(POOL, 2), false);
         }
-        b.bx(Vec3::new(-0.9, 0.9, -hw + 1.2), Vec3::new(0.9, 1.5, hw - 1.2), m(SLAB, 0), false);
+        b.bx(Vec3::new(-0.9, 0.9, -hw + 1.2), Vec3::new(0.9, 1.5, hw - 1.2), m(SLAB, 1), false);
         for zs in [-1.0f32, 1.0] {
             let col: Vec<Vec2> = footprint(1.3, 1.3, 0.65, 3).iter().map(|p| *p + Vec2::new(0.0, zs * (hw * 0.5))).collect();
-            b.prism(&col, -14.0, 0.9, m(SLAB, 0), m(SLAB, 0), false);
+            b.prism(&col, -14.0, 0.9, m(SLAB, 1), m(SLAB, 1), false);
         }
         push(b, format!("Building_Bridge_{k}"), 11.5, &mut meshes, &mut archs);
     }

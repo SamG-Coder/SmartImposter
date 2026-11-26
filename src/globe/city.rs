@@ -1652,6 +1652,13 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
         };
         for (lo, hi) in spans {
             let (l0, l1) = (lo - 10.0, hi + 10.0);
+            // (the deck's top meets the street at its ends: on the higher of the two banks'
+            // ground, its arch over the water from there)
+            let base = {
+                let (ax, ay) = at(lo - 8.0, 0.0);
+                let (bx, by) = at(hi + 8.0, 0.0);
+                ground(k, terrain, ax, ay).max(ground(k, terrain, bx, by)) - 2.92 + 0.1
+            };
             let n = ((l1 - l0) / 20.0).ceil().max(1.0) as u32;
             let step = (l1 - l0) / n as f64;
             for m in 0..n {
@@ -1665,7 +1672,7 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
                 let (x, y) = at(c, 0.0);
                 let (wx, wy) = to_world(x, y);
                 let seed = bh(line, (start + c).round() as i64, 6000 + along_x as u32 * 50);
-                put_world(k, sp, decks[if a { 0 } else { 1 }], wx, wy, h, tang(c), dh.atan(), seed, id, tile);
+                put_world(k, sp, decks[if a { 0 } else { 1 }], wx, wy, base + h, tang(c), dh.atan(), seed, id, tile);
             }
         }
         // street lights along both sidewalks, every ~30 m on alternate sides, and traffic

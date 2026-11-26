@@ -114,7 +114,8 @@ void main() {
         albedo = B_FRAME[min(pal, 3u)];
         glass = 0.25;
     } else if (mt == 3u) {
-        albedo = vec3(0.74, 0.73, 0.70) * grime;
+        // concrete: white (slabs, towers' bands), or weathered grey (bridges' parapets, piers)
+        albedo = (pal == 1u ? vec3(0.31, 0.30, 0.28) : vec3(0.74, 0.73, 0.70)) * grime;
     } else if (mt == 4u) {
         // flat roofs: membrane and gravel, stained
         float nr = vnoise(po.xz * 0.6) * 0.6 + vnoise(po.xz * 2.7) * 0.4;
