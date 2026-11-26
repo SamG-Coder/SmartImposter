@@ -1561,6 +1561,7 @@ impl Renderer {
                             class: crate::city::class_of(&t.name),
                             size: [t.bmax.x - t.bmin.x, t.bmax.z - t.bmin.z],
                             height: t.bmax.y,
+                            residential: t.name.contains("Residential"),
                         });
                     }
                 }

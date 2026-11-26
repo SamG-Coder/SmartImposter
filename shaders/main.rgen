@@ -672,7 +672,14 @@ void main() {
             }
             // (the sunlight into the water is shadowed as the bed under it is: the trees, the
             // bridges and the buildings cast their shadows on the water)
-            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 * (globe() ? mix(0.15, 1.0, sh) : 1.0) + skyUp * 2.0);
+            // (the sun's visibility at the water's surface, not at the bed under it: near a bank
+            // the canal's own wall shades the bed, which is no shadow on the water)
+            float shW = sh;
+            if (globe() && g.city.x > 0.5) {
+                vec3 wupS = normalize(gq);
+                shW = dot(L, wupS) > 0.0 ? traceShadow(ps + wupS * 0.05, L, 1.0e4, 0xFFu) : 0.0;
+            }
+            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 * (globe() ? mix(0.15, 1.0, shW) : 1.0) + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
             // (a city's channels darken towards their banks: the walls' and the trees' shade, the
             // silt stirred up along them; the shore distance is wq.z, < 0 out on the water)

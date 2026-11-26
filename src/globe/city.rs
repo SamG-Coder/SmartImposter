@@ -27,6 +27,8 @@ pub struct ArchRef {
     /// footprint (x, z) and height, m
     pub size: [f32; 2],
     pub height: f32,
+    /// a residential tower (balconies, a podium with its amenity deck, a crown), not an office
+    pub residential: bool,
 }
 
 struct Core {
@@ -991,6 +993,8 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     // (one or two big lots only away from the water: by it the drive and the banks take a
     // bite out of a big building's lot, and the block would stand empty)
     let (nx, ny) = if z <= 2 && nx * ny <= 2 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 40.0) { (3, 2) } else { (nx, ny) };
+    // (a waterfront tower's block: two lots, the tower's big enough for its podium)
+    let (nx, ny) = if water_tower { (2, 1) } else { (nx, ny) };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     // (each model at most once in a block where another fits: no row of identical buildings)
     let mut used: Vec<usize> = Vec::new();
@@ -1002,6 +1006,11 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
             let mut fits: Vec<(usize, u32)> = Vec::new();
             for (a, r) in archs.iter().enumerate() {
                 if r.class != class {
+                    continue;
+                }
+                // (the waterfront's towers are residential: white balcony bands over a podium,
+                // where one fits)
+                if water_tower && lot == 0 && !r.residential && archs.iter().any(|o| o.residential && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
                     continue;
                 }
                 let (ax, az) = (r.size[0] as f64, r.size[1] as f64);
@@ -2127,7 +2136,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         for b in 0..cm {
             for a in 0..cn {
                 let cell = b * 16 + a;
-                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else { 0.6 } {
+                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else if z == 2 { 0.75 } else { 0.6 } {
                     continue;
                 }
                 let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);
@@ -2181,7 +2190,9 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         let Some(d) = in_tile(k, x, y, id) else { continue };
         // (the lots' trees keep off the waterfront drive, as the buildings do; the waterfront's
         // own palms line its edge)
-        if z >= 2 && !(8200..20_000).contains(&salt) && near_water(k, terrain, x, y, WATERFRONT) {
+        // (a grove's trees may stand on the lawn between the drive and the water too, the
+        // shore's own canopy, not on the drive itself)
+        if z >= 2 && !(8200..20_000).contains(&salt) && near_water(k, terrain, x, y, WATERFRONT) && !(salt >= 100_000 && near_water(k, terrain, x, y, 12.0)) {
             continue;
         }
         let (lat, lon) = lat_lon(d);
