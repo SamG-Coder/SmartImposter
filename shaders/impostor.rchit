@@ -31,12 +31,16 @@ void main() {
         // spread is 1 - 0.5 glass (main.rgen reflects it).
         float skyVisB = clamp(v.x + (2.0 / 3.0) * (v.z - 0.5) * 3.0, 0.0, 1.0);
         float glassB = clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0);
+        // (a road deck has no glass: its edges' mixed normals are a parapet and a deck, not a
+        // window to mirror the sky in)
+        bool deck = imps[vid].bmax.w > 1.5;
+        if (deck) glassB = 0.0;
         // its own wall colour (building.rchit buildingTint, the same seed), on what is not glass
         uint bs = plantSeed(pr);
-        const vec3 T[8] = vec3[8](vec3(0.96), vec3(0.97, 0.86, 0.70), vec3(0.95, 0.79, 0.70), vec3(0.85, 0.79, 0.69),
-                                  vec3(0.90, 0.92, 0.87), vec3(0.99, 0.92, 0.76), vec3(0.76, 0.72, 0.66), vec3(0.92, 0.83, 0.79));
-        vec3 tint = bs == 0u ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
-        if (imps[vid].bmax.w > 0.5) {
+        const vec3 T[8] = vec3[8](vec3(0.97, 0.96, 0.93), vec3(1.0, 0.82, 0.58), vec3(1.0, 0.72, 0.58), vec3(0.86, 0.73, 0.56),
+                                  vec3(0.78, 0.92, 0.78), vec3(1.0, 0.91, 0.64), vec3(0.74, 0.67, 0.58), vec3(0.98, 0.70, 0.70));
+        vec3 tint = bs == 0u || deck ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
+        if (imps[vid].bmax.w > 0.5 && !deck) {
             // a car: its paint (building.rchit carPaint)
             const vec3 C[12] = vec3[12](vec3(1.0), vec3(1.0), vec3(0.06), vec3(0.06), vec3(0.62), vec3(0.62), vec3(0.32), vec3(0.65, 0.06, 0.05),
                                         vec3(0.08, 0.16, 0.45), vec3(0.05, 0.07, 0.18), vec3(0.75, 0.66, 0.52), vec3(0.15));
@@ -47,7 +51,7 @@ void main() {
         {
             const vec3 RT[6] = vec3[6](vec3(1.0), vec3(1.1, 1.02, 0.86), vec3(0.98, 0.88, 0.72), vec3(0.55, 0.56, 0.58), vec3(1.22, 1.2, 1.16), vec3(0.8, 0.8, 0.8));
             float roofF = smoothstep(0.75, 0.9, dot(normalize(octDecode(unpackSnorm2x16(hit.normal))), vec3(0.0, 1.0, 0.0)));
-            vec3 rt = bs == 0u ? vec3(1.0) : RT[pcg(bs * 1597334677u) % 6u];
+            vec3 rt = bs == 0u || deck ? vec3(1.0) : RT[pcg(bs * 1597334677u) % 6u];
             pl.albedo = mix(pl.albedo, alb * rt, roofF * (1.0 - glassB));
         }
         pl.t = gl_HitTEXT;

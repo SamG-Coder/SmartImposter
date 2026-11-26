@@ -1034,7 +1034,9 @@ impl Renderer {
                     },
                 ],
                 // w: 1 = a car (impostor.rchit: its paint by the record's seed)
-                bmax: [hi.x, hi.y, hi.z, if t.name.starts_with("Building_Car_") { 1.0 } else { 0.0 }],
+                // (w: 1 a car, its paint by seed; 2 a road deck, bare concrete and asphalt: no
+                // glass, no wall or roof tint, impostor.rchit)
+                bmax: [hi.x, hi.y, hi.z, if t.name.starts_with("Building_Car_") { 1.0 } else if t.name.contains("Bridge") || t.name.contains("Highway") { 2.0 } else { 0.0 }],
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
                 grid: imp.grid,

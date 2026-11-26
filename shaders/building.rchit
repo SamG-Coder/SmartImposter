@@ -28,8 +28,8 @@ const vec3 B_FRAME[4] = vec3[4](vec3(0.10, 0.105, 0.11), vec3(0.46, 0.47, 0.48),
 // in step with impostor.rchit): a palette of whites, creams and pastels; seed 0 (the bake) none.
 vec3 buildingTint(uint seed) {
     if (seed == 0u) return vec3(1.0);
-    const vec3 T[8] = vec3[8](vec3(0.96), vec3(0.97, 0.86, 0.70), vec3(0.95, 0.79, 0.70), vec3(0.85, 0.79, 0.69),
-                              vec3(0.90, 0.92, 0.87), vec3(0.99, 0.92, 0.76), vec3(0.76, 0.72, 0.66), vec3(0.92, 0.83, 0.79));
+    const vec3 T[8] = vec3[8](vec3(0.97, 0.96, 0.93), vec3(1.0, 0.82, 0.58), vec3(1.0, 0.72, 0.58), vec3(0.86, 0.73, 0.56),
+                              vec3(0.78, 0.92, 0.78), vec3(1.0, 0.91, 0.64), vec3(0.74, 0.67, 0.58), vec3(0.98, 0.70, 0.70));
     return T[pcg(seed * 747796405u) & 7u];
 }
 

@@ -746,16 +746,23 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         b.bx(Vec3::new(-2.5, h - 0.4, -d * 0.5 - 0.6), Vec3::new(2.5, h + 0.6, -d * 0.5 + 0.4), m(SPANDREL, [1u8, 3, 6, 5, 4, 1][k]), false);
         push(b, format!("Building_Deco_{k}"), h + 4.0, &mut meshes, &mut archs);
     }
-    // Mediterranean revival mid-rises: sand and cream stucco, recessed windows, tile hip roofs
+    // Mediterranean revival mid-rises: sand and cream stucco, recessed windows; two with tile hip
+    // roofs, the rest flat behind a parapet with their rooftop plant (most of the city's
+    // mid-rise roofs are flat)
     for k in 0..5 {
         let mut b = B::new();
         let pal = Pal { wall: [7, 1, 3, 5, 0][k], glass: [2, 0, 1, 2, 5][k], frame: 2 };
         let (w, d, storeys) = [(30.0f32, 22.0f32, 6usize), (40.0, 18.0, 8), (26.0, 26.0, 5), (36.0, 24.0, 10), (32.0, 20.0, 7)][k];
         let poly = footprint(w, d, 0.0, 0);
         let h = 3.2 * storeys as f32 + 1.0;
-        volume(&mut b, &poly, 0.0, h, 4.5, 3.2, Fac::Punched { col: 3.0, w: 1.4, h: 1.8 }, &pal, false, &mut rng);
-        b.cap(&poly, h, true, m(ROOF, 0));
-        let top = hip_roof(&mut b, w * 0.5 + 0.8, d * 0.5 + 0.8, h, 0.32, m(TILE, [4u8, 3, 4, 0, 4][k]), m(WALL, pal.wall));
+        let hip = k == 0 || k == 3;
+        volume(&mut b, &poly, 0.0, h, 4.5, 3.2, Fac::Punched { col: 3.0, w: 1.4, h: 1.8 }, &pal, !hip, &mut rng);
+        let top = if hip {
+            b.cap(&poly, h, true, m(ROOF, 0));
+            hip_roof(&mut b, w * 0.5 + 0.8, d * 0.5 + 0.8, h, 0.32, m(TILE, [4u8, 3, 4, 0, 4][k]), m(WALL, pal.wall))
+        } else {
+            h + 1.0
+        };
         push(b, format!("Building_Med_{k}"), top, &mut meshes, &mut archs);
     }
     // long condo slabs with balconies, 9-15 storeys

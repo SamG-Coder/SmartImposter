@@ -666,7 +666,7 @@ void main() {
             // floor data says: the 15" ETOPO puts the bay's floor far too deep)
             if (globe() && g.city.x > 0.5) {
                 SIGMA = vec3(0.8, 0.32, 0.36);
-                body = vec3(0.0045, 0.0165, 0.0175);
+                body = vec3(0.026, 0.085, 0.078);
                 Tv = exp(-SIGMA * under);
                 Ts = exp(-SIGMA * sunPath);
             }
@@ -853,10 +853,11 @@ void main() {
                 glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
             }
             // (a city's narrow channels: the bright hazy sky they mirror is held to a fraction
-            // of the sunlight, so a canal near the sun reads as water, not as a white sheet)
+            // of the sunlight towards the sun, so a canal there reads as water, not as a white
+            // sheet; away from the sun the sky's reflection is whole: the calm bay mirrors it)
             if (g.city.x > 0.5) {
                 float rl = dot(refl, vec3(0.2126, 0.7152, 0.0722));
-                float capL = 0.12 * g.sunDir.w;
+                float capL = mix(0.12, 0.6, 1.0 - smoothstep(0.55, 0.9, dot(R, L))) * g.sunDir.w;
                 if (rl > capL) refl *= capL / rl;
             }
             col = mix(col, refl, F) + E * glint * F * sh;

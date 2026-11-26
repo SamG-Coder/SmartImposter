@@ -946,6 +946,8 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     // bite out of a big building's lot, and the block would stand empty)
     let (nx, ny) = if z <= 2 && nx * ny <= 2 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 40.0) { (3, 2) } else { (nx, ny) };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
+    // (each model at most once in a block where another fits: no row of identical buildings)
+    let mut used: Vec<usize> = Vec::new();
     for ly in 0..ny {
         for lx in 0..nx {
             let lot = (ly * nx + lx) as u32;
@@ -1003,6 +1005,8 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 // a building that fills its lot (a big lot is one big building, not a small
                 // one lost in it), any of them where none does
                 let room = (lw - 4.0) * (lh - 4.0);
+                let fresh: Vec<(usize, u32)> = fits.iter().copied().filter(|f| !used.contains(&f.0)).collect();
+                let fits = if fresh.is_empty() { fits.clone() } else { fresh };
                 let big: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| (archs[a].size[0] * archs[a].size[1]) as f64 >= 0.4 * room).collect();
                 let from = if big.is_empty() { &fits } else { &big };
                 from[(bh(i, j, 12 + lot) as usize) % from.len()]
@@ -1069,6 +1073,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 continue;
             }
             out.push(Placed { arch: pick.0, x: px, y: py, quarter, scale, hx: hx * scale, hy: hy * scale });
+            used.push(pick.0);
         }
     }
     out
@@ -1382,8 +1387,9 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
         return None;
     }
     // (a side street bridges a canal, not a river: it ends at the river's bank, and only the
-    // arterials cross it, every few blocks, as real cities bridge their rivers)
-    if !arterial && a + b > 60.0 {
+    // arterials and every third street line cross it, every 300-400 m, as real cities bridge
+    // their rivers and wider canals)
+    if !arterial && a + b > 60.0 && line.rem_euclid(3) != 0 {
         return None;
     }
     // (the water is followed by the land cover alone, point by point (busy shores, boats and

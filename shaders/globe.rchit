@@ -754,14 +754,19 @@ void main() {
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     bool inCity = cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT);
     if (inCity) {
-        // a city's shore is built, a smooth line: the field averaged over an 8 m ring (the 10 m
-        // land cover pixels showed through as a sawtooth), no noise
-        float ru = 8.0 / max(cellM * float(FIELD), 1.0), acc = sd;
-        for (int k = 0; k < 8; ++k) {
-            float a = float(k) * 0.7853982;
-            acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+        // a city's shore is built, a smooth line: the field averaged over rings of 10 and 20 m
+        // (the 10 m land cover pixels showed through an 8 m ring as a scalloped sawtooth), no
+        // noise
+        float acc = sd * 2.0, wsum = 2.0;
+        for (int ring = 1; ring <= 2; ++ring) {
+            float ru = 10.0 * float(ring) / max(cellM * float(FIELD), 1.0);
+            for (int k = 0; k < 10; ++k) {
+                float a = float(k) * 0.6283185 + float(ring) * 0.31;
+                acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+                wsum += 1.0;
+            }
         }
-        sd = acc / 9.0;
+        sd = acc / wsum;
     } else
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));
     float level = waterLevel(V, tuv);
