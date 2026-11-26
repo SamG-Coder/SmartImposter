@@ -32,6 +32,7 @@ const TRANS_GAIN: f32 = 8.0;
 pub const MAX_GROUND_TEX: usize = 81;
 
 #[repr(C)]
+
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
 pub struct Globals {
     pub cam_pos: [f32; 4],
@@ -92,6 +93,22 @@ pub struct Globals {
     /// the ground (main.rgen), y extra coastal haze (atmosphere.glsl atmoHaze - 1), z 1 = the
     /// softer tone curve (resolve.comp), w unused
     pub city: [f32; 4],
+}
+
+/// How much a city view looks towards a low sun (0..1): the backlit haze of resolve.comp
+/// cityGrade. From the camera's heading against the sun's azimuth and the sun's elevation.
+fn backlit(g: &Globals) -> f32 {
+    if g.planet[3] <= 0.0 {
+        return 0.0;
+    }
+    let up = glam::Vec3::new(-g.planet[0], -g.planet[1], -g.planet[2]).normalize();
+    let f = glam::Vec3::new(g.cam_fwd[0], g.cam_fwd[1], g.cam_fwd[2]);
+    let s = glam::Vec3::new(g.sun_true[0], g.sun_true[1], g.sun_true[2]);
+    let (fh, sh) = ((f - up * f.dot(up)).normalize_or_zero(), (s - up * s.dot(up)).normalize_or_zero());
+    let ahead = ((fh.dot(sh) - 0.55) / 0.35).clamp(0.0, 1.0);
+    let el = s.dot(up).asin().to_degrees();
+    let low = ((45.0 - el) / 20.0).clamp(0.0, 1.0) * (el / 5.0).clamp(0.0, 1.0);
+    ahead * ahead * (3.0 - 2.0 * ahead) * low
 }
 
 /// Points of the aircraft's wake kept for the shaders (globals.glsl).
@@ -3193,7 +3210,7 @@ impl Renderer {
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                 );
-                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), (globals.params[2] * self.fade).to_bits(), if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 } else { 1 }];
+                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), (globals.params[2] * self.fade).to_bits(), if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 | (((backlit(&globals) * 255.0) as u32) << 8) } else { 1 }];
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
                 d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.dlss_resolve_set], &[]);
                 d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
@@ -3228,7 +3245,7 @@ impl Renderer {
                 (rw as f32 / w as f32).to_bits(),
                 1.0f32.to_bits(), // history is already an average
                 (globals.params[2] * self.fade).to_bits(),
-                if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 } else { 1 },
+                if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 | (((backlit(&globals) * 255.0) as u32) << 8) } else { 1 },
             ];
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
             d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.resolve_sets[p]], &[]);

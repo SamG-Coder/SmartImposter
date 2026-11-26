@@ -659,7 +659,9 @@ const CHANNELS: &[Channel] = &[
     Channel { a: (-5700.0, 3400.0), b: (-5600.0, 7400.0), half: 22.0, amp: 60.0, wave: 1000.0 },
     Channel { a: (-2600.0, 2550.0), b: (-2400.0, 6800.0), half: 22.0, amp: 80.0, wave: 1100.0 },
     Channel { a: (-4600.0, -2950.0), b: (-4900.0, -6800.0), half: 22.0, amp: 70.0, wave: 950.0 },
-    Channel { a: (-3900.0, 120.0), b: (-7000.0, 600.0), half: 30.0, amp: 120.0, wave: 1200.0 },
+    // the river between downtown and Brickell: from the bay west, broad (180 m) and in long
+    // S-bends, as the Miami River leads the eye to the towers
+    Channel { a: (-1250.0, -1150.0), b: (-7600.0, 250.0), half: 90.0, amp: 260.0, wave: 2600.0 },
     // Miami Beach's west side: residential canals behind the barrier island
     Channel { a: (3350.0, 900.0), b: (3550.0, 6200.0), half: 25.0, amp: 60.0, wave: 1400.0 },
     // and through the land at the west end of the beach, from the bay to the bay
@@ -727,6 +729,24 @@ fn channel_dist(x: f64, y: f64) -> f64 {
         best = best.min(d);
     }
     best
+}
+
+/// The direction (unit, world plane) of the river or canal nearest the point, if one is near.
+fn channel_dir(x: f64, y: f64) -> Option<(f64, f64)> {
+    let ix = channels();
+    let list = ix.cells.get(&((x / CH_CELL).floor() as i64, (y / CH_CELL).floor() as i64))?;
+    let mut best = (f64::MAX, (0.0, 0.0));
+    for &i in list {
+        let (ax, ay, bx, by, half) = ix.segs[i as usize];
+        let (dx, dy) = (bx - ax, by - ay);
+        let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        let d = ((x - ax - dx * t).powi(2) + (y - ay - dy * t).powi(2)).sqrt() - half;
+        if d < best.0 {
+            let l = (dx * dx + dy * dy).sqrt();
+            best = (d, (dx / l, dy / l));
+        }
+    }
+    (best.0 < 30.0).then_some(best.1)
 }
 
 /// Is lat / lon in one of the cities' rivers or canals? (landcover.rs: the land cover's water)
@@ -1603,6 +1623,17 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
         return None;
     }
     let (mx, my) = pt((b - a) * 0.5);
+    // (a street that runs along a river or canal, not across it, has no bridge down its length)
+    {
+        let (w0, w1) = (to_world(pt((b - a) * 0.5 - 10.0).0, pt((b - a) * 0.5 - 10.0).1), to_world(pt((b - a) * 0.5 + 10.0).0, pt((b - a) * 0.5 + 10.0).1));
+        let (wm, (sx, sy)) = (to_world(mx, my), (w1.0 - w0.0, w1.1 - w0.1));
+        if let Some((cx, cy)) = channel_dir(wm.0, wm.1) {
+            let l = (sx * sx + sy * sy).sqrt().max(1e-6);
+            if ((sx * cx + sy * cy) / l).abs() > 0.6 {
+                return None;
+            }
+        }
+    }
     let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
     (wet(mx + px, my + py) && wet(mx - px, my - py)).then_some((a, b))
 }
