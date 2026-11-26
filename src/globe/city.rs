@@ -406,7 +406,22 @@ fn way_items(k: usize, terrain: &Terrain, sp: &Species, id: TileId, tile: &mut T
             // (traffic and palms as before: one chance per 20 m)
             let every = (20.0 / step) as u32;
             if w.kind != WayKind::Avenue && lvl <= 2 {
-                let deck = decks[if w.kind == WayKind::Highway { 0 } else if step < 20.0 { 2 } else { 1 }];
+                let base = if w.kind == WayKind::Highway { 0 } else if step < 20.0 { 2 } else { 1 };
+                // where a ramp runs alongside the highway (and the highway alongside a ramp), that
+                // side's parapet is left off: the decks meet at the gore (local +z is the right)
+                let mut open = 0;
+                if decks.len() >= 9 {
+                    let (half, other_half, other) = if w.kind == WayKind::Highway { (15.0, 5.5, WayKind::Ramp) } else { (5.5, 15.0, WayKind::Highway) };
+                    for side in [-1.0f64, 1.0] {
+                        let (px, py) = (x + ty * side * (half + other_half), y - tx * side * (half + other_half));
+                        let beside = WAYS.iter().any(|o| o.kind == other && o.dist(px, py, 3.0).is_some());
+                        if beside {
+                            open = side as i32;
+                        }
+                    }
+                }
+                let idx = if open == 0 { base } else { 3 + base * 2 + if open < 0 { 0 } else { 1 } };
+                let deck = decks[idx];
                 put_world(k, sp, deck, x, y, g + h - DECK_TOP, yaw, pitch, bh(wl, seg as i64, 11), id, tile);
             }
             if lvl != 0 || seg % every != 0 {

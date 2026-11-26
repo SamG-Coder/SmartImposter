@@ -942,12 +942,22 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     // barrier, two columns on a crossbeam) and a ramp (one lane, one column); the columns run
     // 14 m below the deck's foot, so a deck sunk for a ramp's climb still stands on them
     // (the third: a ramp piece of 6 m, laid every 5 m round the loops' curves)
-    for (k, &(width, hl)) in [(30.0f32, 10.05f32), (11.0, 10.05), (11.0, 3.1)].iter().enumerate() {
+    // (then each again without its left (-z) or its right (+z) parapet: where a ramp runs
+    // alongside, the two decks meet at a painted gore, not across two walls; Highway_3..8)
+    let kinds: Vec<(usize, i32)> = (0..3).map(|k| (k, 0)).chain((0..3).flat_map(|k| [(k, -1), (k, 1)])).collect();
+    for (n, &(k, open)) in kinds.iter().enumerate() {
+        let (width, hl) = [(30.0f32, 10.05f32), (11.0, 10.05), (11.0, 3.1)][k];
         let mut b = B::new();
         let hw = width * 0.5;
         b.bx(Vec3::new(-hl, 8.6, -hw), Vec3::new(hl, 10.0, hw), m(SLAB, 0), true);
         b.quad([Vec3::new(-hl, 10.02, -hw + 0.5), Vec3::new(hl, 10.02, -hw + 0.5), Vec3::new(hl, 10.02, hw - 0.5), Vec3::new(-hl, 10.02, hw - 0.5)], m(ASPHALT, 2 + k.min(1) as u8));
-        for z in [-hw, hw - 0.45] {
+        for (side, z) in [(-1, -hw), (1, hw - 0.45)] {
+            if side == open {
+                // (the open side: the deck's asphalt runs to its edge)
+                let z0 = if side < 0 { -hw } else { hw - 0.5 };
+                b.quad([Vec3::new(-hl, 10.02, z0), Vec3::new(hl, 10.02, z0), Vec3::new(hl, 10.02, z0 + 0.5), Vec3::new(-hl, 10.02, z0 + 0.5)], m(ASPHALT, 2 + k.min(1) as u8));
+                continue;
+            }
             b.bx(Vec3::new(-hl, 10.0, z), Vec3::new(hl, 11.0, z + 0.45), m(SLAB, 0), false);
         }
         if k == 0 {
@@ -961,7 +971,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         } else {
             b.bx(Vec3::new(-0.6, -14.0, -0.6), Vec3::new(0.6, 8.6, 0.6), m(SLAB, 0), false);
         }
-        push(b, format!("Building_Highway_{k}"), 11.0, &mut meshes, &mut archs);
+        push(b, format!("Building_Highway_{n}"), 11.0, &mut meshes, &mut archs);
     }
     // bridge decks, 20 m along the street (+x, 21 m long: the pieces of a crossing overlap,
     // and are pitched with its arch, globe/city.rs streets): an arterial's 22 m and a side
