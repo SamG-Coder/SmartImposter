@@ -1366,6 +1366,11 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
     if a + b > 2.0 * reach {
         return None;
     }
+    // (a side street bridges a canal, not a river: it ends at the river's bank, and only the
+    // arterials cross it, every few blocks, as real cities bridge their rivers)
+    if !arterial && a + b > 60.0 {
+        return None;
+    }
     // (the water is followed by the land cover alone, point by point (busy shores, boats and
     // marinas raise the surface model there); whether it is the sea or a pond above it, which
     // the terrain draws as land in a city, is asked once, at the crossing's middle)
