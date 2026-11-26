@@ -911,7 +911,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let mut b = B::new();
         b.bx(Vec3::new(-0.09, 0.0, -0.09), Vec3::new(0.09, 9.0, 0.09), m(FRAME, 1), false);
         b.bx(Vec3::new(0.0, 8.8, -0.05), Vec3::new(2.4, 8.95, 0.05), m(FRAME, 1), false);
-        b.bx(Vec3::new(1.9, 8.6, -0.22), Vec3::new(2.8, 8.85, 0.22), m(FRAME, 0), false);
+        b.bx(Vec3::new(1.9, 8.6, -0.22), Vec3::new(2.8, 8.85, 0.22), m(POOL, 2), false);
         push(b, "Building_StreetLight".into(), 9.0, &mut meshes, &mut archs);
     }
     {
@@ -969,7 +969,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             let zi = z - zs * 0.1;
             b.bx(Vec3::new(-0.1, 3.7, zi - 0.1), Vec3::new(0.1, 11.5, zi + 0.1), m(FRAME, 1), false);
             b.bx(Vec3::new(-0.06, 11.3, zi - zs * 2.2), Vec3::new(0.06, 11.45, zi), m(FRAME, 1), false);
-            b.bx(Vec3::new(-0.3, 11.1, zi - zs * 2.5 - 0.18), Vec3::new(0.3, 11.35, zi - zs * 2.5 + 0.18), m(FRAME, 0), false);
+            b.bx(Vec3::new(-0.3, 11.1, zi - zs * 2.5 - 0.18), Vec3::new(0.3, 11.35, zi - zs * 2.5 + 0.18), m(POOL, 2), false);
         }
         b.bx(Vec3::new(-0.9, 0.9, -hw + 1.2), Vec3::new(0.9, 1.5, hw - 1.2), m(SLAB, 0), false);
         for zs in [-1.0f32, 1.0] {
@@ -1039,8 +1039,8 @@ fn car(b: &mut B, len: f32, wid: f32, hgt: f32, kind: u32) {
     let ly = belt - 0.22;
     for zs in [-1.0f32, 1.0] {
         let z = zs * (hw - 0.4);
-        b.bx(Vec3::new(hl - 0.05, ly, z - 0.25), Vec3::new(hl + 0.02, ly + 0.14, z + 0.25), m(GLASS, 4), false);
-        b.bx(Vec3::new(-hl - 0.02, ly, z - 0.22), Vec3::new(-hl + 0.05, ly + 0.16, z + 0.22), m(PAINT, 1), false);
+        b.bx(Vec3::new(hl - 0.05, ly, z - 0.25), Vec3::new(hl + 0.02, ly + 0.14, z + 0.25), m(POOL, 3), false);
+        b.bx(Vec3::new(-hl - 0.02, ly, z - 0.22), Vec3::new(-hl + 0.05, ly + 0.16, z + 0.22), m(POOL, 4), false);
     }
     // bumpers, dark, front and back
     b.bx(Vec3::new(hl - 0.1, sill - 0.05, -hw + 0.15), Vec3::new(hl + 0.05, sill + 0.18, hw - 0.15), m(DARK, 0), false);

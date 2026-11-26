@@ -79,6 +79,7 @@ void main() {
     float grime = mix(0.9, 1.04, vnoise(po.xz * 0.11 + po.y * 0.07)) * mix(0.94, 1.0, vnoise(vec2(po.y * 0.35, po.x * 0.21 + po.z * 0.17)));
     vec3 albedo;
     float glass = 0.0, coat = 0.0;
+    vec3 emit = vec3(0.0); // light of its own at dusk (main.rgen scales it by the dark)
     if (mt == 1u || mt == 7u) {
         // glass: window by window a little different (coating, blinds behind it)
         vec3 tint = B_GLASS[min(pal, 7u)];
@@ -98,6 +99,11 @@ void main() {
             glass = mix(glass, 0.75, fs);
             albedo = mix(albedo, frameC, fm);
             glass = mix(glass, 0.15, fm);
+            // a lit room behind about two windows in five, warm or cool, some dimmer; its
+            // average where the pixel holds many windows
+            float lit = mix(0.28, step(bHash(cell, meshId * 31u + 3u), 0.28), detail);
+            vec3 room = mix(vec3(1.0, 0.68, 0.36), vec3(0.85, 0.9, 1.0), step(0.88, r1)) * mix(0.5, 1.0, r2);
+            emit = room * lit * (1.0 - fm) * (1.0 - fs);
         }
     } else if (mt == 0u || mt == 10u) {
         albedo = B_WALL[min(pal, 8u)] * grime * (mt == 10u ? 0.92 : 1.0) * buildingTint(instSeed(gl_InstanceCustomIndexEXT));
@@ -158,6 +164,11 @@ void main() {
             cl = (1.0 - smoothstep(0.08, 0.12, abs(abs(po.z) - 4.6))) * detail;
         }
         albedo = mix(albedo, pal == 0u ? vec3(0.55, 0.42, 0.10) : vec3(0.6), cl);
+    } else if (mt == 13u && pal >= 2u) {
+        // lamps: a street light's head, headlights, taillights
+        albedo = pal == 4u ? vec3(0.4, 0.03, 0.02) : vec3(0.8);
+        glass = 0.2;
+        emit = pal == 2u ? vec3(1.0, 0.8, 0.55) * 40.0 : pal == 3u ? vec3(1.0, 0.95, 0.85) * 60.0 : vec3(1.0, 0.08, 0.04) * 20.0;
     } else if (mt == 13u && pal == 1u) {
         // a wake's foam: bright where it is fresh, a broken lace of it
         albedo = vec3(0.78) * mix(0.55, 1.0, vnoise(po.xz * 1.7));
@@ -180,4 +191,5 @@ void main() {
     // (x: a clearcoat over the paint, main.rgen)
     // (y: plain tinted glass, cars' and boats' windows: F0 0.04, not a coated curtain wall)
     pl.trans = vec3(coat, (mt == 1u && pal == 6u) ? 1.0 : 0.0, glass);
+    pl.wtan = emit;
 }

@@ -952,7 +952,14 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
   mid-rise; small balconies, water tanks, roof terraces and pools; marinas off some waterfronts;
   three landmark towers (a stepped tower under a needle, a cylinder crowned by fins, a slab with
   a sail) in the hearts of the cores. Coated glass reflects 25-35% at normal incidence.
-- **Still to do**: lights at night; streets that follow the coastlines; real interchanges. The
+- **Shores, streets and dusk.** A waterfront drive (promenade, verge, two lanes) follows the
+  shoreline field along the mid-rise and tower blocks; the shore changes every few hundred metres
+  between seawall, riprap, mangrove fringe and small beaches. Bridges are one continuous arch per
+  crossing (thin parapets, lamps, columns). Street lights and traffic signals line the streets;
+  cars have shaped glasshouses, lights and clearcoat paint. As the sun sets, lit windows (about a
+  quarter, mostly warm; in the impostors from window-sized cells in each building's own frame),
+  street lamps and car lights come up (`--time 2026-11-26T22:35`).
+- **Still to do**: real interchanges; light pools on the ground under the lamps at night. The
   city is generated, not mapped.
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),

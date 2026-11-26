@@ -564,6 +564,11 @@ void main() {
             // albedo is that tint). The reflection is traced (other towers, the bay, the sky),
             // the sun's highlight is GGX.
             float gls = clamp(pl.trans.z, 0.0, 1.0);
+            // its own light (building.rchit / impostor.rchit: windows, lamps, car lights), in
+            // the sun's units, coming up as the sun sets: a lit room is about 1/1500 of the
+            // sunlit facade's radiance (brighter than that: a city at dusk reads by its lights)
+            vec3 emitB = pl.wtan;
+            float dusk = globe() ? smoothstep(0.15, -0.06, dot(L, normalize(gq))) : 0.0;
             // car paint (building.rchit: trans.x): its colour under a smooth clearcoat
             bool coat = pl.trans.x > 0.5;
             bool plainGlass = pl.trans.y > 0.5;
@@ -619,6 +624,7 @@ void main() {
             // reads dark as on a real car seen from above)
             if (plainGlass) { Fe *= 0.5; diffA *= 0.3; }
             col = diffA / PI * E * max(ndl, 0.0) * sh + diffA * indirect + spec + env * Fe;
+            col += emitB * (g.sunDir.w * 3e-3 * dusk);
             gbAlb = diffA;
             gbRough = rough;
             gbSpec = max(Fe.r, max(Fe.g, Fe.b));

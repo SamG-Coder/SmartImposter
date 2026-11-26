@@ -50,6 +50,17 @@ void main() {
         pl.ao = a.a * mix(0.75, 1.0, skyVisB);
         pl.sunVis = 1.0;
         pl.trans = vec3(0.0, 0.0, glassB);
+        // lit windows far away: the glass's share, on or off in cells of a window (1.6 m x a storey) of the building's own
+        // surface (in the building's own frame, so the cells line up with its facades), warm or cool (building.rchit)
+        mat3 Mb = plantMatrix(pr);
+        vec3 pb = transpose(Mb) * (gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT - plantOrigin(pr)) / dot(Mb[0], Mb[0]);
+        vec3 q = floor(pb / vec3(1.6, 3.2, 1.6));
+        uint hq = pcg(uint(int(q.x) + 65536) * 73856093u ^ uint(int(q.y) + 65536) * 19349663u ^ uint(int(q.z) + 65536) * 83492791u);
+        float on = step(float(hq & 1023u) / 1023.0, 0.28);
+        vec3 room = (hq & 28672u) == 28672u ? vec3(0.85, 0.9, 1.0) : vec3(1.0, 0.68, 0.36);
+        // (walls only: the glass share leaks into the roofs' coarse mips)
+        float wallF = 1.0 - smoothstep(0.35, 0.6, abs(octDecode(unpackSnorm2x16(hit.normal)).y));
+        pl.wtan = room * on * glassB * wallF * mix(0.5, 1.0, float((hq >> 16) & 255u) / 255.0);
         pl.shadowMask = 0xFFu;
         return;
     }
