@@ -170,6 +170,20 @@ fn interior(i: i64, j: i64) -> (f64, f64, f64, f64) {
 const HOUSE_LOT: f64 = 21.0;
 const FRONT_YARD: f64 = 6.0;
 
+/// House lot `l` of `n` on side `row` of block (i, j) whose interior is `w` wide: where it
+/// starts along the block and how wide it is. The lines between lots are moved up to 18% of
+/// a lot either way, so no two lots are alike (globe.rchit cLotLine the same).
+fn house_lot(i: i64, j: i64, row: usize, l: usize, n: usize, w: f64) -> (f64, f64) {
+    let lw = w / n as f64;
+    let line = |k: usize| k as f64 * lw + if k > 0 && k < n { (bu(i, j, 7300 + row as u32 * 32 + k as u32) - 0.5) * 0.36 * lw } else { 0.0 };
+    (line(l), line(l + 1) - line(l))
+}
+
+/// A house lot's front yard (m from its street): 4.5 to 9.5 m, lot by lot.
+fn front_yard(i: i64, j: i64, lot: u32) -> f64 {
+    4.5 + 5.0 * bu(i, j, 7400 + lot)
+}
+
 // ----
 
 /// A city's plane: the tangent plane at its centre (sea level), x east, y north. The terrain
@@ -822,11 +836,11 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     if z == 0 {
         // houses: two rows facing their streets
         let n = (w / HOUSE_LOT).floor().max(1.0) as usize;
-        let lw = w / n as f64;
         let depth = h * 0.5;
         for row in 0..2 {
             for l in 0..n {
                 let lot = (row * n + l) as u32;
+                let (ls, lw) = house_lot(i, j, row, l, n, w);
                 let drive_right = bu(i, j, 30 + lot) < 0.5;
                 // the archetypes that fit: along the street at most the lot less the driveway,
                 // at most 16 m deep
@@ -870,9 +884,9 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                     let (hx, hy) = (ax * 0.5 * scale, az * 0.5 * scale);
                     // along the street: centred in what the driveway leaves; back from the street
                     let u = if drive_right { 1.5 + (lw - 6.0) * 0.5 } else { 4.5 + (lw - 6.0) * 0.5 };
-                    for front in [FRONT_YARD, 3.0] {
+                    for front in [front_yard(i, j, lot), 3.0] {
                         let v = front + hy + 0.5;
-                        let px = x0 + l as f64 * lw + u;
+                        let px = x0 + ls + u;
                         let py = if row == 0 { y0 + v } else { y0 + h - v };
                         // (mapped water raised above the sea is the islands' land: built enough)
                         if built_at(px, py) < 0.15 && (buildable(k, terrain, px, py) || !house_ground(k, terrain, px, py)) {
@@ -894,14 +908,40 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 let _ = depth;
                 let Some((a, px, py, quarter, scale, hx, hy)) = found else { continue };
                 out.push(Placed { arch: a, x: px, y: py, quarter, scale, hx, hy });
-                // its pool and patio in the back yard (four houses in five), only with the house
+                // its pool, patio and lanai against the back of the house (four houses in five),
+                // set to one side of it or the other, only with the house
                 if bu(i, j, 600 + lot) < 0.8 {
-                    if let Some(pa) = archs.iter().position(|r| r.class == Class::Pool) {
-                        let back = FRONT_YARD + 17.5 + 3.5 + 4.0;
-                        let (qx, qy) = (x0 + l as f64 * lw + 5.5 + (lw - 11.0).max(0.0) * bu(i, j, 620 + lot), if row == 0 { y0 + back } else { y0 + h - back });
-                        let pool_ok = back + 6.0 < h * 0.5 && buildable(k, terrain, qx, qy) && buildable(k, terrain, qx, qy + if row == 0 { 6.0 } else { -6.0 });
+                    let pools: Vec<usize> = archs.iter().enumerate().filter(|(_, r)| r.class == Class::Pool).map(|(a, _)| a).collect();
+                    if !pools.is_empty() {
+                        let pa = pools[(bh(i, j, 610 + lot) as usize) % pools.len()];
+                        // (the patio's house edge on the house's back wall)
+                        let qy = if row == 0 { py + hy + 7.0 } else { py - hy - 7.0 };
+                        let lo = x0 + ls + 5.7;
+                        let hi = (x0 + ls + lw - 5.7).max(lo);
+                        let qx = (px + (hx - 5.5).max(0.0) * (bu(i, j, 620 + lot) * 2.0 - 1.0)).clamp(lo, hi);
+                        let far = if row == 0 { qy + 7.0 - y0 } else { y0 + h - (qy - 7.0) };
+                        let pool_ok = far < h * 0.5 - 0.5 && buildable(k, terrain, qx, qy) && buildable(k, terrain, qx, qy + if row == 0 { 7.0 } else { -7.0 });
                         if pool_ok && archs[pa].height >= need {
-                            out.push(Placed { arch: pa, x: qx, y: qy, quarter: if row == 0 { 2 } else { 0 }, scale: 1.0, hx: 5.5, hy: 6.0 });
+                            out.push(Placed { arch: pa, x: qx, y: qy, quarter: if row == 0 { 2 } else { 0 }, scale: 1.0, hx: 5.5, hy: 7.0 });
+                        }
+                    }
+                }
+                // a hedge along the lot's line on its left, from behind the front yard to the
+                // back line (two lot lines in three), in 8 m pieces with a gap now and then
+                if l > 0 && bu(i, j, 640 + lot) < 0.67 {
+                    if let Some(ha) = archs.iter().position(|r| r.class == Class::Hedge) {
+                        if archs[ha].height >= need {
+                            let hxl = x0 + ls;
+                            let mut v = front_yard(i, j, lot) + 4.0;
+                            let mut p = 0u32;
+                            while v + 4.0 < h * 0.5 - 0.5 {
+                                let hyl = if row == 0 { y0 + v + 4.0 } else { y0 + h - v - 4.0 };
+                                if bu(i, j, 660 + lot * 16 + p) < 0.85 && buildable(k, terrain, hxl, hyl) {
+                                    out.push(Placed { arch: ha, x: hxl, y: hyl, quarter: 0, scale: 1.0, hx: 0.5, hy: 4.1 });
+                                }
+                                v += 8.2;
+                                p += 1;
+                            }
                         }
                     }
                 }
@@ -1197,7 +1237,7 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     // thinning level: impostor.rint never thins buildings)
                     // (a pool and its patio lie flat on the ground, a few cm up: sunk as the
                     // buildings are, all 20 cm of it was under the lawn)
-                    let sink = if r.class == Class::Pool { -0.03 } else { 0.4 };
+                    let sink = if r.class == Class::Pool { -0.03 } else if r.class == Class::Hedge { 0.1 } else { 0.4 };
                     let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - sink, p.quarter as f64 * std::f64::consts::FRAC_PI_2, p.scale);
                     push_rec(tile, rows, super::forest::rec_data(r.variant, seed << 8), &infos[r.variant]);
                 }
@@ -1646,17 +1686,17 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
         }
     } else if z == 0 {
         let nl = (w / HOUSE_LOT).floor().max(1.0) as usize;
-        let lw = w / nl as f64;
         for r in 0..2 {
             for l in 0..nl {
                 let lot = (r * nl + l) as u32;
+                let (ls, lw) = house_lot(i, j, r, l, nl, w);
                 let right = bu(i, j, 30 + lot) < 0.5;
                 let u = if right { lw - 3.0 } else { 3.0 };
                 for (c, v) in [(0u32, 3.4), (1, 9.0)] {
                     if bu(i, j, 24_000 + lot * 2 + c) > if c == 0 { 0.65 } else { 0.3 } {
                         continue;
                     }
-                    let (x, y) = (x0 + l as f64 * lw + u, if r == 0 { y0 + v } else { y0 + h - v });
+                    let (x, y) = (x0 + ls + u, if r == 0 { y0 + v } else { y0 + h - v });
                     if !free(x, y) || !buildable(k, terrain, x, y) || near_water(k, terrain, x, y, 12.0) {
                         continue;
                     }
@@ -1896,16 +1936,16 @@ fn docks(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, 
     }
     let (x0, y0, w, h) = interior(i, j);
     let n = (w / HOUSE_LOT).floor().max(1.0) as usize;
-    let lw = w / n as f64;
     for row in 0..2 {
         for l in 0..n {
             let lot = (row * n + l) as u32;
-            let u = l as f64 * lw + lw * (0.3 + 0.4 * bu(i, j, 9100 + lot));
+            let (ls, lw) = house_lot(i, j, row, l, n, w);
+            let u = ls + lw * (0.3 + 0.4 * bu(i, j, 9100 + lot));
             // the lot's back line, and outwards (away from its street)
             let (yb, out) = if row == 0 { (y0 + h * 0.5, 1.0) } else { (y0 + h * 0.5, -1.0) };
             let x = x0 + u;
             // a house on this lot, land at the lot, water beyond the back line
-            let has_house = placed.iter().any(|p| (p.x - (x0 + l as f64 * lw + lw * 0.5)).abs() < lw * 0.5 && (p.y - yb).abs() < h * 0.5 && (p.y - yb) * out < 0.0);
+            let has_house = placed.iter().any(|p| p.hx > 2.0 && (p.x - (x0 + ls + lw * 0.5)).abs() < lw * 0.5 && (p.y - yb).abs() < h * 0.5 && (p.y - yb) * out < 0.0);
             if !has_house || !water_at(k, terrain, x, yb + out * 6.0) || !water_at(k, terrain, x, yb + out * 14.0) {
                 continue;
             }
@@ -1999,12 +2039,12 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
     let mut spots: Vec<(f64, f64, bool, u32)> = Vec::new();
     if z == 0 {
         let n = (w / HOUSE_LOT).floor().max(1.0) as usize;
-        let lw = w / n as f64;
         for row in 0..2 {
             for l in 0..n {
                 let lot = (row * n + l) as u32;
+                let (ls, lw) = house_lot(i, j, row, l, n, w);
                 let right = bu(i, j, 30 + lot) < 0.5;
-                let at = |u: f64, v: f64| (x0 + l as f64 * lw + u, if row == 0 { y0 + v } else { y0 + h - v });
+                let at = |u: f64, v: f64| (x0 + ls + u, if row == 0 { y0 + v } else { y0 + h - v });
                 if bu(i, j, 3100 + lot) < 0.85 {
                     let (x, y) = at(if right { 2.6 } else { lw - 2.6 }, 2.8);
                     spots.push((x, y, bu(i, j, 3200 + lot) < 0.4, 3300 + lot));

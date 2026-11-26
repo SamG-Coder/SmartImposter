@@ -373,6 +373,13 @@ uint cHash(uint x) {
 }
 uint cBh(int i, int j, uint s) { return cHash(uint(i) * 0x9E3779B1u ^ cHash(uint(j) + s * 0x85EBCA6Bu)); }
 float cBu(int i, int j, uint s) { return float(cBh(i, j, s) >> 8) / 16777216.0; }
+
+// A house block's lot line k of n on side `row` (globe/city.rs house_lot): moved up to 18% of a
+// lot either way, the block's ends fixed.
+float cLotLine(int i, int j, uint row, float k, float n, float lw) {
+    if (k <= 0.0 || k >= n) return k * lw;
+    return k * lw + (cBu(i, j, 7300u + row * 32u + uint(k)) - 0.5) * 0.36 * lw;
+}
 int cMod(int i, int m) { return i - m * int(floor(float(i) / float(m))); }
 bool cArtX(int i) { return cMod(i, 6) == 0; }
 bool cArtY(int j) { return cMod(j, 5) == 0; }
@@ -562,8 +569,13 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         float lw = W / n;
         bool south = b.y < 0.5 * H;
         float dv = south ? b.y : H - b.y; // back from the street
+        uint rowI = south ? 0u : 1u;
         float l = clamp(floor(b.x / lw), 0.0, n - 1.0);
-        float u = b.x - l * lw;
+        if (b.x < cLotLine(i, j, rowI, l, n, lw)) l = max(l - 1.0, 0.0);
+        else if (b.x >= cLotLine(i, j, rowI, l + 1.0, n, lw)) l = min(l + 1.0, n - 1.0);
+        float la = cLotLine(i, j, rowI, l, n, lw);
+        float u = b.x - la;
+        lw = cLotLine(i, j, rowI, l + 1.0, n, lw) - la; // (this lot's own width from here on)
         uint lotN = uint((south ? 0.0 : n) + l);
         bool right = cBu(i, j, 30u + lotN) < 0.5;
         vec2 q = vec2(u, dv);
@@ -572,10 +584,8 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         float drive = right ? cBox(q, vec2(lw - 4.6, -1.0), vec2(lw - 1.4, 20.0), fw) : cBox(q, vec2(1.4, -1.0), vec2(4.6, 20.0), fw);
         lot = mix(lot, vec3(0.20, 0.195, 0.185) * mix(0.8, 1.05, n2), drive);
         lot = mix(lot, vec3(0.22, 0.21, 0.19), cBox(q, vec2(0.5 * lw - 0.6, -1.0), vec2(0.5 * lw + 0.6, 6.5), fw));
-        // the back yard: a patio and, in some, a pool with its coping
-        float back = 6.0 + 17.5;
-        lot = mix(lot, vec3(0.23, 0.215, 0.195), cBox(q, vec2(2.0, back), vec2(lw - 2.0, back + 2.5), fw));
-        // (the back-yard pools are placed with their houses: globe/city.rs block)
+        // (the back-yard pools, patios and lanais are placed with their houses: globe/city.rs
+        // block; the hedges on the lot lines too)
         // hedges along the lot lines
         float hedge = max(1.0 - smoothstep(0.5, 0.5 + fw, min(u, lw - u)), 1.0 - smoothstep(0.6, 0.6 + fw, 0.5 * H - dv));
         lot = mix(lot, vec3(0.035, 0.06, 0.02) * mix(0.8, 1.2, n2), hedge * step(6.0, dv));

@@ -53,6 +53,8 @@ pub enum Class {
     Street,
     /// a house's back-yard pool
     Pool,
+    /// a hedge piece along a house lot's line
+    Hedge,
 }
 
 pub struct Arch {
@@ -909,19 +911,57 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, "Building_Dock".into(), 1.2, &mut meshes, &mut archs);
     }
-    // a back-yard pool (6 x 8 m with its coping and a strip of deck) in a paver patio of 11 x
-    // 12 m with a few loungers, placed with its house
-    {
+    // back-yard pools, placed against the back of their house (local -z): a paver patio of 11 x
+    // 14 m from the house wall, a covered lanai along the wall (a flat roof on posts), and the
+    // pool beyond it with its coping and a few loungers: a rectangle, an L, a kidney
+    for k in 0..3 {
         let mut b = B::new();
-        b.bx(Vec3::new(-5.5, 0.0, -6.0), Vec3::new(5.5, 0.1, 6.0), m(TILE, 4), false);
-        for (k, x) in [-4.6f32, -4.6, 4.6].iter().enumerate() {
-            let z = [-1.5f32, 0.8, -3.0][k];
+        b.bx(Vec3::new(-5.5, 0.0, -7.0), Vec3::new(5.5, 0.1, 7.0), m(TILE, 4), false);
+        // the lanai: 2.8 m deep along the wall, its roof at 2.8 m on three posts
+        b.bx(Vec3::new(-5.5, 2.7, -7.0), Vec3::new(5.5, 2.95, -4.2), m(TILE, [4u8, 3, 4][k]), true);
+        for x in [-5.2f32, 0.0, 5.2] {
+            b.bx(Vec3::new(x - 0.12, 0.1, -4.5), Vec3::new(x + 0.12, 2.7, -4.26), m(WALL, 0), false);
+        }
+        let water: Vec<Vec<Vec2>> = match k {
+            0 => vec![footprint(6.0, 8.0, 0.0, 0).iter().map(|p| *p + Vec2::new(0.0, 1.8)).collect()],
+            1 => vec![
+                footprint(4.4, 8.4, 0.0, 0).iter().map(|p| *p + Vec2::new(-1.4, 1.8)).collect(),
+                footprint(3.2, 3.0, 0.0, 0).iter().map(|p| *p + Vec2::new(2.4, 4.5)).collect(),
+            ],
+            _ => {
+                // a kidney: an ellipse dented on one side
+                let p: Vec<Vec2> = (0..28)
+                    .map(|t| {
+                        let a = t as f32 / 28.0 * std::f32::consts::TAU;
+                        let (c, s) = (a.cos(), a.sin());
+                        let dent = if c > 0.0 { 1.3 * c * c * (1.0 - s.abs()).max(0.0) } else { 0.0 };
+                        Vec2::new(3.1 * c - dent, 1.8 + 4.1 * s)
+                    })
+                    .collect();
+                vec![ccw(p)]
+            }
+        };
+        for poly in &water {
+            let center = poly.iter().fold(Vec2::ZERO, |a, p| a + *p) / poly.len() as f32;
+            let coping: Vec<Vec2> = poly.iter().map(|p| *p + (*p - center).normalize_or_zero() * 0.5).collect();
+            b.prism(&coping, 0.0, 0.15, m(SLAB, 0), m(SLAB, 0), false);
+        }
+        for poly in &water {
+            b.prism(poly, 0.15, 0.17, m(POOL, 0), m(POOL, 0), false);
+        }
+        for (n, &(x, z)) in [(-4.7f32, -2.6f32), (-4.7, -0.6), (4.7, 6.0)].iter().enumerate() {
+            if k == 1 && n == 2 {
+                continue;
+            }
             b.bx(Vec3::new(x - 0.35, 0.1, z - 0.9), Vec3::new(x + 0.35, 0.45, z + 0.9), m(PAINT, 0), false);
         }
-        b.bx(Vec3::new(-3.6, 0.0, -4.6), Vec3::new(3.6, 0.15, 4.6), m(SLAB, 0), false);
-        b.bx(Vec3::new(-3.0, 0.15, -4.0), Vec3::new(3.0, 0.17, 4.0), m(POOL, 0), false);
-        b.bx(Vec3::new(-3.6, 0.0, 4.6), Vec3::new(3.6, 0.1, 6.0), m(WOOD, 0), false);
-        push(b, "Building_Pool".into(), 0.2, &mut meshes, &mut archs);
+        push(b, format!("Building_Pool_{k}"), 3.0, &mut meshes, &mut archs);
+    }
+    // a hedge piece: 8 m of clipped ficus, a metre wide and 1.8 m tall (the lots' lines)
+    {
+        let mut b = B::new();
+        b.bx(Vec3::new(-0.5, 0.0, -4.1), Vec3::new(0.5, 1.8, 4.1), m(PAINT, 5), false);
+        push(b, "Building_Hedge".into(), 1.8, &mut meshes, &mut archs);
     }
     // cars (origin on the ground, front towards +x; painted white, the paint's colour is each
     // car's own: building.rchit / impostor.rchit by its record's seed)
@@ -1172,6 +1212,8 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 pub fn class_of(name: &str) -> Class {
     if name.contains("Building_Pool") {
         Class::Pool
+    } else if name.contains("Building_Hedge") {
+        Class::Hedge
     } else if name.contains("StreetLight") || name.contains("Signal") {
         Class::Street
     } else if name.contains("Landmark") {

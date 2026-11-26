@@ -144,6 +144,12 @@ void main() {
         const vec3 PAINTC[5] = vec3[5](vec3(0.03, 0.05, 0.13), vec3(0.36, 0.05, 0.04), vec3(0.04, 0.22, 0.24), vec3(0.02, 0.02, 0.025), vec3(0.86, 0.86, 0.84));
         albedo = PAINTC[min(pal, 4u)];
         glass = 0.3;
+        if (pal == 5u) {
+            // a clipped hedge: dense small leaves, matte, uneven dark green
+            float hn = vnoise(po.xz * 2.3 + po.y * 1.7) * 0.6 + vnoise(po.zy * 6.0 + po.x * 3.0) * 0.4;
+            albedo = vec3(0.045, 0.075, 0.028) * mix(0.6, 1.3, hn);
+            glass = 0.0;
+        }
     } else if (mt == 14u) {
         // car paint: each car's own colour (its record's seed; white in the bake, the impostor
         // applies the same colour: impostor.rchit carPaint), glossy
