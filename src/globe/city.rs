@@ -761,6 +761,10 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                 py = cy + side * sy;
                 px = cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.3;
             }
+            // (the waterfront drive runs along the water within WATERFRONT m: nothing built on it)
+            if near_water(k, terrain, px, py, hx.max(hy) * scale + WATERFRONT) {
+                continue;
+            }
             if built_at(px, py) < if class == Class::Tower { 0.15 } else { 0.3 } {
                 continue;
             }
@@ -1093,7 +1097,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
                     }
                     let bx = 2.2 + (st as f64 + 0.5) * 2.6 + (w - 4.4 - stalls as f64 * 2.6) * 0.5;
                     let (x, y) = (x0 + bx, y0 + by);
-                    if !free(x, y) || !buildable(k, terrain, x, y) {
+                    if !free(x, y) || !buildable(k, terrain, x, y) || near_water(k, terrain, x, y, WATERFRONT) {
                         continue;
                     }
                     let kind = (bh(i, j, 21_000 + n) % 5) as usize;
@@ -1142,6 +1146,17 @@ fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64,
 }
 
 const BOAT_CELL: f64 = 130.0;
+
+/// Width of the waterfront drive with its promenade and sidewalk (globe.rchit cityGround).
+const WATERFRONT: f64 = 24.0;
+
+/// Is there sea-level water within `r` m of the plan point (eight directions and the point)?
+fn near_water(k: usize, terrain: &Terrain, x: f64, y: f64, r: f64) -> bool {
+    (0..8).any(|n| {
+        let a = n as f64 * std::f64::consts::FRAC_PI_4;
+        water_at(k, terrain, x + r * a.cos(), y + r * a.sin())
+    }) || water_at(k, terrain, x, y)
+}
 
 /// Marinas off the waterfront of block (i, j) (the city's blocks other than houses): where the
 /// water reaches out beyond an edge of the block, a walkway runs along the edge 14 m out, finger

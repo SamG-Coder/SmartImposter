@@ -448,7 +448,7 @@ bool cityNear(vec3 p) {
     return dot(c, c) < gg.cityP.z * gg.cityP.z;
 }
 
-float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, out vec3 alb) {
+float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, float sd, out vec3 alb) {
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
     vec3 v = p - gg.cityO.xyz;
@@ -584,6 +584,24 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     vec3 mangrove = vec3(0.028, 0.05, 0.02) * mix(0.7, 1.3, fbmN(c * 0.25 + 77.0, 3));
     park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));
     alb = mix(park, planned, smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)));
+    // the waterfront drive (globe/city.rs WATERFRONT): along the shore of the city's blocks
+    // other than houses, following the shoreline field: a paved promenade at the seawall, a
+    // planted verge, two lanes with a double yellow line and white edge lines, a sidewalk; the
+    // streets of the grid run into it
+    if (zone >= 1 && sd < 24.0 && sd > 0.0) {
+        vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
+        vec3 drive = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
+        float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.3))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.7)));
+        float wht = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 7.6))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 19.4)));
+        drive = mix(drive, vec3(0.55, 0.42, 0.10), clamp(yel, 0.0, 1.0) * shown);
+        drive = mix(drive, vec3(0.6, 0.6, 0.58), clamp(wht, 0.0, 1.0) * shown);
+        vec3 wf = prom;
+        wf = mix(wf, lawnC, smoothstep(4.8, 4.8 + fw, sd));
+        wf = mix(wf, vec3(0.30, 0.29, 0.27), smoothstep(6.8, 6.8 + fw, sd) * shown);
+        wf = mix(wf, drive, smoothstep(7.1, 7.1 + fw, sd));
+        wf = mix(wf, walk, smoothstep(20.0, 20.0 + fw, sd));
+        alb = mix(alb, wf, 1.0 - smoothstep(23.0, 23.0 + fw, sd));
+    }
     // the roads of their own: an avenue's asphalt, lane lines and planted median; the ground
     // under an elevated road is a mown verge
     int wk;
@@ -639,6 +657,7 @@ void main() {
     vec2 tuv = vertUV(tri.x) * w.x + vertUV(tri.y) * w.y + vertUV(tri.z) * w.z;
     float cellM = V.v[NVERT * 12u];
     float sd = shoreDist(V, tuv);
+    float sdSmooth = sd; // (the city's waterfront drive follows the field's own, smooth shore)
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));
     float level = waterLevel(V, tuv);
@@ -720,7 +739,7 @@ void main() {
     } else if (cover || cityNear(p)) {
         // (in a city also where the land cover has no data: a former pond, the plan covers it)
         vec3 cityAlb;
-        float urban = cityGround(p, footprint, B.x, B.w, C.x, cityAlb);
+        float urban = cityGround(p, footprint, B.x, B.w, C.x, sdSmooth, cityAlb);
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
         // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
         // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.
