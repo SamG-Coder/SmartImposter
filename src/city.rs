@@ -51,6 +51,8 @@ pub enum Class {
     Landmark,
     /// street lights and traffic signals
     Street,
+    /// a house's back-yard pool
+    Pool,
 }
 
 pub struct Arch {
@@ -897,6 +899,14 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, "Building_Dock".into(), 1.2, &mut meshes, &mut archs);
     }
+    // a back-yard pool (6 x 8 m with its coping and a strip of deck), placed with its house
+    {
+        let mut b = B::new();
+        b.bx(Vec3::new(-3.6, 0.0, -4.6), Vec3::new(3.6, 0.15, 4.6), m(SLAB, 0), false);
+        b.bx(Vec3::new(-3.0, 0.15, -4.0), Vec3::new(3.0, 0.17, 4.0), m(POOL, 0), false);
+        b.bx(Vec3::new(-3.6, 0.0, 4.6), Vec3::new(3.6, 0.1, 6.0), m(WOOD, 0), false);
+        push(b, "Building_Pool".into(), 0.2, &mut meshes, &mut archs);
+    }
     // cars (origin on the ground, front towards +x; painted white, the paint's colour is each
     // car's own: building.rchit / impostor.rchit by its record's seed)
     for (k, &(len, wid, hgt, kind)) in [(4.0f32, 1.75f32, 1.45f32, 0u32), (4.75, 1.82, 1.45, 0), (4.85, 1.95, 1.75, 1), (5.6, 2.0, 1.85, 2), (5.2, 2.0, 2.15, 3), (12.0, 2.55, 3.1, 4)].iter().enumerate() {
@@ -1131,7 +1141,9 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("StreetLight") || name.contains("Signal") {
+    if name.contains("Building_Pool") {
+        Class::Pool
+    } else if name.contains("StreetLight") || name.contains("Signal") {
         Class::Street
     } else if name.contains("Landmark") {
         Class::Landmark

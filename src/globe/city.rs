@@ -575,6 +575,14 @@ fn urban_share(f: &[f32; lc::GROUPS]) -> f32 {
     (f[4] + 0.5 * (f[lc::TREE] + f[lc::GRASS])).min(1.0)
 }
 
+/// `urban_share` over a square of `size` m round lat / lon; mapped water above sea level counts
+/// as built (globe.rchit draws those ponds as the city's land, lots and all).
+fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
+    let Some(f) = terrain.cover.fractions(la, lo, size) else { return 0.0 };
+    let pond = f[lc::WATER] > 0.0 && !sea_level_water(terrain, la, lo);
+    (urban_share(&f) + if pond { f[lc::WATER] } else { 0.0 }).min(1.0)
+}
+
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (wx, wy) = to_world(x, y);
@@ -609,7 +617,7 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
     let dens = density(k, x0 + w * 0.5, y0 + h * 0.5);
     let built_at = |x: f64, y: f64| {
         let (la, lo) = to_lat_lon(k, x, y);
-        terrain.cover.fractions(la, lo, 40.0).map(|f| urban_share(&f)).unwrap_or(0.0)
+        built_share(terrain, la, lo, 40.0)
     };
     if z == 0 {
         // houses: two rows facing their streets
@@ -665,6 +673,17 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                     continue;
                 }
                 out.push(Placed { arch: a, x: px, y: py, quarter, scale, hx, hy });
+                // its pool in the back yard (half the houses), only with the house
+                if bu(i, j, 600 + lot) < 0.5 {
+                    if let Some(pa) = archs.iter().position(|r| r.class == Class::Pool) {
+                        let back = FRONT_YARD + 17.5 + 3.5 + 4.0;
+                        let (qx, qy) = (x0 + l as f64 * lw + 3.6 + (lw - 7.2) * bu(i, j, 620 + lot), if row == 0 { y0 + back } else { y0 + h - back });
+                        let pool_ok = back + 4.6 < h * 0.5 && buildable(k, terrain, qx, qy) && buildable(k, terrain, qx, qy + if row == 0 { 5.0 } else { -5.0 });
+                        if pool_ok && archs[pa].height >= need {
+                            out.push(Placed { arch: pa, x: qx, y: qy, quarter: if row == 0 { 2 } else { 0 }, scale: 1.0, hx: 3.6, hy: 4.6 });
+                        }
+                    }
+                }
             }
         }
         return out;
@@ -1139,7 +1158,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
                     }
                     let bx = 2.2 + (st as f64 + 0.5) * 2.6 + (w - 4.4 - stalls as f64 * 2.6) * 0.5;
                     let (x, y) = (x0 + bx, y0 + by);
-                    if !free(x, y) || !buildable(k, terrain, x, y) || (z >= 2 && near_water(k, terrain, x, y, WATERFRONT)) {
+                    if !free(x, y) || !buildable(k, terrain, x, y) || near_water(k, terrain, x, y, if z >= 2 { WATERFRONT } else { 12.0 }) {
                         continue;
                     }
                     let kind = (bh(i, j, 21_000 + n) % 5) as usize;
@@ -1162,7 +1181,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
                         continue;
                     }
                     let (x, y) = (x0 + l as f64 * lw + u, if r == 0 { y0 + v } else { y0 + h - v });
-                    if !free(x, y) || !buildable(k, terrain, x, y) {
+                    if !free(x, y) || !buildable(k, terrain, x, y) || near_water(k, terrain, x, y, 12.0) {
                         continue;
                     }
                     // nose in towards the house
@@ -1190,7 +1209,7 @@ fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64,
 const BOAT_CELL: f64 = 130.0;
 
 /// Width of the waterfront drive with its promenade and sidewalk (globe.rchit cityGround).
-const WATERFRONT: f64 = 24.0;
+const WATERFRONT: f64 = 32.0;
 
 /// Is there sea-level water within `r` m of the plan point (eight directions and the point)?
 fn near_water(k: usize, terrain: &Terrain, x: f64, y: f64, r: f64) -> bool {
@@ -1289,7 +1308,9 @@ fn sea_level_water(terrain: &Terrain, la: f64, lo: f64) -> bool {
         }
     }
     h.sort_by(|a, b| a.total_cmp(b));
-    h[h.len() / 4] < 1.0
+    // drawn as water only where the ground is under that level (tiles.rs: the drawn water is
+    // mapped water whose ground lies below its level; a pond above sea level is land in a city)
+    h[h.len() / 4] < 1.0 && terrain.height(la, lo) < 0.6
 }
 
 /// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards
@@ -1424,7 +1445,7 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
         }
         let Some(d) = in_tile(k, x, y, id) else { continue };
         let (lat, lon) = lat_lon(d);
-        let built = terrain.cover.fractions(lat, lon, 30.0).map(|f| urban_share(&f)).unwrap_or(0.0);
+        let built = built_share(terrain, lat, lon, 30.0);
         if built < 0.25 || !buildable(k, terrain, x, y) {
             continue;
         }
@@ -1529,7 +1550,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         let list = if broad && !sp.city_trees.is_empty() { &sp.city_trees } else { &sp.palms };
         let Some(d) = in_tile(k, x, y, id) else { continue };
         let (lat, lon) = lat_lon(d);
-        if !buildable(k, terrain, x, y) || terrain.cover.fractions(lat, lon, 30.0).map(|f| urban_share(&f)).unwrap_or(0.0) < 0.2 {
+        if !buildable(k, terrain, x, y) || built_share(terrain, lat, lon, 30.0) < 0.2 {
             continue;
         }
         if tile.recs.len() >= MAX_PER_TILE {

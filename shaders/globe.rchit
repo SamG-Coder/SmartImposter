@@ -550,14 +550,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         // the back yard: a patio and, in some, a pool with its coping
         float back = 6.0 + 17.5;
         lot = mix(lot, vec3(0.23, 0.215, 0.195), cBox(q, vec2(2.0, back), vec2(lw - 2.0, back + 2.5), fw));
-        if (cBu(i, j, 600u + lotN) < 0.5) {
-            float px = 2.5 + (lw - 12.0) * cBu(i, j, 620u + lotN);
-            vec2 lo = vec2(px, back + 3.5), hi = vec2(px + 4.5 + 3.0 * cBu(i, j, 640u + lotN), back + 3.5 + 7.5);
-            lot = mix(lot, vec3(0.42, 0.40, 0.37), cBox(q, lo - 0.6, hi + 0.6, fw));
-            vec2 pq = (q - lo) / max(hi - lo, vec2(1.0));
-            vec3 water = mix(vec3(0.05, 0.30, 0.34), vec3(0.10, 0.42, 0.46), smoothstep(0.0, 1.0, pq.y)) * mix(0.9, 1.1, n2);
-            lot = mix(lot, water, cBox(q, lo, hi, fw));
-        }
+        // (the back-yard pools are placed with their houses: globe/city.rs block)
         // hedges along the lot lines
         float hedge = max(1.0 - smoothstep(0.5, 0.5 + fw, min(u, lw - u)), 1.0 - smoothstep(0.6, 0.6 + fw, 0.5 * H - dv));
         lot = mix(lot, vec3(0.035, 0.06, 0.02) * mix(0.8, 1.2, n2), hedge * step(6.0, dv));
@@ -596,19 +589,26 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // other than houses, following the shoreline field: a paved promenade at the seawall, a
     // planted verge, two lanes with a double yellow line and white edge lines, a sidewalk; the
     // streets of the grid run into it
-    if (zone >= 2 && sd < 24.0 && sd > 0.0) {
+    // (the drive's lanes lie well inland, D m out from the water, on the low-passed distance:
+    // a level set that far in is smooth, and the promenade and a planted verge take up the
+    // shore's wiggles; the grid's streets, and with them the bridges' approaches, run through
+    // the verge to the drive)
+    const float D = 16.0;
+    if (zone >= 2 && sd < D + 16.0 && sd > 0.0) {
         vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
         vec3 drive = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
-        float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.3))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.7)));
-        float wht = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 7.6))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 19.4)));
+        float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.0))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.4)));
+        float wht = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 0.5))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 11.9)));
         drive = mix(drive, vec3(0.55, 0.42, 0.10), clamp(yel, 0.0, 1.0) * shown);
         drive = mix(drive, vec3(0.6, 0.6, 0.58), clamp(wht, 0.0, 1.0) * shown);
         vec3 wf = prom;
-        wf = mix(wf, lawnC, smoothstep(4.8, 4.8 + fw, sd));
-        wf = mix(wf, vec3(0.30, 0.29, 0.27), smoothstep(6.8, 6.8 + fw, sd) * shown);
-        wf = mix(wf, drive, smoothstep(7.1, 7.1 + fw, sd));
-        wf = mix(wf, walk, smoothstep(20.0, 20.0 + fw, sd));
-        alb = mix(alb, wf, 1.0 - smoothstep(23.0, 23.0 + fw, sd));
+        wf = mix(wf, lawnC, smoothstep(5.0, 5.0 + fw, sd));
+        wf = mix(wf, vec3(0.30, 0.29, 0.27), smoothstep(D - 0.3, D - 0.3 + fw, sd) * shown);
+        wf = mix(wf, drive, smoothstep(D, D + fw, sd));
+        wf = mix(wf, walk, smoothstep(D + 12.4, D + 12.4 + fw, sd));
+        float cover = 1.0 - smoothstep(D + 15.5, D + 15.5 + fw, sd);
+        cover *= 1.0 - roadW * (1.0 - smoothstep(D - 1.0, D, sd)); // the streets run through
+        alb = mix(alb, wf, cover);
     }
     // the roads of their own: an avenue's asphalt, lane lines and planted median; the ground
     // under an elevated road is a mown verge
@@ -665,7 +665,18 @@ void main() {
     vec2 tuv = vertUV(tri.x) * w.x + vertUV(tri.y) * w.y + vertUV(tri.z) * w.z;
     float cellM = V.v[NVERT * 12u];
     float sd = shoreDist(V, tuv);
-    float sdSmooth = sd; // (the city's waterfront drive follows the field's own, smooth shore)
+    // the city's waterfront drive follows a low-passed shore: the field (before its noise)
+    // averaged over a ring of 14 m round the point
+    float sdSmooth = sd;
+    {
+        float ru = 14.0 / max(cellM * float(FIELD), 1.0);
+        float acc = sd;
+        for (int k = 0; k < 8; ++k) {
+            float a = float(k) * 0.7853982;
+            acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+        }
+        sdSmooth = acc / 9.0;
+    }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));
     float level = waterLevel(V, tuv);
