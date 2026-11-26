@@ -914,7 +914,7 @@ void main() {
                     glint *= mix(0.75, 4.3, step(0.93, hs));
                     // (the sun's own path on calm water is far brighter than the sky's glare on
                     // it: a near-white streak down the river towards the sun)
-                    glint *= 6.0;
+                    glint *= 3.5;
                 }
             }
             // (a city's narrow channels: the bright hazy sky they mirror is held to a fraction
@@ -922,7 +922,7 @@ void main() {
             // sheet; away from the sun the sky's reflection is whole: the calm bay mirrors it)
             if (g.city.x > 0.5) {
                 float rl = dot(refl, vec3(0.2126, 0.7152, 0.0722));
-                float capL = mix(0.45, 0.6, 1.0 - smoothstep(0.55, 0.9, dot(R, L))) * g.sunDir.w;
+                float capL = mix(0.3, 0.6, 1.0 - smoothstep(0.55, 0.9, dot(R, L))) * g.sunDir.w;
                 if (rl > capL) refl *= capL / rl;
             }
             col = mix(col, refl, F) + E * glint * F * sh;

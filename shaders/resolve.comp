@@ -35,7 +35,7 @@ vec3 cityGrade(vec3 hdr) {
     // (in linear: the haze's veil over the dark end, cool grey; a little less saturation)
     float l2 = dot(c, vec3(0.2126, 0.7152, 0.0722));
     c = mix(c, mix(vec3(l2), c, 0.8), milk);
-    c = mix(c, c + vec3(0.040, 0.047, 0.062) * (1.0 - c), milk);
+    c = mix(c, c + vec3(0.032, 0.038, 0.052) * (1.0 - c), milk);
     c *= mix(vec3(1.0), vec3(0.94, 0.975, 1.06), milk);
     return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
 }

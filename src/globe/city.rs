@@ -666,6 +666,12 @@ const CHANNELS: &[Channel] = &[
     Channel { a: (-3147.0, -440.0), b: (-3420.0, -250.0), half: 34.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-3420.0, -250.0), b: (-3760.0, -235.0), half: 34.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-3760.0, -235.0), b: (-3938.0, -560.0), half: 34.0, amp: 0.0, wave: 1000.0 },
+    // where the river meets the city's inner bay: a lagoon, arms of water north and south of
+    // the river joined at their ends, the land between them wooded islands (ISLAND_PARKS)
+    Channel { a: (-4350.0, -140.0), b: (-2900.0, -170.0), half: 150.0, amp: 60.0, wave: 1400.0 },
+    Channel { a: (-4350.0, -1180.0), b: (-2900.0, -1140.0), half: 150.0, amp: 70.0, wave: 1300.0 },
+    Channel { a: (-4350.0, -140.0), b: (-4350.0, -1180.0), half: 120.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-2900.0, -170.0), b: (-2900.0, -1140.0), half: 120.0, amp: 0.0, wave: 1000.0 },
     // a canal looping south off it round a peninsula
     Channel { a: (-2690.0, -720.0), b: (-2620.0, -1080.0), half: 28.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-2620.0, -1080.0), b: (-2900.0, -1260.0), half: 28.0, amp: 0.0, wave: 1000.0 },
@@ -828,6 +834,10 @@ const TOWER_SPOTS: &[(f64, f64, f64)] = &[
     (25.7935, -80.1600, 260.0),
 ];
 
+/// Wooded islands, nothing built on them (world plane rectangles: x0, y0, x1, y1): the land
+/// the lagoon's arms and the river leave between them.
+const ISLAND_PARKS: &[(f64, f64, f64, f64)] = &[(-4230.0, -1030.0, -3020.0, -290.0)];
+
 /// Is block (i, j) of zone z a surface car park round its buildings? (A third of the walk-up
 /// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
 /// and shade trees.
@@ -877,6 +887,12 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     let mut out = Vec::new();
     let (x0, y0, w, h) = interior(i, j);
     let z = block_zone(k, i, j);
+    {
+        let (cx, cy) = to_world(x0 + w * 0.5, y0 + h * 0.5);
+        if ISLAND_PARKS.iter().any(|&(ax, ay, bx, by)| (ax..bx).contains(&cx) && (ay..by).contains(&cy)) {
+            return out;
+        }
+    }
     // (the zones below the cores hold nothing that tall)
     let tallest = |cls: &[Class]| archs.iter().filter(|a| cls.contains(&a.class)).map(|a| a.height).fold(0.0f32, f32::max);
     let classes: &[Class] = match z {
