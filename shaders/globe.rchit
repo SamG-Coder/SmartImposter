@@ -395,6 +395,51 @@ float cBox(vec2 p, vec2 lo, vec2 hi, float fw) {
     return a.x * a.y;
 }
 
+// ---- the plan bends (globe/city.rs warp, to_plan): the grid is straight in the plan, curved in
+// the city's plane
+vec2 cWarp(vec2 q) {
+    return vec2(50.0 * sin(q.y / 330.0 + 1.3) + 18.0 * sin(q.y / 140.0 + q.x / 500.0 + 0.4),
+                40.0 * sin(q.x / 380.0 + 2.1) + 15.0 * sin(q.x / 150.0 + q.y / 520.0 + 2.9));
+}
+vec2 cToPlan(vec2 c) {
+    vec2 q = c;
+    for (int k = 0; k < 6; ++k) q = c - cWarp(q);
+    return q;
+}
+// the roads of their own (globe/city.rs WAYS; 0 avenue, 1 highway, 2 ramp), in the city's plane
+const int C_WAYS = 7;
+const int C_WAY_FIRST[8] = int[8](0, 10, 15, 20, 25, 30, 35, 41);
+const int C_WAY_KIND[7] = int[7](1, 1, 2, 2, 0, 0, 0);
+const float C_WAY_HALF[7] = float[7](15.0, 13.0, 5.5, 5.5, 14.0, 14.0, 14.0);
+const vec2 C_WAY_P[41] = vec2[41](vec2(-3350.0, -7000.0), vec2(-3250.0, -5000.0), vec2(-3150.0, -3000.0), vec2(-3050.0, -1500.0), vec2(-3000.0, -200.0), vec2(-3080.0, 1200.0), vec2(-3250.0, 2800.0), vec2(-3450.0, 4500.0), vec2(-3600.0, 6500.0), vec2(-3700.0, 9000.0), vec2(-3010.0, 700.0), vec2(-2700.0, 790.0), vec2(-2300.0, 860.0), vec2(-1900.0, 890.0), vec2(-1450.0, 880.0), vec2(-3018.0, -1300.0), vec2(-3013.0, -1450.0), vec2(-2995.0, -1600.0), vec2(-2965.0, -1750.0), vec2(-2930.0, -1900.0), vec2(-3277.0, 2800.0), vec2(-3300.0, 2950.0), vec2(-3345.0, 3100.0), vec2(-3400.0, 3250.0), vec2(-3460.0, 3400.0), vec2(-7500.0, -6500.0), vec2(-5600.0, -4400.0), vec2(-4200.0, -2900.0), vec2(-3300.0, -1900.0), vec2(-2500.0, -1100.0), vec2(-1800.0, 2600.0), vec2(-3000.0, 3600.0), vec2(-4400.0, 4800.0), vec2(-6000.0, 6300.0), vec2(-7500.0, 7800.0), vec2(4300.0, -1500.0), vec2(4150.0, 0.0), vec2(4250.0, 1500.0), vec2(4500.0, 3000.0), vec2(4800.0, 4500.0), vec2(5000.0, 6000.0));
+// The nearest road to c: its kind, half width, signed distance across, distance along.
+// Returns false if none is within its half width + pad.
+bool cWay(vec2 c, float pad, out int kind, out float wHalf, out float d, out float s) {
+    float best = 1e9;
+    kind = -1;
+    for (int w = 0; w < C_WAYS; ++w) {
+        float hw = C_WAY_HALF[w] + pad, acc = 0.0;
+        for (int p = C_WAY_FIRST[w]; p < C_WAY_FIRST[w + 1] - 1; ++p) {
+            vec2 a = C_WAY_P[p], b = C_WAY_P[p + 1];
+            vec2 ab = b - a;
+            float l = length(ab);
+            if (any(lessThan(c, min(a, b) - hw)) || any(greaterThan(c, max(a, b) + hw))) { acc += l; continue; }
+            float t = clamp(dot(c - a, ab) / (l * l), 0.0, 1.0);
+            vec2 e = c - a - ab * t;
+            float dist = length(e);
+            if (dist < hw && dist < best) {
+                best = dist;
+                kind = C_WAY_KIND[w];
+                wHalf = C_WAY_HALF[w];
+                d = (ab.x * e.y - ab.y * e.x) / l;
+                s = acc + t * l;
+            }
+            acc += l;
+        }
+    }
+    return kind >= 0;
+}
+
 // Is p inside the city's plan?
 bool cityNear(vec3 p) {
     if (gg.cityP.z <= 0.0) return false;
@@ -407,9 +452,10 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
     vec3 v = p - gg.cityO.xyz;
-    vec2 c = vec2(dot(v, gg.cityE.xyz), dot(v, gg.cityN.xyz));
-    float r = length(c);
+    vec2 cw = vec2(dot(v, gg.cityE.xyz), dot(v, gg.cityN.xyz)); // the city's plane
+    float r = length(cw);
     if (r > gg.cityP.z) return 0.0;
+    vec2 c = cToPlan(cw); // the plan (the grid's own coordinates)
     float BX = gg.cityP.x, BY = gg.cityP.y;
     int i = int(floor(c.x / BX)), j = int(floor(c.y / BY));
     if (c.x < cLineX(i)) i -= 1; else if (c.x >= cLineX(i + 1)) i += 1;
@@ -538,6 +584,29 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     vec3 mangrove = vec3(0.028, 0.05, 0.02) * mix(0.7, 1.3, fbmN(c * 0.25 + 77.0, 3));
     park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));
     alb = mix(park, planned, smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)));
+    // the roads of their own: an avenue's asphalt, lane lines and planted median; the ground
+    // under an elevated road is a mown verge
+    int wk;
+    float wh, wd, ws;
+    if (cWay(cw, 4.0, wk, wh, wd, ws)) {
+        float ad = abs(wd);
+        vec3 road;
+        float cover;
+        if (wk == 0) {
+            vec3 asph = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
+            float lane = (1.0 - smoothstep(0.07, 0.07 + fw, abs(ad - 4.9))) * step(fract(ws / 9.0), 0.35)
+                       + (1.0 - smoothstep(0.07, 0.07 + fw, abs(ad - (wh - 3.9))));
+            road = mix(asph, vec3(0.6, 0.6, 0.58), clamp(lane, 0.0, 1.0) * shown);
+            road = mix(road, lawnC, 1.0 - smoothstep(1.5, 1.5 + fw, ad));                       // median
+            road = mix(road, vec3(0.30, 0.29, 0.27), smoothstep(1.4, 1.4 + fw, ad) * (1.0 - smoothstep(1.7, 1.7 + fw, ad)) * shown); // its kerb
+            road = mix(road, walk, smoothstep(wh - 3.5, wh - 3.5 + fw, ad));                     // sidewalks
+            cover = 1.0 - smoothstep(wh, wh + fw, ad);
+        } else {
+            road = lawnC * 0.9;
+            cover = 1.0 - smoothstep(wh + 3.0, wh + 3.0 + fw, ad);
+        }
+        alb = mix(alb, road, cover);
+    }
     // the city keeps off water and wetland; it fades in with the built-up land and out at its rim
     float urban = 1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z);
     // (land by the shore field is land, right up to the water: no fade by the water fraction,

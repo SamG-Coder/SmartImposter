@@ -142,6 +142,15 @@ void main() {
         // a bridge's roadway: asphalt with its centre line
         albedo = vec3(0.075, 0.075, 0.078) * mix(0.85, 1.15, vnoise(po.xz * 0.3));
         float cl = (1.0 - smoothstep(0.1, 0.14, abs(po.z))) * step(fract(po.x / 9.0), pal == 0u ? 1.0 : 0.4) * detail;
+        if (pal == 2u) {
+            // the highway: dashed lanes either side of the median, solid edge lines
+            float az = abs(po.z);
+            float dash = step(fract(po.x / 12.0), 0.3);
+            cl = max(max(1.0 - smoothstep(0.08, 0.12, abs(az - 4.0)), 1.0 - smoothstep(0.08, 0.12, abs(az - 7.6))) * dash,
+                     max(1.0 - smoothstep(0.08, 0.12, abs(az - 0.6)), 1.0 - smoothstep(0.08, 0.12, abs(az - 13.8)))) * detail;
+        } else if (pal == 3u) {
+            cl = (1.0 - smoothstep(0.08, 0.12, abs(abs(po.z) - 4.6))) * detail;
+        }
         albedo = mix(albedo, pal == 0u ? vec3(0.55, 0.42, 0.10) : vec3(0.6), cl);
     } else if (mt == 13u && pal == 1u) {
         // a wake's foam: bright where it is fresh, a broken lace of it

@@ -210,7 +210,265 @@ fn plane(k: usize, d: DVec3) -> (f64, f64) {
     (v.dot(f.east), v.dot(f.north))
 }
 
-/// The city whose plan covers lat / lon, and the point in its plane (m east, m north).
+// ---- the plan bends: a smooth warp from the plan (where the grid is straight) to the city's
+// plane, so the streets curve over a few hundred metres and the blocks are never quite square.
+// The same functions are in globe.rchit (cWarp); keep them in step. Its slope stays under 0.3,
+// so the inverse (a fixed point) converges in a few steps.
+
+fn warp(x: f64, y: f64) -> (f64, f64) {
+    (
+        50.0 * (y / 330.0 + 1.3).sin() + 18.0 * (y / 140.0 + x / 500.0 + 0.4).sin(),
+        40.0 * (x / 380.0 + 2.1).sin() + 15.0 * (x / 150.0 + y / 520.0 + 2.9).sin(),
+    )
+}
+
+/// Plan -> the city's plane.
+pub fn to_world(x: f64, y: f64) -> (f64, f64) {
+    let w = warp(x, y);
+    (x + w.0, y + w.1)
+}
+
+/// The city's plane -> the plan.
+pub fn to_plan(x: f64, y: f64) -> (f64, f64) {
+    let (mut qx, mut qy) = (x, y);
+    for _ in 0..6 {
+        let w = warp(qx, qy);
+        qx = x - w.0;
+        qy = y - w.1;
+    }
+    (qx, qy)
+}
+
+/// How much the warp turns the plan's axes at a plan point (rad, from east towards north):
+/// buildings and cars turn with their streets.
+fn twist(x: f64, y: f64) -> f64 {
+    let a2 = y / 140.0 + x / 500.0 + 0.4;
+    let b2 = x / 150.0 + y / 520.0 + 2.9;
+    let j00 = 1.0 + 18.0 * a2.cos() / 500.0;
+    let j01 = 50.0 * (y / 330.0 + 1.3).cos() / 330.0 + 18.0 * a2.cos() / 140.0;
+    let j10 = 40.0 * (x / 380.0 + 2.1).cos() / 380.0 + 15.0 * b2.cos() / 150.0;
+    let j11 = 1.0 + 15.0 * b2.cos() / 520.0;
+    0.5 * (j10.atan2(j00) + (-j01).atan2(j11))
+}
+
+// ---- roads of their own, laid out by hand in the city's plane (not the plan's grid): an
+// elevated highway west of downtown with a spur into it and ramps down to the streets, and
+// diagonal avenues at grade (a planted median, two lanes each way). globe.rchit draws the
+// avenues on the ground from the same list (C_WAY_*): keep them in step.
+
+#[derive(Clone, Copy, PartialEq)]
+enum WayKind {
+    Avenue,
+    Highway,
+    Ramp,
+}
+
+struct Way {
+    kind: WayKind,
+    half: f64,
+    start_ground: bool,
+    end_ground: bool,
+    pts: &'static [(f64, f64)],
+}
+
+/// Height of the elevated roads' decks (m), and over how far a ramp climbs to it.
+const DECK_TOP: f64 = 10.0;
+const RAMP_LEN: f64 = 240.0;
+
+const WAYS: &[Way] = &[
+    Way { kind: WayKind::Highway, half: 15.0, start_ground: true, end_ground: true, pts: &[(-3350.0, -7000.0), (-3250.0, -5000.0), (-3150.0, -3000.0), (-3050.0, -1500.0), (-3000.0, -200.0), (-3080.0, 1200.0), (-3250.0, 2800.0), (-3450.0, 4500.0), (-3600.0, 6500.0), (-3700.0, 9000.0)] },
+    Way { kind: WayKind::Highway, half: 13.0, start_ground: false, end_ground: true, pts: &[(-3010.0, 700.0), (-2700.0, 790.0), (-2300.0, 860.0), (-1900.0, 890.0), (-1450.0, 880.0)] },
+    Way { kind: WayKind::Ramp, half: 5.5, start_ground: false, end_ground: true, pts: &[(-3018.0, -1300.0), (-3013.0, -1450.0), (-2995.0, -1600.0), (-2965.0, -1750.0), (-2930.0, -1900.0)] },
+    Way { kind: WayKind::Ramp, half: 5.5, start_ground: false, end_ground: true, pts: &[(-3277.0, 2800.0), (-3300.0, 2950.0), (-3345.0, 3100.0), (-3400.0, 3250.0), (-3460.0, 3400.0)] },
+    Way { kind: WayKind::Avenue, half: 14.0, start_ground: true, end_ground: true, pts: &[(-7500.0, -6500.0), (-5600.0, -4400.0), (-4200.0, -2900.0), (-3300.0, -1900.0), (-2500.0, -1100.0)] },
+    Way { kind: WayKind::Avenue, half: 14.0, start_ground: true, end_ground: true, pts: &[(-1800.0, 2600.0), (-3000.0, 3600.0), (-4400.0, 4800.0), (-6000.0, 6300.0), (-7500.0, 7800.0)] },
+    Way { kind: WayKind::Avenue, half: 14.0, start_ground: true, end_ground: true, pts: &[(4300.0, -1500.0), (4150.0, 0.0), (4250.0, 1500.0), (4500.0, 3000.0), (4800.0, 4500.0), (5000.0, 6000.0)] },
+];
+
+impl Way {
+    fn len(&self) -> f64 {
+        self.pts.windows(2).map(|w| ((w[1].0 - w[0].0).powi(2) + (w[1].1 - w[0].1).powi(2)).sqrt()).sum()
+    }
+    /// Point and unit tangent at distance s along.
+    fn at(&self, s: f64) -> ((f64, f64), (f64, f64)) {
+        let mut s = s;
+        for w in self.pts.windows(2) {
+            let (dx, dy) = (w[1].0 - w[0].0, w[1].1 - w[0].1);
+            let l = (dx * dx + dy * dy).sqrt();
+            if s <= l {
+                return ((w[0].0 + dx * s / l, w[0].1 + dy * s / l), (dx / l, dy / l));
+            }
+            s -= l;
+        }
+        let n = self.pts.len();
+        let (a, b) = (self.pts[n - 2], self.pts[n - 1]);
+        let l = ((b.0 - a.0).powi(2) + (b.1 - a.1).powi(2)).sqrt();
+        (b, ((b.0 - a.0) / l, (b.1 - a.1) / l))
+    }
+    /// Deck top over the ground at s (0 for an avenue).
+    fn deck(&self, s: f64, len: f64) -> f64 {
+        if self.kind == WayKind::Avenue {
+            return 0.0;
+        }
+        let mut f: f64 = 1.0;
+        if self.start_ground {
+            f = f.min(s / RAMP_LEN);
+        }
+        if self.end_ground {
+            f = f.min((len - s) / RAMP_LEN);
+        }
+        DECK_TOP * f.clamp(0.0, 1.0)
+    }
+    /// Distance from the centre line to a point (unsigned), if within `reach`.
+    fn dist(&self, x: f64, y: f64, reach: f64) -> Option<f64> {
+        let mut best = f64::MAX;
+        for w in self.pts.windows(2) {
+            let (ax, ay, bx, by) = (w[0].0, w[0].1, w[1].0, w[1].1);
+            if x < ax.min(bx) - reach || x > ax.max(bx) + reach || y < ay.min(by) - reach || y > ay.max(by) + reach {
+                continue;
+            }
+            let (dx, dy) = (bx - ax, by - ay);
+            let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+            best = best.min(((x - ax - dx * t).powi(2) + (y - ay - dy * t).powi(2)).sqrt());
+        }
+        (best < reach).then_some(best)
+    }
+}
+
+/// Is the city-plane point on one of the roads (within its half width plus `pad`)?
+fn on_way(x: f64, y: f64, pad: f64) -> bool {
+    WAYS.iter().any(|w| w.dist(x, y, w.half + pad).is_some())
+}
+
+/// Highway and ramp decks, the traffic on them and on the avenues, the avenues' median palms,
+/// whose feet lie in tile `id` (box `lo`..`hi` in the city's plane).
+#[allow(clippy::too_many_arguments)]
+fn way_items(k: usize, terrain: &Terrain, sp: &Species, id: TileId, tile: &mut TreeTile, lvl: u8, lo: (f64, f64), hi: (f64, f64)) {
+    let (kinds, _) = car_kinds(&sp.buildings);
+    let decks: Vec<&ArchRef> = sp.buildings.iter().filter(|a| a.class == Class::Highway).collect();
+    if decks.len() < 2 || kinds.len() < 6 {
+        return;
+    }
+    for (wi, w) in WAYS.iter().enumerate() {
+        let len = w.len();
+        let wl = wi as i64;
+        let mut s = 10.0;
+        let mut n = 0u32;
+        while s < len {
+            let ((x, y), (tx, ty)) = w.at(s);
+            let seg = n;
+            n += 1;
+            s += 20.0;
+            if x < lo.0 - 40.0 || x > hi.0 + 40.0 || y < lo.1 - 40.0 || y > hi.1 + 40.0 {
+                continue;
+            }
+            let yaw = ty.atan2(tx);
+            let h = w.deck(s - 20.0, len);
+            let slope = (w.deck(s - 10.0, len) - w.deck(s - 30.0, len)) / 20.0;
+            let pitch = slope.atan();
+            let g = ground_world(k, terrain, x, y);
+            if w.kind != WayKind::Avenue && lvl <= 2 {
+                let deck = decks[if w.kind == WayKind::Highway { 0 } else { 1 }];
+                put_world(k, sp, deck, x, y, g + h - DECK_TOP, yaw, pitch, bh(wl, seg as i64, 11), id, tile);
+            }
+            if lvl != 0 {
+                continue;
+            }
+            // traffic: right-hand, lanes by kind; a car now and then in each lane per 20 m
+            let lanes: &[f64] = match w.kind {
+                WayKind::Highway => &[-9.4, -5.8, -2.2, 2.2, 5.8, 9.4],
+                WayKind::Ramp => &[0.0],
+                WayKind::Avenue => &[-6.6, -3.2, 3.2, 6.6],
+            };
+            for (li, &off) in lanes.iter().enumerate() {
+                let salt = 100 + li as i64;
+                if bu(wl, seg as i64 * 16 + salt, 12) > if w.kind == WayKind::Highway { 0.55 } else { 0.35 } {
+                    continue;
+                }
+                let along = (bu(wl, seg as i64 * 16 + salt, 13) - 0.5) * 16.0;
+                // (the right of the direction of travel is +off: x right = (ty, -tx))
+                let (cx, cy) = (x + tx * along + ty * off, y + ty * along - tx * off);
+                if w.kind == WayKind::Avenue && water_world(k, terrain, cx, cy) {
+                    continue;
+                }
+                let back = off < 0.0 || (w.kind == WayKind::Ramp && bu(wl, seg as i64, 14) < 0.0);
+                let kind = if bu(wl, seg as i64 * 16 + salt, 15) < 0.05 { 5 } else { (bh(wl, seg as i64 * 16 + salt, 16) % 5) as usize };
+                let cyaw = yaw + if back { std::f64::consts::PI } else { 0.0 };
+                let cp = if back { -pitch } else { pitch };
+                put_world(k, sp, kinds[kind], cx, cy, ground_world(k, terrain, cx, cy) + h + 0.02, cyaw, cp, bh(wl, seg as i64 * 16 + salt, 17), id, tile);
+            }
+            // the avenues' medians: a palm every 20 m
+            if w.kind == WayKind::Avenue && !sp.palms.is_empty() && !water_world(k, terrain, x, y) {
+                let vid = sp.palms[(bh(wl, seg as i64, 18) as usize) % sp.palms.len()];
+                put_world_v(k, sp, vid, x, y, g - 0.1, bu(wl, seg as i64, 19) * std::f64::consts::TAU, 0.9 + 0.3 * bu(wl, seg as i64, 20), bh(wl, seg as i64, 21), id, tile);
+            }
+        }
+    }
+}
+
+fn ground_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> f64 {
+    let (la, lo) = to_lat_lon_world(k, x, y);
+    terrain.height(la, lo).max(0.0) as f64
+}
+
+fn water_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
+    let (la, lo) = to_lat_lon_world(k, x, y);
+    terrain.cover.class_group(la, lo) == Some(lc::WATER)
+}
+
+fn to_lat_lon_world(k: usize, x: f64, y: f64) -> (f64, f64) {
+    let f = &frames()[k];
+    lat_lon(f.centre + f.east * x + f.north * y)
+}
+
+/// Is the city-plane point's foot in tree tile `id`?
+fn in_tile_world(k: usize, x: f64, y: f64, id: TileId) -> Option<DVec3> {
+    let (lat, lon) = to_lat_lon_world(k, x, y);
+    let d = super::tiles::dir_from_lat_lon(lat, lon);
+    let (face, u, v) = super::forest::dir_to_face_uv(d);
+    let cells = 1u64 << id.level;
+    let to_cell = |c: f64| (((c + 1.0) * 0.5 * cells as f64).floor() as i64).clamp(0, cells as i64 - 1) as u32;
+    (face == id.face && to_cell(u) == id.x && to_cell(v) == id.y).then_some(d)
+}
+
+/// Archetype `r` at a city-plane point, base height h, heading `yaw`, tilted up by `pitch`.
+#[allow(clippy::too_many_arguments)]
+fn put_world(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64, pitch: f64, seed: u32, id: TileId, tile: &mut TreeTile) {
+    let Some(d) = in_tile_world(k, x, y, id) else { return };
+    if tile.recs.len() >= MAX_PER_TILE {
+        return;
+    }
+    let up = d;
+    let east = DVec3::Z.cross(up).normalize();
+    let north = up.cross(east);
+    let fx = east * yaw.cos() + north * yaw.sin();
+    let ax = fx * pitch.cos() + up * pitch.sin();
+    let ay = up * pitch.cos() - fx * pitch.sin();
+    let az = ax.cross(ay);
+    let t = d * (R_EARTH + h) - tile.center;
+    let rows = [[ax.x, ay.x, az.x, t.x], [ax.y, ay.y, az.y, t.y], [ax.z, ay.z, az.z, t.z]];
+    push_rec(tile, rows, super::forest::rec_data(r.variant, (1 + seed % 8190) << 8), &sp.infos[r.variant]);
+}
+
+/// A plant variant at a city-plane point, standing upright.
+#[allow(clippy::too_many_arguments)]
+fn put_world_v(k: usize, sp: &Species, vid: usize, x: f64, y: f64, h: f64, yaw: f64, sc: f64, seed: u32, id: TileId, tile: &mut TreeTile) {
+    let Some(d) = in_tile_world(k, x, y, id) else { return };
+    if tile.recs.len() >= MAX_PER_TILE {
+        return;
+    }
+    let up = d;
+    let east = DVec3::Z.cross(up).normalize();
+    let north = up.cross(east);
+    let fx = east * yaw.cos() + north * yaw.sin();
+    let z = fx.cross(up);
+    let (fx, y2, z) = (fx * sc, up * sc, z * sc);
+    let t = d * (R_EARTH + h) - tile.center;
+    let rows = [[fx.x, y2.x, z.x, t.x], [fx.y, y2.y, z.y, t.y], [fx.z, y2.z, z.z, t.z]];
+    push_rec(tile, rows, super::forest::rec_data(vid, (1 + seed % 8190) << 8), &sp.infos[vid]);
+}
+
+/// The city whose plan covers lat / lon, and the point in its plan (m, before the warp).
 fn city_at(lat: f64, lon: f64) -> Option<(usize, f64, f64)> {
     CITIES.iter().enumerate().find_map(|(k, c)| {
         // (a quick test first)
@@ -218,13 +476,18 @@ fn city_at(lat: f64, lon: f64) -> Option<(usize, f64, f64)> {
             return None;
         }
         let (x, y) = plane(k, super::tiles::dir_from_lat_lon(lat, lon));
-        (x * x + y * y < c.radius * c.radius).then_some((k, x, y))
+        if x * x + y * y >= c.radius * c.radius {
+            return None;
+        }
+        let (px, py) = to_plan(x, y);
+        Some((k, px, py))
     })
 }
 
+/// A plan point's latitude and longitude (through the warp).
 fn to_lat_lon(k: usize, x: f64, y: f64) -> (f64, f64) {
-    let f = &frames()[k];
-    lat_lon(f.centre + f.east * x + f.north * y)
+    let (wx, wy) = to_world(x, y);
+    to_lat_lon_world(k, wx, wy)
 }
 
 /// How central a place is: 1 in a downtown core, falling off with distance.
@@ -307,6 +570,10 @@ struct Placed {
 
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
+    let (wx, wy) = to_world(x, y);
+    if on_way(wx, wy, 1.0) {
+        return false;
+    }
     let (la, lo) = to_lat_lon(k, x, y);
     !matches!(terrain.cover.class_group(la, lo), Some(lc::WATER) | Some(lc::WETLAND) | None)
 }
@@ -385,6 +652,10 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                     continue;
                 }
                 let _ = depth;
+                let (wx, wy) = to_world(px, py);
+                if on_way(wx, wy, hx.max(hy) + 3.0) {
+                    continue;
+                }
                 out.push(Placed { arch: a, x: px, y: py, quarter, scale, hx, hy });
             }
         }
@@ -506,6 +777,10 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                     }
                 }
             }
+            let (wx, wy) = to_world(px, py);
+            if on_way(wx, wy, hx.max(hy) * scale + 3.0) {
+                continue;
+            }
             out.push(Placed { arch: pick.0, x: px, y: py, quarter, scale, hx: hx * scale, hy: hy * scale });
         }
     }
@@ -530,6 +805,10 @@ impl Blocks {
         let Some((k, x, y)) = city_at(lat, lon) else { return false };
         if archs.is_empty() {
             return false;
+        }
+        let (wx, wy) = to_world(x, y);
+        if on_way(wx, wy, 0.0) {
+            return true;
         }
         let (i, j) = cell(x, y);
         let (fx, fy) = (x - line_x(i), y - line_y(j));
@@ -580,7 +859,13 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
     let corners: Vec<DVec3> = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.5, 0.5)].iter().map(|(a, b)| face_dir(id.face, u0 + a * s, v0 + b * s)).collect();
     for (k, c) in CITIES.iter().enumerate() {
         // the tile's box in the city plane
-        let pts: Vec<(f64, f64)> = corners.iter().map(|d| plane(k, *d)).collect();
+        let world: Vec<(f64, f64)> = corners.iter().map(|d| plane(k, *d)).collect();
+        let (wxl, wxh) = world.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
+        let (wyl, wyh) = world.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
+        if !(wxh < -c.radius || wxl > c.radius || wyh < -c.radius || wyl > c.radius) {
+            way_items(k, terrain, sp, id, tile, TREE_LEVEL.saturating_sub(id.level), (wxl, wyl), (wxh, wyh));
+        }
+        let pts: Vec<(f64, f64)> = world.iter().map(|p| to_plan(p.0, p.1)).collect();
         let (xl, xh) = pts.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.0), a.1.max(p.0)));
         let (yl, yh) = pts.iter().fold((f64::MAX, f64::MIN), |a, p| (a.0.min(p.1), a.1.max(p.1)));
         if xh < -c.radius || xl > c.radius || yh < -c.radius || yl > c.radius {
@@ -1075,6 +1360,9 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
 /// Object -> tile rows for something standing at direction `d` at height `h`, turned `yaw`
 /// from east towards north, scaled.
 fn frame_rows(d: DVec3, center: DVec3, h: f64, yaw: f64, sc: f64) -> [[f64; 4]; 3] {
+    // (turned with its street: the plan's axes bend with the warp)
+    let (lat, lon) = lat_lon(d);
+    let yaw = yaw + city_at(lat, lon).map(|(_, x, y)| twist(x, y)).unwrap_or(0.0);
     let up = d;
     let east = DVec3::Z.cross(up).normalize();
     let north = up.cross(east);

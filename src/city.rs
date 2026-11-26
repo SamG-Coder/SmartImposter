@@ -45,6 +45,8 @@ pub enum Class {
     /// cars (parking lots, driveways, traffic) and bridge decks: not for lots
     Car,
     Bridge,
+    /// elevated highway and ramp decks
+    Highway,
 }
 
 pub struct Arch {
@@ -840,6 +842,28 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         car(&mut b, len, wid, hgt, kind);
         push(b, format!("Building_Car_{k}"), hgt, &mut meshes, &mut archs);
     }
+    // elevated road decks, 20 m along (+x), deck top at 10 m: the highway (six lanes, a median
+    // barrier, two columns on a crossbeam) and a ramp (one lane, one column); the columns run
+    // 6 m into the ground, so a deck sunk for a ramp's climb still stands on them
+    for (k, &width) in [30.0f32, 11.0].iter().enumerate() {
+        let mut b = B::new();
+        let hw = width * 0.5;
+        b.bx(Vec3::new(-10.05, 8.6, -hw), Vec3::new(10.05, 10.0, hw), m(SLAB, 0), true);
+        b.quad([Vec3::new(-10.0, 10.02, -hw + 0.5), Vec3::new(10.0, 10.02, -hw + 0.5), Vec3::new(10.0, 10.02, hw - 0.5), Vec3::new(-10.0, 10.02, hw - 0.5)], m(ASPHALT, 2 + k as u8));
+        for z in [-hw, hw - 0.45] {
+            b.bx(Vec3::new(-10.05, 10.0, z), Vec3::new(10.05, 11.0, z + 0.45), m(SLAB, 0), false);
+        }
+        if k == 0 {
+            b.bx(Vec3::new(-10.05, 10.0, -0.3), Vec3::new(10.05, 10.85, 0.3), m(SLAB, 0), false);
+            b.bx(Vec3::new(-1.2, 7.4, -hw + 2.0), Vec3::new(1.2, 8.6, hw - 2.0), m(SLAB, 0), false);
+            for z in [-7.0f32, 7.0] {
+                b.bx(Vec3::new(-0.9, -6.0, z - 0.9), Vec3::new(0.9, 7.4, z + 0.9), m(SLAB, 0), false);
+            }
+        } else {
+            b.bx(Vec3::new(-0.8, -6.0, -0.8), Vec3::new(0.8, 8.6, 0.8), m(SLAB, 0), false);
+        }
+        push(b, format!("Building_Highway_{k}"), 11.0, &mut meshes, &mut archs);
+    }
     // bridge decks, 20 m along the street (+x): an arterial's 22 m and a side street's 14 m,
     // deck on two piers, parapets, the roadway asphalt
     for (k, &width) in [22.0f32, 14.0].iter().enumerate() {
@@ -961,7 +985,9 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("Boat_Wake") {
+    if name.contains("Highway") {
+        Class::Highway
+    } else if name.contains("Boat_Wake") {
         Class::Underway
     } else if name.contains("Boat") {
         Class::Boat
