@@ -1523,7 +1523,13 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
                 while s < c1 - 4.0 {
                     let side = if n % 2 == 0 { -1.0 } else { 1.0 };
                     let (x, y) = at(s, side * kerb);
-                    if !mapped_water(k, terrain, x, y) {
+                    // (none on or under a bridge, its abutments included: the bridge has its own
+                    // lamps on its parapets, and a street lamp there would stand in its lanes)
+                    let bridged = [-14.0, 0.0, 14.0].iter().any(|d| {
+                        let (cx, cy) = at(s + d, 0.0);
+                        crossing(k, terrain, cx, cy, along_x, a, line).is_some()
+                    });
+                    if !bridged && !mapped_water(k, terrain, x, y) {
                         // (the arm reaches over the road: towards the line from this side)
                         let yaw = yaw0 - std::f64::consts::FRAC_PI_2 * side * if along_x { -1.0 } else { 1.0 };
                         put_at(k, sp, light, x, y, ground(k, terrain, x, y), yaw, bh(i, j, 8800 + n + along_x as u32 * 100), id, tile);
@@ -2055,6 +2061,39 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             }
         }
     }
+    // groves: in the walk-up and mid-rise blocks that are not car parks, about half of the
+    // block's 30 m cells are planted solid (a crown every 7-8 m, the ground under them hidden,
+    // as the reference's canopy between the buildings); the buildings keep their own ground
+    // (and in the house blocks: the yards' own shade trees, the canopy of Miami's older
+    // neighbourhoods; a crown that would stand on a house, its pool or its drive is skipped)
+    if z <= 2 && !parking_block(z, i, j) {
+        let (cn, cm) = ((w / 30.0).ceil().max(1.0) as u32, (h / 30.0).ceil().max(1.0) as u32);
+        let (cw, ch) = (w / cn as f64, h / cm as f64);
+        for b in 0..cm {
+            for a in 0..cn {
+                let cell = b * 16 + a;
+                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else { 0.6 } {
+                    continue;
+                }
+                let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);
+                for v in 0..gm {
+                    for u in 0..gn {
+                        let t = cell * 64 + v * 8 + u;
+                        let px = x0 + a as f64 * cw + (u as f64 + 0.2 + 0.6 * bu(i, j, 9100 + t)) * cw / gn as f64;
+                        let py = y0 + b as f64 * ch + (v as f64 + 0.2 + 0.6 * bu(i, j, 9200 + t)) * ch / gm as f64;
+                        if z == 0 {
+                            // (off the front yards, where the drives are: 7 m back from either street)
+                            let back = (py - y0).min(y0 + h - py);
+                            if back < FRONT_YARD + 3.0 {
+                                continue;
+                            }
+                        }
+                        spots.push((px, py, bu(i, j, 9300 + t) < 0.85, 100_000 + t));
+                    }
+                }
+            }
+        }
+    }
     // the waterfront: palms and broad crowns along every edge of the block that the water
     // comes within 12 m of (the canal banks, the bay shore), every ~8 m
     {
@@ -2091,14 +2130,17 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             continue;
         }
         let (lat, lon) = lat_lon(d);
-        if !buildable(k, terrain, x, y) || built_share(terrain, lat, lon, 30.0) < 0.2 {
+        // (the groves grow on the open ground too, parks and lawns: only off the water)
+        let grove = salt >= 100_000;
+        if !buildable(k, terrain, x, y) || (!grove && built_share(terrain, lat, lon, 30.0) < 0.2) {
             continue;
         }
         if tile.recs.len() >= MAX_PER_TILE {
             return;
         }
         let vid = list[(bh(i, j, salt) as usize) % list.len()];
-        let sc = if broad { 0.7 + 0.4 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
+        // (a grove's crowns grow big and meet: the canopy closes over the ground)
+        let sc = if grove && broad { 0.95 + 0.4 * bu(i, j, salt + 50_000) } else if broad { 0.7 + 0.4 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
         let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, sc);
         push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, salt + 70_000) % 8190) << 8), &sp.infos[vid]);
     }
