@@ -942,8 +942,8 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
   malls, a big-box store, gas stations, L-shaped houses with garages. The street lines are moved
   by up to +-12 m each (blocks of different sizes), shops and walk-ups line the arterials between
   the house blocks, and the downtown cores are tight clusters.
-- **Still to do**: lights at night; the street plan is one grid turned nowhere (the real city's
-  street pattern is not used: the city is generated, not mapped).
+- **Still to do**: lights at night; the streets are one north-south grid (jittered), not the
+  real city's pattern: the city is generated, not mapped.
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
