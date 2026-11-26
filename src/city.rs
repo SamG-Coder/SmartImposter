@@ -263,7 +263,9 @@ enum Fac {
     /// floor
     Curtain { col: f32, fin: f32 },
     /// glass walls set back `depth` behind slab edges, glass rails at every floor
-    Balcony { depth: f32 },
+    /// `solid`: white concrete parapets on the balconies, not glass rails (the white banded
+    /// towers of Miami's waterfront)
+    Balcony { depth: f32, solid: bool },
     /// horizontal bands: glass ribbon `win` of the storey, recessed, spandrel between
     Ribbon { win: f32, col: f32 },
     /// a solid wall with recessed windows of w x h every `col` m
@@ -319,7 +321,7 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 }
             }
         }
-        Fac::Balcony { depth } => {
+        Fac::Balcony { depth, solid } => {
             let core = inset(poly, depth);
             for k in 0..n {
                 let (a, c) = (core[k], core[(k + 1) % n]);
@@ -331,6 +333,12 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 // the slab (a plate over the whole footprint: its edge and soffit show)
                 for k in 0..n {
                     b.wall(poly[k], poly[(k + 1) % n], y - 0.3, y, 0.0, m(SLAB, 0), None);
+                    if solid {
+                        // a solid white parapet, the slab's edge carried up
+                        b.wall(poly[k], poly[(k + 1) % n], y, y + 1.1, 0.0, m(SLAB, 0), None);
+                        b.strip(poly[k], poly[(k + 1) % n], y + 1.1, y + 1.18, -0.2, 0.0, m(SLAB, 0));
+                        continue;
+                    }
                     // glass rail on the slab edge, with a top rail
                     let u0 = perimeter_u(poly, k);
                     b.wall(poly[k], poly[(k + 1) % n], y, y + 1.05, -0.05, m(RAIL, pal.glass), Some((u0, 1.5, y, 1.05)));
@@ -634,7 +642,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let mut b = B::new();
         let pal = Pal { wall: 0, glass: 5, frame: 2 };
         let poly = footprint(38.0, 38.0, 19.0, 6);
-        volume(&mut b, &poly, 0.0, 250.0, 7.0, 3.4, Fac::Balcony { depth: 2.2 }, &pal, false, &mut rng);
+        volume(&mut b, &poly, 0.0, 250.0, 7.0, 3.4, Fac::Balcony { depth: 2.2, solid: false }, &pal, false, &mut rng);
         b.cap(&poly, 250.0, true, m(ROOF, 0));
         // the crown: fins standing round the rim, open between them
         for k in 0..16 {
@@ -682,7 +690,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             b.bx(Vec3::new(-w * 0.25 + 0.5, pod_h + 0.2, z0 + 1.5), Vec3::new(w * 0.25 - 0.5, pod_h + 0.22, z0 + 5.5), m(POOL, 0), false);
         }
         let poly = footprint(w, d, chamfer, round);
-        volume(&mut b, &poly, y0, h, if y0 == 0.0 { 6.0 } else { 0.0 }, 3.2, Fac::Balcony { depth: [2.0, 2.4, 1.8, 2.2, 2.6, 2.0, 2.4, 1.6, 2.2][k] }, &pal, true, &mut rng);
+        volume(&mut b, &poly, y0, h, if y0 == 0.0 { 6.0 } else { 0.0 }, 3.2, Fac::Balcony { depth: [2.0, 2.4, 1.8, 2.2, 2.6, 2.0, 2.4, 1.6, 2.2][k], solid: k % 3 != 1 }, &pal, true, &mut rng);
         // white concrete fins at the corners, full height: the towers read white, glass between
         for c in [Vec2::new(-w * 0.5, -d * 0.5), Vec2::new(w * 0.5, -d * 0.5), Vec2::new(w * 0.5, d * 0.5), Vec2::new(-w * 0.5, d * 0.5)] {
             if chamfer == 0.0 {
@@ -697,6 +705,30 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let crown = inset(&poly, 6.0);
         volume(&mut b, &crown, h, h + 5.0, 0.0, 5.0, Fac::Ribbon { win: 0.5, col: 2.0 }, &pal, true, &mut rng);
         push(b, format!("Building_Residential_{k}"), h + 6.0, &mut meshes, &mut archs);
+    }
+    // slender residential towers, 30-45 storeys on 26-34 m footprints: white balcony bands
+    // (solid parapets), a low parking podium inside the lot on some, a crown of white fins
+    for k in 0..6 {
+        let mut b = B::new();
+        let pal = Pal { wall: 0, glass: [5, 4, 2, 5, 1, 4][k], frame: 2 };
+        let h = [105.0f32, 125.0, 140.0, 115.0, 145.0, 98.0][k];
+        let (w, d) = [(28.0f32, 24.0f32), (32.0, 26.0), (26.0, 26.0), (34.0, 28.0), (30.0, 22.0), (28.0, 28.0)][k];
+        let (chamfer, round) = [(0.0f32, 0usize), (6.0, 3), (8.0, 4), (0.0, 0), (4.0, 0), (9.0, 5)][k];
+        let mut y0 = 0.0;
+        if k % 2 == 0 {
+            let pod = footprint(w + 10.0, d + 10.0, 0.0, 0);
+            volume(&mut b, &pod, 0.0, 10.0, 4.5, 3.1, Fac::Garage, &pal, true, &mut rng);
+            y0 = 10.0;
+        }
+        let poly = footprint(w, d, chamfer, round);
+        volume(&mut b, &poly, y0, h, if y0 == 0.0 { 6.0 } else { 0.0 }, 3.2, Fac::Balcony { depth: 2.0, solid: true }, &pal, true, &mut rng);
+        let crown = inset(&poly, 5.0);
+        volume(&mut b, &crown, h, h + 5.0, 0.0, 5.0, Fac::Ribbon { win: 0.5, col: 2.0 }, &pal, true, &mut rng);
+        // the crown's white fins, standing proud above the roof
+        for c in &crown {
+            b.bx(Vec3::new(c.x - 0.4, h, c.y - 0.4), Vec3::new(c.x + 0.4, h + 11.0, c.y + 0.4), m(SLAB, 0), false);
+        }
+        push(b, format!("Building_Residential_Slim_{k}"), h + 11.0, &mut meshes, &mut archs);
     }
     // office blocks: ribbon windows or curtain walls, 6-16 storeys
     for k in 0..6 {
@@ -716,7 +748,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let (w, d, storeys) = [(30.0, 18.0, 4), (40.0, 20.0, 6), (24.0, 16.0, 3), (36.0, 24.0, 8), (28.0, 28.0, 5), (50.0, 18.0, 10)][k];
         let poly = footprint(w, d, 0.0, 0);
         let h = 3.0 * storeys as f32 + 1.0;
-        let fac = if k % 3 == 2 { Fac::Balcony { depth: 1.8 } } else { Fac::Punched { col: 3.2, w: 1.6, h: 1.7 } };
+        let fac = if k % 3 == 2 { Fac::Balcony { depth: 1.8, solid: false } } else { Fac::Punched { col: 3.2, w: 1.6, h: 1.7 } };
         volume(&mut b, &poly, 0.0, h, 0.0, 3.0, fac, &pal, true, &mut rng);
         push(b, format!("Building_Apartments_{k}"), h + 4.0, &mut meshes, &mut archs);
     }
@@ -797,7 +829,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let (w, d, storeys) = [(54.0f32, 16.0f32, 12usize), (46.0, 18.0, 9), (60.0, 16.0, 15), (40.0, 20.0, 11)][k];
         let poly = footprint(w, d, 0.0, 0);
         let h = 3.1 * storeys as f32 + 5.0;
-        volume(&mut b, &poly, 0.0, h, 5.0, 3.1, Fac::Balcony { depth: 1.8 }, &pal, true, &mut rng);
+        volume(&mut b, &poly, 0.0, h, 5.0, 3.1, Fac::Balcony { depth: 1.8, solid: true }, &pal, true, &mut rng);
         push(b, format!("Building_Condo_{k}"), h + 4.0, &mut meshes, &mut archs);
     }
     // L-shaped and courtyard apartment blocks, 3-6 storeys
@@ -806,7 +838,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let pal = Pal { wall: [1, 5, 7, 4][k], glass: [0, 2, 5, 1][k], frame: 2 };
         let storeys = [3usize, 4, 5, 6][k];
         let h = 3.0 * storeys as f32 + 0.8;
-        let fac = if k % 2 == 0 { Fac::Punched { col: 3.0, w: 1.5, h: 1.6 } } else { Fac::Balcony { depth: 1.6 } };
+        let fac = if k % 2 == 0 { Fac::Punched { col: 3.0, w: 1.5, h: 1.6 } } else { Fac::Balcony { depth: 1.6, solid: false } };
         let a = ccw(vec![Vec2::new(-20.0, -16.0), Vec2::new(20.0, -16.0), Vec2::new(20.0, -3.0), Vec2::new(-20.0, -3.0)]);
         let c = ccw(vec![Vec2::new(-20.0, -3.0), Vec2::new(-7.0, -3.0), Vec2::new(-7.0, 16.0), Vec2::new(-20.0, 16.0)]);
         volume(&mut b, &a, 0.0, h, 0.0, 3.0, fac, &pal, true, &mut rng);

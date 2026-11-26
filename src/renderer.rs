@@ -1562,6 +1562,7 @@ impl Renderer {
                             size: [t.bmax.x - t.bmin.x, t.bmax.z - t.bmin.z],
                             height: t.bmax.y,
                             residential: t.name.contains("Residential"),
+                            slim: t.name.contains("Residential_Slim"),
                         });
                     }
                 }

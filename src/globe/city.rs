@@ -28,7 +28,10 @@ pub struct ArchRef {
     pub size: [f32; 2],
     pub height: f32,
     /// a residential tower (balconies, a podium with its amenity deck, a crown), not an office
+    #[allow(dead_code)]
     pub residential: bool,
+    /// a slender one (30-45 storeys on 26-34 m): the waterfront's
+    pub slim: bool,
 }
 
 struct Core {
@@ -993,15 +996,22 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     // (one or two big lots only away from the water: by it the drive and the banks take a
     // bite out of a big building's lot, and the block would stand empty)
     let (nx, ny) = if z <= 2 && nx * ny <= 2 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 40.0) { (3, 2) } else { (nx, ny) };
-    // (a waterfront tower's block: two lots, the tower's big enough for its podium)
-    let (nx, ny) = if water_tower { (2, 1) } else { (nx, ny) };
+    // (a waterfront tower's block: four lots, the tower on one with its podium inside it)
+    let (nx, ny) = if water_tower { (2, 2) } else { (nx, ny) };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     // (each model at most once in a block where another fits: no row of identical buildings)
     let mut used: Vec<usize> = Vec::new();
     for ly in 0..ny {
         for lx in 0..nx {
             let lot = (ly * nx + lx) as u32;
-            let class = if water_tower && lot == 0 { Class::Tower } else { classes[(bh(i, j, 10 + lot) as usize) % classes.len()] };
+            // (the tower block's other lots are mid-rises: no second, squat tower beside it)
+            let class = if water_tower && lot == 0 {
+                Class::Tower
+            } else if water_tower {
+                Class::MidRise
+            } else {
+                classes[(bh(i, j, 10 + lot) as usize) % classes.len()]
+            };
             let (cx, cy) = (x0 + (lx as f64 + 0.5) * lw, y0 + (ly as f64 + 0.5) * lh);
             let mut fits: Vec<(usize, u32)> = Vec::new();
             for (a, r) in archs.iter().enumerate() {
@@ -1010,7 +1020,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 }
                 // (the waterfront's towers are residential: white balcony bands over a podium,
                 // where one fits)
-                if water_tower && lot == 0 && !r.residential && archs.iter().any(|o| o.residential && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
+                if water_tower && lot == 0 && !r.slim {
                     continue;
                 }
                 let (ax, az) = (r.size[0] as f64, r.size[1] as f64);
@@ -1096,6 +1106,16 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
             }
             // (the waterfront drive runs along the water within WATERFRONT m: nothing built on it)
             if z >= 2 && near_water(k, terrain, px, py, hx.max(hy) * scale + WATERFRONT) {
+                continue;
+            }
+            // (a tower stands well back on land: water anywhere within its reach, finer sampled)
+            if class == Class::Tower && (0..24).any(|n| {
+                let a = n as f64 * std::f64::consts::TAU / 24.0;
+                [0.5, 1.0].iter().any(|f| {
+                    let r = (hx.max(hy) * scale + WATERFRONT) * f;
+                    water_at(k, terrain, px + r * a.cos(), py + r * a.sin())
+                })
+            }) {
                 continue;
             }
             if built_at(px, py) < if class == Class::Tower { 0.15 } else { 0.3 } {
