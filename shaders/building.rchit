@@ -24,6 +24,15 @@ const vec3 B_GLASS[8] = vec3[8](vec3(0.32, 0.50, 0.52), vec3(0.24, 0.36, 0.52), 
                                 vec3(0.60, 0.63, 0.66), vec3(0.34, 0.58, 0.62), vec3(0.20, 0.22, 0.24), vec3(0.32, 0.48, 0.40));
 const vec3 B_FRAME[4] = vec3[4](vec3(0.10, 0.105, 0.11), vec3(0.46, 0.47, 0.48), vec3(0.76, 0.76, 0.74), vec3(0.04, 0.04, 0.045));
 
+// A building's own wall colour (its record's seed: the same in its mesh and its impostor, kept
+// in step with impostor.rchit): a palette of whites, creams and pastels; seed 0 (the bake) none.
+vec3 buildingTint(uint seed) {
+    if (seed == 0u) return vec3(1.0);
+    const vec3 T[8] = vec3[8](vec3(1.0), vec3(1.0, 0.95, 0.86), vec3(1.0, 0.9, 0.88), vec3(0.92, 0.96, 1.0),
+                              vec3(0.94, 1.0, 0.93), vec3(1.0, 0.97, 0.88), vec3(0.86, 0.86, 0.85), vec3(1.0, 0.98, 0.95));
+    return T[pcg(seed * 747796405u) & 7u];
+}
+
 float bHash(vec2 c, uint k) { return float(pcg(uint(int(c.x) + 4096) * 7919u ^ uint(int(c.y) + 4096) * 104729u ^ k) & 0xFFFFu) / 65535.0; }
 
 void main() {
@@ -65,7 +74,8 @@ void main() {
         // glass: window by window a little different (coating, blinds behind it)
         vec3 tint = B_GLASS[min(pal, 7u)];
         albedo = tint * mix(1.0, mix(0.86, 1.12, r1), detail);
-        glass = mt == 7u ? 0.8 : mix(1.0, mix(0.8, 1.0, r2), detail);
+        glass = mt == 7u ? 0.45 : mix(1.0, mix(0.8, 1.0, r2), detail);
+        if (mt == 7u) albedo = mix(albedo, vec3(0.62, 0.66, 0.66), 0.45); // rails: frosted, lighter
         if (mt == 1u) {
             // mullions at the cell edges and a spandrel band at the foot of each storey (opaque
             // glass): drawn where the pixel resolves them, their average beyond
@@ -80,7 +90,10 @@ void main() {
             glass = mix(glass, 0.15, fm);
         }
     } else if (mt == 0u || mt == 10u) {
-        albedo = B_WALL[min(pal, 8u)] * grime * (mt == 10u ? 0.92 : 1.0);
+        albedo = B_WALL[min(pal, 8u)] * grime * (mt == 10u ? 0.92 : 1.0) * buildingTint(instSeed(gl_InstanceCustomIndexEXT));
+        // weathering: dirt splashed up the foot of the walls, rain streaks down them
+        albedo *= mix(0.8, 1.0, smoothstep(0.0, 2.5, po.y));
+        albedo *= mix(1.0, mix(0.86, 1.0, vnoise(vec2((po.x + po.z) * 2.3, po.y * 0.07))), 0.8 * detail);
     } else if (mt == 2u) {
         albedo = B_FRAME[min(pal, 3u)];
         glass = 0.25;

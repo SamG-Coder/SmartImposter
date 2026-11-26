@@ -475,8 +475,9 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     // glass office towers: podium, shaft (some with setbacks), crown
     for k in 0..9 {
         let mut b = B::new();
-        let pal = Pal { wall: [0, 2, 8][k % 3], glass: [0, 1, 2, 3, 4, 5][k % 6], frame: [0, 1, 2, 3][k % 4] };
-        let h = [120.0, 150.0, 185.0, 215.0, 240.0, 105.0, 165.0, 200.0, 135.0][k];
+        let pal = Pal { wall: [0, 2, 8][k % 3], glass: [4, 1, 2, 5, 4, 0, 2, 4, 3][k], frame: [1, 2, 1, 0, 2, 1, 2, 1, 0][k] };
+        // (the fifth is a supertall: the skyline's peak, chosen in the densest cores)
+        let h = [120.0, 150.0, 185.0, 215.0, 320.0, 105.0, 165.0, 200.0, 135.0][k];
         let (w, d) = ([38.0, 42.0, 36.0, 44.0, 40.0, 34.0, 46.0, 38.0, 40.0][k], [34.0, 36.0, 36.0, 38.0, 40.0, 30.0, 34.0, 38.0, 32.0][k]);
         let (chamfer, round) = [(0.0, 0), (6.0, 0), (10.0, 4), (0.0, 0), (8.0, 0), (12.0, 6), (0.0, 0), (9.0, 3), (5.0, 0)][k];
         let pod_h = [0.0, 22.0, 0.0, 26.0, 18.0, 0.0, 30.0, 0.0, 20.0][k];
@@ -512,8 +513,8 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     // residential towers: white slab bands, glass rails, blue-green glass (the Miami look)
     for k in 0..9 {
         let mut b = B::new();
-        let pal = Pal { wall: [0, 1, 0, 3, 0, 7, 0, 1, 0][k], glass: [0, 2, 1, 5, 0, 3, 7, 1, 2][k], frame: [2, 2, 1, 0, 2, 1, 2, 2, 0][k] };
-        let h = [95.0, 140.0, 180.0, 70.0, 210.0, 120.0, 160.0, 85.0, 190.0][k];
+        let pal = Pal { wall: [0, 1, 0, 0, 0, 7, 0, 1, 0][k], glass: [5, 2, 4, 5, 0, 4, 5, 1, 2][k], frame: [2, 2, 2, 2, 2, 1, 2, 2, 2][k] };
+        let h = [95.0, 140.0, 180.0, 70.0, 210.0, 120.0, 160.0, 85.0, 290.0][k];
         let (w, d) = ([44.0, 52.0, 40.0, 48.0, 42.0, 56.0, 38.0, 50.0, 46.0][k], [24.0, 26.0, 30.0, 22.0, 34.0, 24.0, 38.0, 26.0, 28.0][k]);
         let (chamfer, round) = [(0.0, 0), (8.0, 4), (0.0, 0), (6.0, 0), (12.0, 5), (0.0, 0), (10.0, 4), (0.0, 0), (9.0, 0)][k];
         let pod_h = [16.0, 20.0, 0.0, 14.0, 24.0, 18.0, 0.0, 12.0, 22.0][k];
@@ -522,9 +523,20 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             let pod = footprint(w + 14.0, d + 18.0, 0.0, 0);
             volume(&mut b, &pod, 0.0, pod_h, 5.0, 3.0, if k % 2 == 0 { Fac::Garage } else { Fac::Ribbon { win: 0.4, col: 2.0 } }, &Pal { wall: pal.wall, glass: pal.glass, frame: pal.frame }, true, &mut rng);
             y0 = pod_h;
+            // the amenity deck on the podium roof: a pool in its coping, a timber deck
+            let z0 = d * 0.5 + 1.5;
+            b.bx(Vec3::new(-w * 0.35, pod_h, z0), Vec3::new(w * 0.35, pod_h + 0.12, z0 + 7.0), m(WOOD, 0), false);
+            b.bx(Vec3::new(-w * 0.25, pod_h + 0.12, z0 + 1.0), Vec3::new(w * 0.25, pod_h + 0.2, z0 + 6.0), m(SLAB, 0), false);
+            b.bx(Vec3::new(-w * 0.25 + 0.5, pod_h + 0.2, z0 + 1.5), Vec3::new(w * 0.25 - 0.5, pod_h + 0.22, z0 + 5.5), m(POOL, 0), false);
         }
         let poly = footprint(w, d, chamfer, round);
         volume(&mut b, &poly, y0, h, if y0 == 0.0 { 6.0 } else { 0.0 }, 3.2, Fac::Balcony { depth: [2.0, 2.4, 1.8, 2.2, 2.6, 2.0, 2.4, 1.6, 2.2][k] }, &pal, true, &mut rng);
+        // white concrete fins at the corners, full height: the towers read white, glass between
+        for c in [Vec2::new(-w * 0.5, -d * 0.5), Vec2::new(w * 0.5, -d * 0.5), Vec2::new(w * 0.5, d * 0.5), Vec2::new(-w * 0.5, d * 0.5)] {
+            if chamfer == 0.0 {
+                b.bx(Vec3::new(c.x - 0.6, y0, c.y - 0.6), Vec3::new(c.x + 0.6, h + 1.0, c.y + 0.6), m(SLAB, 0), false);
+            }
+        }
         // a solid end core on some (stair / lift shaft), standing proud
         if k % 3 == 0 {
             let x = w * 0.5;

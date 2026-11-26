@@ -30,14 +30,20 @@ void main() {
         // much of the texel is glass was baked into the normal's length (building.rchit): the
         // spread is 1 - 0.5 glass (main.rgen reflects it).
         float skyVisB = clamp(v.x + (2.0 / 3.0) * (v.z - 0.5) * 3.0, 0.0, 1.0);
-        pl.albedo = alb;
+        float glassB = clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0);
+        // its own wall colour (building.rchit buildingTint, the same seed), on what is not glass
+        uint bs = plantSeed(pr);
+        const vec3 T[8] = vec3[8](vec3(1.0), vec3(1.0, 0.95, 0.86), vec3(1.0, 0.9, 0.88), vec3(0.92, 0.96, 1.0),
+                                  vec3(0.94, 1.0, 0.93), vec3(1.0, 0.97, 0.88), vec3(0.86, 0.86, 0.85), vec3(1.0, 0.98, 0.95));
+        vec3 tint = bs == 0u ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
+        pl.albedo = alb * mix(vec3(1.0), tint, 1.0 - glassB);
         pl.t = gl_HitTEXT;
         pl.n = n;
         pl.ng = n;
         pl.flags = FLAG_IMPOSTOR | MAT_BUILDING | FLAG_BUILDING;
         pl.ao = a.a * mix(0.75, 1.0, skyVisB);
         pl.sunVis = 1.0;
-        pl.trans = vec3(0.0, 0.0, clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0));
+        pl.trans = vec3(0.0, 0.0, glassB);
         pl.shadowMask = 0xFFu;
         return;
     }

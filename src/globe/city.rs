@@ -411,13 +411,45 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
             // slack in the lot: set back from the street by a random amount
             let sx = (lw * 0.5 - 2.0 - hx * scale).max(0.0);
             let sy = (lh * 0.5 - 2.0 - hy * scale).max(0.0);
-            let (px, py) = (cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.7, cy + (bu(i, j, 80 + lot) * 2.0 - 1.0) * sy * 0.7);
+            let (mut px, mut py) = (cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.7, cy + (bu(i, j, 80 + lot) * 2.0 - 1.0) * sy * 0.7);
+            // downtown a tower stands at one end of its lot, a podium (garage or shops) fills
+            // the rest, as the parking podiums of real towers do
+            let podium = class == Class::Tower && z == 3 && sy > 14.0;
+            let side = if bu(i, j, 85 + lot) < 0.5 { 1.0 } else { -1.0 };
+            if podium {
+                py = cy + side * sy;
+                px = cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.3;
+            }
             if built_at(px, py) < if class == Class::Tower { 0.15 } else { 0.3 } {
                 continue;
             }
             let (ex, ey) = (hx * scale + 1.0, hy * scale + 1.0);
             if !(buildable(k, terrain, px, py) && buildable(k, terrain, px - ex, py - ey) && buildable(k, terrain, px + ex, py - ey) && buildable(k, terrain, px + ex, py + ey) && buildable(k, terrain, px - ex, py + ey)) {
                 continue;
+            }
+            if podium {
+                // the free span: from the lot's far edge to the tower, less a gap
+                let free = 2.0 * sy - 1.5;
+                let gy = py - side * (hy * scale + 1.5 + free * 0.5);
+                let mut best: Option<(usize, u32, f64)> = None;
+                for (a, r) in archs.iter().enumerate() {
+                    if r.class != Class::LowRise {
+                        continue;
+                    }
+                    for q in 0..2u32 {
+                        let (ax, ay) = if q == 0 { (r.size[0] as f64, r.size[1] as f64) } else { (r.size[1] as f64, r.size[0] as f64) };
+                        if ax <= lw - 4.0 && ay <= free && best.is_none_or(|b| ax * ay > b.2) {
+                            best = Some((a, q, ax * ay));
+                        }
+                    }
+                }
+                if let Some((a, q, _)) = best {
+                    let r = &archs[a];
+                    let (ax, ay) = if q == 0 { (r.size[0] as f64, r.size[1] as f64) } else { (r.size[1] as f64, r.size[0] as f64) };
+                    if r.height >= need && buildable(k, terrain, px, gy) && buildable(k, terrain, px, gy - side * ay * 0.5) {
+                        out.push(Placed { arch: a, x: px, y: gy, quarter: q, scale: 1.0, hx: ax * 0.5, hy: ay * 0.5 });
+                    }
+                }
             }
             out.push(Placed { arch: pick.0, x: px, y: py, quarter, scale, hx: hx * scale, hy: hy * scale });
         }

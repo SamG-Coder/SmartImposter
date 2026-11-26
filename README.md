@@ -912,12 +912,26 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
   `atmosphere.glsl`): the skyline a pale silhouette a few kilometres out, the sun warmer; a softer
   tone curve (lifted toe, a little less saturation, warm highlights). `SI_CITY_GI=0`,
   `SI_CITY_HAZE=<x>` and `SI_CITY_GRADE=0` turn them off or change them for comparisons.
-- **Palms** line the sidewalks (whole streets with or without), and three in four of the trees the
-  land cover puts in the city are palms.
-- **Still to do**: Florida broadleaf trees instead of the temperate stand-ins and trees in the
-  yards; seawalls, docks and calm water in canals and the bay; boats and their wakes; more varied
-  massing and materials (white concrete towers, podiums filling the lots, a height profile with a
-  peak); cars on the streets and in the parking lots; bridges.
+- **Trees** (`catalog.rs` `add_city_palms`). The library's palms are young plants of 1-2 m, so
+  tall palms are built from them: a procedural trunk (7-14 m, tapering, some leaning, a crownshaft;
+  the beech scan's smooth grey bark) carrying a young palm scaled up as its crown, four variants
+  baked like any tree. They line the sidewalks (whole streets with or without), stand in the front
+  and back yards, round the parking lots and in the plaza planters, all from the same hashed plan;
+  the land cover's trees in a city are palms and broad crowns (oak, maple, beech standing in for
+  live oaks and figs), never conifers, poplars or bamboo.
+- **The waterfront.** Every city shore but sand beaches and mangroves is a seawall: the ground
+  runs to a concrete cap with a dark wet face, the water is deep right up to it and has no lapping
+  foam (`FLAG_SEAWALL`). In a city the waves feel the real (ETOPO) floor, so the swell dies out in
+  the shallow bay and the canals while the open sea keeps it. Docks run out behind the waterfront
+  houses, most with a boat moored; runabouts, cruisers and motor yachts (archetypes like the
+  buildings, with timber and gelcoat materials) lie out on open water clear of the shore.
+- **Massing and materials.** Two supertalls (320 and 290 m) give the skyline its peak; residential
+  towers are white concrete with corner fins, frosted rails and pool decks on their podiums;
+  downtown a tower stands at one end of its lot with a garage or shops podium filling the rest;
+  every building has a wall tint of its own (whites, creams, pastels; the same in its mesh and its
+  impostor, from its record's seed), dirt at the foot of its walls and rain streaks down them.
+- **Still to do**: cars (the 256 variant slots are full: a plant record keeps its variant in 8
+  bits), boat wakes, bridges and causeways, lights at night.
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
