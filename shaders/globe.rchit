@@ -717,7 +717,8 @@ void main() {
     if (water) {
         n = up;
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
-    } else if (cover) {
+    } else if (cover || cityNear(p)) {
+        // (in a city also where the land cover has no data: a former pond, the plan covers it)
         vec3 cityAlb;
         float urban = cityGround(p, footprint, B.x, B.w, C.x, cityAlb);
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a

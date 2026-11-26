@@ -413,7 +413,7 @@ fn ground_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> f64 {
 
 fn water_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (la, lo) = to_lat_lon_world(k, x, y);
-    terrain.cover.class_group(la, lo) == Some(lc::WATER)
+    terrain.cover.class_group(la, lo) == Some(lc::WATER) && terrain.height(la, lo) < 2.0
 }
 
 fn to_lat_lon_world(k: usize, x: f64, y: f64) -> (f64, f64) {
@@ -1106,9 +1106,11 @@ fn boat_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Option<&ArchRef>) {
     (archs.iter().filter(|a| a.class == Class::Boat).collect(), archs.iter().find(|a| a.class == Class::Dock))
 }
 
+/// Water at sea level (the bay, the river, the canals). Ponds above it are land in a city
+/// (globe.rchit: the land cover's ponds among the blocks are mostly mapping noise).
 fn water_at(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (la, lo) = to_lat_lon(k, x, y);
-    terrain.cover.class_group(la, lo) == Some(lc::WATER)
+    terrain.cover.class_group(la, lo) == Some(lc::WATER) && terrain.height(la, lo) < 2.0
 }
 
 /// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards
