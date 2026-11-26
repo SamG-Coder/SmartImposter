@@ -347,9 +347,14 @@ impl Terrain {
     /// exactly 0; there ETOPO's seafloor is used instead.
     pub fn height(&self, lat: f64, lon: f64) -> f32 {
         let coarse = self.etopo.height(lat, lon);
-        match self.glo.height(lat, lon) {
+        let h = match self.glo.height(lat, lon) {
             Some(fine) if !(fine == 0.0 && coarse < 0.0) => fine,
             _ => coarse,
+        };
+        // in a city the 30 m surface model has the real buildings in it: the plain under them
+        match super::city::ground_cap(lat, lon) {
+            Some(cap) if h > cap => cap,
+            _ => h,
         }
     }
 

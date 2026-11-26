@@ -220,6 +220,7 @@ float traceShadow(vec3 o, vec3 d, float tmax, uint mask) {
 }
 
 void main() {
+    atmoHaze = 1.0 + g.city.y;
     uvec2 px = gl_LaunchIDEXT.xy;
     uvec2 size = gl_LaunchSizeEXT.xy;
     uint accumN = g.iparams.x;
@@ -301,6 +302,12 @@ void main() {
         uint mat = pl.flags & 0xFFu;
         bool leaf = mat == MAT_LEAF;
         vec3 alb = pl.albedo;
+        // a Florida city's broadleaf canopy: deep, dark green (live oak, ficus), not the
+        // temperate stand-ins' yellow-green
+        if (leaf && g.city.x > 0.5) {
+            alb *= vec3(0.72, 0.84, 0.66);
+            pl.trans *= 0.6;
+        }
         float ao = pl.ao;
         // Impostor normals arrive shortened to |mean n| (blade / leaf normal spread): Lambert on the
         // shortened normal is the texel's true mean diffuse. Everything else uses the direction.
@@ -374,7 +381,11 @@ void main() {
         bool lawn = (pl.flags & FLAG_LAWN) != 0u;
         bool terrain = mat == MAT_TERRAIN || lawn;
         float aoRange = terrain ? 30.0 : g.params.w;
-        if ((!imp || lawn) && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
+        // In a city (Globals.city.x) the buildings and the ground get one traced bounce of light
+        // instead (below): no AO rays there.
+        bool giOn = globe() && g.city.x > 0.5 && dbg == 0u && (profSkip & 2u) == 0u && pl.t < 8000.0
+                    && ((pl.flags & FLAG_BUILDING) != 0u || (mat == MAT_TERRAIN && (pl.flags & FLAG_WATER) == 0u));
+        if (!giOn && (!imp || lawn) && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
             float occ = 0.0;
             for (uint i = 0u; i < g.iparams.w; ++i) {
                 vec3 d2 = cosineSample(n, rng);
@@ -405,7 +416,14 @@ void main() {
             if (seaFFT) {
                 // the waves feel the bottom near the shore: long ones die out first
                 float dep = max(wfloor, wd);
+                // in a city the bay and the canals are sheltered and shallow: the waves feel the
+                // real floor (ETOPO), not the shelf the shore field draws, so the swell dies out
+                // and only the wind's ripples remain; the open sea outside keeps its waves
+                if (g.city.x > 0.5) dep = min(dep, max(wfloor, 0.5) * 1.4 + 0.5);
                 oAmp = vec4(smoothstep(0.0, 25.0, dep), smoothstep(0.0, 8.0, dep), smoothstep(0.0, 2.0, dep), smoothstep(0.0, 0.4, dep));
+                // (a city's bay is sheltered: no swell, the wind's chop halved; the long cascades'
+                // tiling showed as zig-zag bands across it)
+                if (g.city.x > 0.5) oAmp *= vec4(0.0, 0.25, 0.6, 1.0);
                 // Real wave geometry: march the ray through the slab the waves fill (+-A around
                 // the mean level) against the height field, first crossing refined by bisection.
                 // Crests hide the troughs behind them at grazing angles; within 1.5 km.
@@ -467,7 +485,62 @@ void main() {
             ground = skyUp * 0.25;
             amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
         }
-        col = direct + alb * amb * ao;
+        // the light from everything around (irradiance / PI): the sky model and AO, or in a city
+        // one traced bounce: a cosine-distributed ray, lit at what it hits by the sun (its own
+        // shadow ray) and the sky, or the sky's radiance where it escapes. Walls in shade take up
+        // the sunlit street and the towers across it; DLSS Ray Reconstruction averages the one
+        // sample per pixel.
+        vec3 indirect = amb * ao;
+        if (giOn) {
+            HitPayload keep = pl;
+            vec3 upW = normalize(gq);
+            vec3 d2 = cosineSample(nDir, rng);
+            if (dot(d2, ng) < 0.0) d2 = reflect(d2, ng);
+            vec3 o2 = p + ng * (0.02 + keep.t * 2e-4);
+            pl.t = -1.0;
+            pl.sunVis = 1.0;
+            pl.shadowMask = 0xFFu;
+            pl.trans = vec3(0.0);
+            pl.wdepth = 0.0;
+            pl.wlevel = 0.0;
+            pl.wfloor = 0.0;
+            traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, o2, 0.02, d2, 4000.0, 0);
+            vec3 Lin;
+            if (pl.t < 0.0) {
+                Lin = dot(d2, upW) > 0.0 ? globeSkyFrom(gq, d2) : skyUp * 0.25 / PI;
+                if (cloudsOn()) Lin *= 1.0 - 0.45 * cloudCover(cloudEarth(gq));
+            } else {
+                vec3 hp = o2 + d2 * pl.t;
+                vec3 hn = normalize(dot(pl.n, d2) > 0.0 ? -pl.n : pl.n);
+                vec3 hg = dot(pl.ng, d2) > 0.0 ? -pl.ng : pl.ng;
+                float hndl = dot(hn, L);
+                float hsh = hndl > 0.0 ? traceShadow(hp + hg * (0.02 + pl.t * 2e-4), L, 1.0e4, 0xFFu) * pl.sunVis : 0.0;
+                vec3 ha = pl.albedo;
+                if ((pl.flags & FLAG_BUILDING) != 0u) ha *= mix(1.0, 0.2, clamp(pl.trans.z, 0.0, 1.0));
+                if ((pl.flags & FLAG_WATER) != 0u) ha = vec3(0.02, 0.03, 0.035);
+                Lin = ha / PI * E * max(hndl, 0.0) * hsh + ha * skyUp * (0.6 + 0.4 * max(dot(hn, upW), 0.0)) / PI * pl.ao;
+            }
+            pl = keep;
+            // (on the scale of the sky model above: amb is PI x the zenith radiance)
+            indirect = Lin * PI * ao;
+        }
+        // a city's facades: the light bounced up off the sunlit pavements, walls and roofs
+        // around them (warm: stucco, concrete, sand), more than the one traced bounce gathers
+        // off the dark lawns and asphalt, and a little more fill in their shade: shaded walls
+        // read warm cream, not the blue sky's grey (the half of the view below the horizon,
+        // irradiance E sin(sun) x albedo ~0.3 / 2 of it)
+        if (globe() && g.city.x > 0.5 && (pl.flags & FLAG_BUILDING) != 0u) {
+            vec3 upB = normalize(gq);
+            float sunUp = max(dot(L, upB), 0.0);
+            float below = 0.5 - 0.5 * dot(nDir, upB);
+            indirect = indirect * vec3(1.22, 1.18, 1.1) + E * (sunUp * (0.25 + below)) * vec3(0.42, 0.35, 0.25) / PI * ao;
+        }
+        col = direct + alb * indirect;
+        // a city at dusk: the street lamps' pools of light on the ground (globe.rchit cityLamp)
+        if (globe() && mat == MAT_TERRAIN && !globeWater && g.city.x > 0.5) {
+            float duskG = smoothstep(0.15, -0.06, dot(L, normalize(gq)));
+            col += alb / PI * pl.wtan * (g.sunDir.w * 0.06 * duskG);
+        }
         if (craftHit && dbg == 0u) {
             // The aircraft's paint and metal (aircraft.rchit: roughness, metal, emission): a GGX
             // sun highlight, and the sky above and the land below mirrored by how smooth the
@@ -510,6 +583,78 @@ void main() {
             gbSpec = max(envW.r, max(envW.g, envW.b));
         }
 
+        if ((pl.flags & FLAG_BUILDING) != 0u && dbg == 0u) {
+            // A building (tri.rchit buildingHit, impostor.rchit): walls are matte; glass has a dark
+            // interior behind it and reflects by Fresnel, its coating tinting the reflection (the
+            // albedo is that tint). The reflection is traced (other towers, the bay, the sky),
+            // the sun's highlight is GGX.
+            float gls = clamp(pl.trans.z, 0.0, 1.0);
+            // its own light (building.rchit / impostor.rchit: windows, lamps, car lights), in
+            // the sun's units, coming up as the sun sets: a lit room is about 1/1500 of the
+            // sunlit facade's radiance (brighter than that: a city at dusk reads by its lights)
+            vec3 emitB = pl.wtan;
+            float dusk = globe() ? smoothstep(0.15, -0.06, dot(L, normalize(gq))) : 0.0;
+            // car paint (building.rchit: trans.x): its colour under a smooth clearcoat
+            bool coat = pl.trans.x > 0.5;
+            bool plainGlass = pl.trans.y > 0.5;
+            float rough = coat ? 0.09 : mix(0.85, 0.035, gls);
+            vec3 V = -dir;
+            float NdV = max(dot(nDir, V), 1e-3);
+            vec3 diffA = alb * mix(1.0, 0.17, gls);
+            vec3 F0 = coat ? vec3(0.05) : plainGlass ? vec3(0.04) : mix(vec3(0.04), vec3(0.15) + alb * 0.32, gls); // coated curtain-wall glass: 0.25-0.35 at normal incidence
+            vec3 spec = vec3(0.0);
+            if (ndl > 0.0) {
+                vec3 H = normalize(L + V);
+                float NdH = max(dot(nDir, H), 0.0);
+                float a = rough * rough, a2 = a * a;
+                float dd = NdH * NdH * (a2 - 1.0) + 1.0;
+                float D = min(a2 / (PI * dd * dd), 400.0);
+                float k = a * 0.5;
+                float G = ndl / (ndl * (1.0 - k) + k) * NdV / (NdV * (1.0 - k) + k);
+                vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+                spec = E * F * (D * G / (4.0 * NdV)) * sh;
+            }
+            vec3 Fe = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdV, 5.0);
+            vec3 env = amb;
+            if (gls > 0.2 || coat) {
+                vec3 upW = globe() ? normalize(gq) : vec3(0.0, 1.0, 0.0);
+                vec3 R = reflect(dir, nDir);
+                vec3 org2 = p + ng * (0.05 + pl.t * 2e-4);
+                float tB = pl.t;
+                pl.t = -1.0;
+                pl.sunVis = 1.0;
+                pl.shadowMask = 0xFFu;
+                pl.trans = vec3(0.0);
+                traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org2, 0.02, R, farRay(), 0);
+                if (pl.t < 0.0) {
+                    env = globe() ? globeSkyFrom(gq, R) : skyColor(R);
+                } else {
+                    vec3 rp = org2 + R * pl.t;
+                    vec3 rn = dot(pl.n, R) > 0.0 ? -pl.n : pl.n;
+                    vec3 rg = dot(pl.ng, R) > 0.0 ? -pl.ng : pl.ng;
+                    float rndl = dot(normalize(rn), L);
+                    float rsh = rndl > 0.0 ? traceShadow(rp + rg * (0.02 + pl.t * 2e-4), L, 1.0e4, 0xFFu) * pl.sunVis : 0.0;
+                    vec3 rA = (pl.flags & FLAG_BUILDING) != 0u ? pl.albedo * mix(1.0, 0.25, clamp(pl.trans.z, 0.0, 1.0)) : pl.albedo;
+                    env = rA / PI * E * max(rndl, 0.0) * rsh + rA * mix(ground, skyUp, dot(normalize(rn), upW) * 0.5 + 0.5) * pl.ao;
+                    if ((pl.flags & FLAG_WATER) != 0u) env = env * 0.3 + (globe() ? globeSkyFrom(gq, reflect(R, upW)) : skyColor(reflect(R, upW))) * 0.1;
+                    if (globe()) {
+                        vec3 Tr;
+                        vec3 S = atmosphere(gq, R, pl.t, L, g.sunDir.w, Tr);
+                        env = env * Tr + S;
+                    }
+                }
+                pl.t = tB;
+            }
+            // (a car's tinted windows over a dark cabin: the reflection held down, so the glass
+            // reads dark as on a real car seen from above)
+            if (plainGlass) { Fe *= 0.5; diffA *= 0.3; }
+            col = diffA / PI * E * max(ndl, 0.0) * sh + diffA * indirect + spec + env * Fe;
+            col += emitB * (g.sunDir.w * 4.5e-3 * dusk);
+            gbAlb = diffA;
+            gbRough = rough;
+            gbSpec = max(Fe.r, max(Fe.g, Fe.b));
+        }
+
         if (water && dbg == 0u) {
             // Water surface over the bed (Unreal-style river shading): refraction of the lit bed
             // with depth absorption (Beer-Lambert) and in-scattering, flowing ripples, foam where
@@ -527,8 +672,29 @@ void main() {
             // light scattered back out of deep water (globe: dark blue-green lakes, deep blue sea;
             // the bed shows only where it is shallow)
             vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? mix(vec3(0.0018, 0.0075, 0.012), vec3(0.0007, 0.0032, 0.0135), open) : vec3(0.003, 0.010, 0.010);
-            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
+            // a city's bay, rivers and canals: murky with silt and runoff, a dark blue-green (the
+            // bed shows only right at the shore), never the reef's bright turquoise (whatever the
+            // floor data says: the 15" ETOPO puts the bay's floor far too deep)
+            if (globe() && g.city.x > 0.5) {
+                SIGMA = vec3(0.8, 0.34, 0.42);
+                body = vec3(0.050, 0.068, 0.070);
+                Tv = exp(-SIGMA * under);
+                Ts = exp(-SIGMA * sunPath);
+            }
+            // (the sunlight into the water is shadowed as the bed under it is: the trees, the
+            // bridges and the buildings cast their shadows on the water)
+            // (the sun's visibility at the water's surface, not at the bed under it: near a bank
+            // the canal's own wall shades the bed, which is no shadow on the water)
+            float shW = sh;
+            if (globe() && g.city.x > 0.5) {
+                vec3 wupS = normalize(gq);
+                shW = dot(L, wupS) > 0.0 ? traceShadow(ps + wupS * 0.05, L, 1.0e4, 0xFFu) : 0.0;
+            }
+            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 * (globe() ? mix(0.15, 1.0, shW) : 1.0) + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
+            // (a city's channels darken towards their banks: the walls' and the trees' shade, the
+            // silt stirred up along them; the shore distance is wq.z, < 0 out on the water)
+            if (globe() && g.city.x > 0.5) refr *= mix(0.68, 1.0, smoothstep(1.0, 16.0, -wq.z));
             // flowing ripples: two octaves drifting at different speeds and directions, fixed to
             // the ground (globe: the Earth-fixed water coordinates, not the camera frame)
             float tm = g.extra.w;
@@ -562,6 +728,23 @@ void main() {
                 lostVar += g.ocean0.y;
                 // whitecaps where the crests fold (ocean.rs: the coverage for the wind)
                 waveFoam = max(oA(1, x, lod.y).w * oAmp.y, oA(2, x, lod.z).w * oAmp.z);
+                // a city's sheltered water: the swell is gone, the wind's own ripples (3 m to
+                // 3 cm, noise stretched along their crests) are what break the mirror up close
+                if (g.city.x > 0.5) {
+                    for (int i = 1; i < 10; ++i) {
+                        float fi = float(i);
+                        float lam = 1.7 * pow(0.6, fi);
+                        // (each octave its own direction, wandering slowly over the water)
+                        float ang = 0.7 + sin(fi * 2.399) * 1.3 + 1.2 * (vnoise(q * 0.03 + fi * 5.1) - 0.5);
+                        vec2 dd = vec2(cos(ang), sin(ang)), cc = vec2(-dd.y, dd.x);
+                        float speed = sqrt(9.81 * lam / 6.2831853);
+                        vec2 sp = vec2((dot(q, dd) - speed * tm) / lam, dot(q, cc) / (lam * 1.4)) + fi * 17.3;
+                        vec3 nd = vnoiseD(sp);
+                        float keep = 1.0 - smoothstep(lam * 0.15, lam * 0.5, pxM);
+                        gr += (dd * nd.y + cc * nd.z / 1.4) * (i < 3 ? 0.045 : 0.07) * keep;
+                        lostVar += 0.18 * 0.0049 * (1.0 - keep * keep);
+                    }
+                }
             } else if (globeWater) {
                 // wind waves: directional swells from 12 cm to 7 m spread around the wind, slope
                 // ~0.04 each, gusts (slow patches) varying their strength; waves smaller than a
@@ -602,6 +785,18 @@ void main() {
                 gr = vec2(hx - h0, hz - h0) / e;
             }
             float foam;
+            // (a city's canals and sheltered bay: far calmer than the open sea's wind, so the
+            // sun makes a glint streak and the banks and towers are mirrored, not a wide sheet
+            // of glitter: mostly smooth, the wind's ripples in cat's-paw patches drifting across
+            // it, and calmer still towards the banks)
+            if (g.city.x > 0.5) {
+                float paw = smoothstep(0.42, 0.78, vnoise(q * 0.045 + vec2(0.06, 0.03) * tm) * 0.7 + vnoise(q * 0.13 - vec2(0.02, 0.05) * tm) * 0.3);
+                float bank = mix(0.45, 1.0, smoothstep(4.0, 45.0, -wq.z));
+                // (the patches only shade the roughness a little, over a floor: the sun's
+                // reflection stays one soft, continuous streak, not white blotches)
+                lostVar = max(lostVar * 0.12 * mix(0.75, 1.0, paw) * bank, 0.006);
+                gr *= 0.8 * mix(0.45, 1.0, paw) * bank;
+            }
             if (globeWater) {
                 vec3 wup = normalize(gq);
                 n = normalize(wup - wtan * gr.x - wvd * gr.y);
@@ -610,7 +805,7 @@ void main() {
                 float swash = 0.5 + 0.35 * sin(tm * 0.9 + vnoise(q * 0.12) * 6.2831853);
                 float band = smoothstep(-swash - 0.8, -swash * 0.4, sdW) * (1.0 - smoothstep(-0.1, 0.15, sdW));
                 float brk = smoothstep(0.42, 0.78, vnoise(q * 1.6 + vec2(0.3, 0.5) * tm) * 0.6 + vnoise(q * 5.5 - vec2(0.2, 0.4) * tm) * 0.4);
-                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf);
+                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf) * ((pl.flags & FLAG_SEAWALL) != 0u ? 0.0 : 1.0);
                 // whitecaps (FFT sea): a breaking crest is a lace of bubbles and streaks, not a
                 // solid patch; finer near the camera, an even mix further out (mips)
                 // fresh foam on the breaking crest is dense and bright; older foam trails behind
@@ -630,6 +825,13 @@ void main() {
             p = ps;
             pl.t = tSurf;
             col = refr;
+            // (a city's calm water up close: each ripple facet takes the sun's light into the
+            // water a little more or less as it faces the sun, a fine texture over the body
+            // colour that the weak Fresnel reflection at steep angles cannot give)
+            if (globeWater && g.city.x > 0.5) {
+                vec2 Lt = vec2(dot(L, wtan), dot(L, wvd));
+                col *= clamp(1.0 - 2.3 * dot(gr, Lt) / max(dot(L, normalize(gq)), 0.2), 0.85, 1.15);
+            }
             if (seaFFT) {
                 // Light through the thin wave crests (Atlas GDC 2019 water BSDF, simplified): the
                 // crests glow green-blue when the sun is behind them, a little on the faces too
@@ -637,7 +839,8 @@ void main() {
                 float back = pow(max(dot(L, dir), 0.0), 4.0) * pow(0.5 - 0.5 * dot(L, n), 3.0);
                 float face = pow(max(dot(-dir, n), 0.0), 2.0);
                 vec3 sssCol = mix(vec3(0.0, 0.07, 0.055), vec3(0.0, 0.04, 0.065), open);
-                col += sssCol * E * sh * hn * (3.0 * back + 0.12 * face);
+                // (a city's sheltered water has no crests to glow through: ripples only)
+                col += sssCol * E * sh * hn * (3.0 * back + 0.12 * face) * (g.city.x > 0.5 ? 0.12 : 1.0);
             }
             float tHit = pl.t;
             // the ripples smaller than a pixel still tilt the surface: one random facet per pixel
@@ -703,6 +906,24 @@ void main() {
                 float D = exp((c2 - 1.0) / (c2 * m2)) / (PI * m2 * c2 * c2);
                 float Fh = 0.02 + 0.98 * pow(1.0 - max(dot(H, -dir), 0.0), 5.0);
                 glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
+                if (g.city.x > 0.5) {
+                    // fine glitter in the streak: the 3 cm ripples' facets flashing, a few in a
+                    // hundred at a time, changing several times a second (mean kept)
+                    vec2 cell = floor(q * 22.0) + floor(tm * 6.0) * vec2(17.13, 3.71);
+                    float hs = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+                    glint *= mix(0.75, 4.3, step(0.93, hs));
+                    // (the sun's own path on calm water is far brighter than the sky's glare on
+                    // it: a near-white streak down the river towards the sun)
+                    glint *= 4.5;
+                }
+            }
+            // (a city's narrow channels: the bright hazy sky they mirror is held to a fraction
+            // of the sunlight towards the sun, so a canal there reads as water, not as a white
+            // sheet; away from the sun the sky's reflection is whole: the calm bay mirrors it)
+            if (g.city.x > 0.5) {
+                float rl = dot(refl, vec3(0.2126, 0.7152, 0.0722));
+                float capL = mix(0.3, 0.6, 1.0 - smoothstep(0.55, 0.9, dot(R, L))) * g.sunDir.w;
+                if (rl > capL) refl *= capL / rl;
             }
             col = mix(col, refl, F) + E * glint * F * sh;
             vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);

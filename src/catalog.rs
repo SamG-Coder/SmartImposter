@@ -15,6 +15,9 @@ pub enum Kind {
     Grass,
     /// Opaque scans without foliage: rocks, logs, snags, cacti (tools/fab_to_mtree.py solid)
     Rock,
+    /// Procedural building archetypes (city.rs): a facade material of their own (tri.rchit),
+    /// meshes much further out than plants, never thinned with distance
+    Building,
 }
 
 pub struct Species {
@@ -60,6 +63,11 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Is this mesh one of the procedural buildings (city.rs)?
+    pub fn is_building_mesh(&self, mesh: usize) -> bool {
+        self.mesh_species.get(mesh).and_then(|&s| self.species.get(s as usize)).is_some_and(|s| s.kind == Kind::Building)
+    }
+
     /// Variants of the species whose name contains `key`.
     pub fn variants_of(&self, key: &str) -> Vec<usize> {
         self.species.iter().filter(|s| s.name.contains(key)).flat_map(|s| s.variants.clone()).collect()
@@ -171,6 +179,126 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         });
     }
     Ok((pack, cat))
+}
+
+/// Tall palms for the cities, built from what the library has: the Megascans palms are young
+/// plants of 1-2 m, so each tall palm is a procedural trunk (7-14 m, tapering, some leaning, with
+/// a crownshaft swelling under the fronds; the smooth grey bark of the beech scan) carrying one
+/// of those palms scaled up as its crown. Their meshes and textures are the palms' own; only the
+/// trunks are new. One species of four variants, grown like trees (globe/city.rs). Nothing is
+/// added when the palms are not downloaded.
+pub fn add_city_palms(pack: &mut TreePack, cat: &mut Catalog) {
+    let find = |cat: &Catalog, k: &str| cat.species.iter().position(|s| s.name.contains(k) && !s.variants.is_empty());
+    let bark = find(cat, "European_Beech").or_else(|| find(cat, "Silver_Birch"));
+    // (crown species, its variant, trunk height, crown scale, lean m)
+    let plan: [(&str, usize, f32, f32, f32); 4] =
+        [("Alexandra_Palm", 0, 11.0, 3.6, 0.0), ("Alexandra_Palm", 2, 14.0, 3.4, 0.6), ("Tropical_Palm", 0, 8.5, 3.3, 1.8), ("Chinese_Fan_Palm", 1, 7.0, 3.2, 0.3)];
+    let si = cat.species.len();
+    let first = pack.trees.len();
+    let mut trans = [0.5f32; 3];
+    for (k, &(crown_sp, cv, th, cs, lean)) in plan.iter().enumerate() {
+        let Some(s) = find(cat, crown_sp) else { continue };
+        let Some(src) = s_variant(cat, s, cv) else { continue };
+        trans = cat.species[s].trans_tint;
+        // the trunk: 12 sides, 24 rings, bent towards +x by `lean` at the top
+        let (sides, rings) = (12usize, 24usize);
+        let mut m = crate::asset::MeshData { name: format!("City_Palm_Trunk_{k}"), positions: Vec::new(), normals: Vec::new(), uvs: Vec::new(), indices: Vec::new(), materials: Vec::new(), grid: 0 };
+        let centre = |t: f32| glam::Vec3::new(lean * t * t, th * t, 0.0);
+        for r in 0..=rings {
+            let t = r as f32 / rings as f32;
+            // root flare, taper, the crownshaft swelling in the top tenth
+            let rad = 0.24 - 0.07 * t + 0.12 * (1.0 - t).powi(8) + 0.06 * ((t - 0.9) / 0.1).clamp(0.0, 1.0);
+            let c = centre(t);
+            for a in 0..=sides {
+                let ang = a as f32 / sides as f32 * std::f32::consts::TAU;
+                let n = glam::Vec3::new(ang.cos(), 0.0, ang.sin());
+                m.positions.extend_from_slice(&(c + n * rad).to_array());
+                m.normals.extend_from_slice(&n.to_array());
+                m.uvs.extend_from_slice(&[a as f32 / sides as f32 * 0.6, t * th / 1.6]);
+            }
+        }
+        for r in 0..rings as u32 {
+            for a in 0..sides as u32 {
+                let (i0, i1) = (r * (sides as u32 + 1) + a, (r + 1) * (sides as u32 + 1) + a);
+                m.indices.extend_from_slice(&[i0, i1, i0 + 1, i0 + 1, i1, i1 + 1]);
+            }
+        }
+        m.materials = vec![0u8; (m.indices.len() / 3).div_ceil(4) * 4];
+        let trunk = pack.meshes.len() as u32;
+        let (tlo, thi) = m.bounds();
+        pack.meshes.push(m);
+        cat.mesh_species.push(bark.unwrap_or(s) as u32);
+        cat.mesh_alpha.push(false);
+        // the crown on top: the young palm scaled, its base a little inside the crownshaft
+        let src_t = &pack.trees[src];
+        let top = centre(1.0);
+        let lift = glam::Affine3A::from_translation(glam::Vec3::new(top.x, top.y - 0.4 - src_t.bmin.y * cs, top.z)) * glam::Affine3A::from_scale(glam::Vec3::splat(cs));
+        let mut parts = vec![crate::asset::TreePart { mesh: trunk, xform: glam::Affine3A::IDENTITY }];
+        parts.extend(src_t.parts.iter().map(|p| crate::asset::TreePart { mesh: p.mesh, xform: lift * p.xform }));
+        let (mut lo, mut hi) = (tlo, thi);
+        for c in 0..8 {
+            let q = glam::Vec3::new(
+                if c & 1 == 0 { src_t.bmin.x } else { src_t.bmax.x },
+                if c & 2 == 0 { src_t.bmin.y } else { src_t.bmax.y },
+                if c & 4 == 0 { src_t.bmin.z } else { src_t.bmax.z },
+            );
+            let w = lift.transform_point3(q);
+            lo = lo.min(w);
+            hi = hi.max(w);
+        }
+        let height = hi.y - lo.y;
+        let (lod_scale, cull) = lod_for(height);
+        cat.variants.push(Variant { species: si, kind: Kind::Tree, height, lod_scale, cull, texel_scale: 1.0 });
+        pack.trees.push(crate::asset::TreeAsset { name: format!("City_Palm_{k}"), bmin: lo, bmax: hi, parts });
+    }
+    if pack.trees.len() > first {
+        cat.species.push(Species {
+            name: "City_Palm".into(),
+            kind: Kind::Tree,
+            textures: [None, None, None, None],
+            leaf_tint: [0.5; 3],
+            bark_tint: [0.5; 3],
+            trans_tint: trans,
+            variants: first..pack.trees.len(),
+        });
+    }
+}
+
+/// Global variant index of species `s`'s `k`-th variant (the last if it has fewer).
+fn s_variant(cat: &Catalog, s: usize, k: usize) -> Option<usize> {
+    let r = cat.species[s].variants.clone();
+    (!r.is_empty()).then(|| (r.start + k).min(r.end - 1))
+}
+
+/// Append the procedural building archetypes (city.rs) as one more species, after the plants.
+pub fn add_buildings(pack: &mut TreePack, cat: &mut Catalog) {
+    let (p, archs) = crate::city::pack();
+    let si = cat.species.len();
+    let mesh_base = pack.meshes.len() as u32;
+    let first = pack.trees.len();
+    for (mut t, a) in p.trees.into_iter().zip(&archs) {
+        for part in &mut t.parts {
+            part.mesh += mesh_base;
+        }
+        // A building's mesh costs one instance, a plant's hundreds: the mesh band goes out to
+        // ~44 m x the LOD scale, 350 m for the tallest towers, where the impostor's texels are
+        // below a pixel and a half at 1440p.
+        let lod_scale = (a.height / 25.0).clamp(5.0, 10.0);
+        cat.variants.push(Variant { species: si, kind: Kind::Building, height: a.height, lod_scale, cull: 0.0, texel_scale: 1.0 });
+        pack.trees.push(t);
+    }
+    cat.mesh_species.extend(std::iter::repeat_n(si as u32, p.meshes.len()));
+    cat.mesh_alpha.extend(std::iter::repeat_n(false, p.meshes.len()));
+    pack.meshes.extend(p.meshes);
+    cat.species.push(Species {
+        name: "Buildings".into(),
+        kind: Kind::Building,
+        textures: [None, None, None, None],
+        leaf_tint: [0.5; 3],
+        bark_tint: [0.5; 3],
+        trans_tint: [0.0; 3],
+        variants: first..pack.trees.len(),
+    });
 }
 
 /// Ground layers in shader order (tri.rchit): Fab library folder name prefix of each Megascans

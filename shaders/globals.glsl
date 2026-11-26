@@ -42,6 +42,7 @@ struct Globals {
     vec4 acVel;     //   xyz which way the air goes past the aircraft (model frame, unit), w engine power 0..1
     vec4 wake[32];  //   where the aircraft has been, newest first (the renderer's frame); w age (s)
     vec4 wakeB[32]; //   x condensation trail left there 0..1, y how much the air was stirred there 0..1
+    vec4 city;      // globe, near a city (globe/city.rs): x 1 = one traced bounce of light (main.rgen), y extra coastal haze, z 1 = the city's tone curve (resolve.comp)
 };
 
 // Sub-pixel jitter for TAA / DLSS: Halton(2,3), 32-frame cycle, in [0,1)^2 (mirrored in dlss.rs).

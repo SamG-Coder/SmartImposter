@@ -36,6 +36,14 @@ pub struct GlobeGlobals {
     pub misc: [f32; 4],
     /// xy shared index buffer address (lo, hi)
     pub addr: [u32; 4],
+    /// the city nearest the camera (globe/city.rs shader_city): its plane's origin relative to
+    /// the camera, its east and north axes (camera frame); block x, block y, radius (0: no
+    /// city), number of cores; the cores (x, y in the plane, strength, radius)
+    pub city_o: [f32; 4],
+    pub city_e: [f32; 4],
+    pub city_n: [f32; 4],
+    pub city_p: [f32; 4],
+    pub city_cores: [[f32; 4]; super::city::MAX_CORES],
 }
 
 const CACHE_TILES: usize = 14_000;
@@ -576,7 +584,7 @@ impl GlobeScene {
             "etopo",
         )?;
         println!("Elevation grid on the GPU ({:.1}s)", t.elapsed().as_secs_f32());
-        let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
+        let ubo = gpu.create_buffer(512, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
         let table = gpu.create_buffer(MAX_TERRAIN_TILES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
         let recs = forest::CAPACITY as u64;
         let plants = gpu.create_buffer(recs * PLANT_REC_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "globe plants")?;
@@ -1335,7 +1343,7 @@ impl GlobeScene {
                 continue;
             }
             for r in &t.recs {
-                let v = (r[12] & 0xFF) as usize;
+                let v = super::forest::rec_variant(r[12]);
                 let p = t.center + DVec3::new(f32::from_bits(r[3]) as f64, f32::from_bits(r[7]) as f64, f32::from_bits(r[11]) as f64);
                 let d = (p - cam).length() as f32;
                 if v < out.len() && d < out[v] {
@@ -1373,11 +1381,12 @@ globe workers: {} terrain tiles at {:.2} ms ({:.2} ms shoreline field), {} tree 
             ) + &{
                 let u = |k: usize, i: usize| UNDER[k][i].load(std::sync::atomic::Ordering::Relaxed) as f64;
                 format!(
-                    " [{} tree tiles at {:.2} ms, {} understory tiles at {:.2} ms]",
+                    " [{} tree tiles at {:.2} ms, {} understory tiles at {:.2} ms] city ms total: grow {:.0} streets {:.0} ways {:.0} blocked {:.0} block {:.0}",
                     u(0, 1),
                     u(0, 0) / u(0, 1).max(1.0) / 1e6,
                     u(1, 1),
                     u(1, 0) / u(1, 1).max(1.0) / 1e6
+                    , super::city::CITY_NS[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[2].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[3].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[4].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
                 )
             }
         }

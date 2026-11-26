@@ -10,6 +10,10 @@ const float BETA_M = 21e-6;
 const float H_R = 8000.0;
 const float H_M = 1200.0;
 const float MIE_G = 0.76;
+// How hazy the boundary layer is, x the clear-day aerosol (main.rgen sets it per frame: humid
+// coastal air near a city, Globals.city.y). Haze dims and warms the sun and pales the sky and the
+// distance alike, as it is one Mie layer.
+float atmoHaze = 1.0;
 
 // Ray / sphere (centred at the origin): (near, far), far < 0 if missed.
 vec2 raySphere(vec3 ro, vec3 rd, float r) {
@@ -43,7 +47,7 @@ vec2 lightDepth(vec3 x, vec3 L) {
 const vec3 BETA_O = vec3(0.650e-6, 1.881e-6, 0.085e-6) * 2.0;
 
 vec3 extinction(vec2 od) {
-    return exp(-((BETA_R + BETA_O) * od.x + BETA_M * 1.11 * od.y));
+    return exp(-((BETA_R + BETA_O) * od.x + BETA_M * atmoHaze * 1.11 * od.y));
 }
 
 // In-scattered light along ro + rd * [0, tmax] (ro relative to the planet centre) and the
@@ -85,8 +89,13 @@ vec3 atmosphere(vec3 ro, vec3 rd, float tmax, vec3 L, float sunI, out vec3 T) {
     float pR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
     float g2 = MIE_G * MIE_G;
     float pM = 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * MIE_G * mu, 1.5));
+    // (the extra coastal haze, atmoHaze - 1: larger, wetter particles scatter more evenly,
+    // a broad lobe: the whole sky turns a pale, warm grey, not only the sun's side)
+    const float HAZE_G = 0.35;
+    float h2 = HAZE_G * HAZE_G;
+    float pH = 3.0 / (8.0 * PI) * ((1.0 - h2) * (1.0 + mu * mu)) / ((2.0 + h2) * pow(1.0 + h2 - 2.0 * HAZE_G * mu, 1.5));
     T = extinction(od);
-    return sunI * (sumR * BETA_R * pR + sumM * BETA_M * pM);
+    return sunI * (sumR * BETA_R * pR + sumM * BETA_M * (pM + (atmoHaze - 1.0) * pH * vec3(1.0, 0.96, 0.9)));
 }
 
 #endif

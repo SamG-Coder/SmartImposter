@@ -15,7 +15,10 @@ void main() {
     vec4 a = unpackUnorm4x8(hit.albedoAo);
     vec3 alb = a.rgb * a.rgb; // atlas stores sqrt(albedo) for precision
     // plant -> instance space -> world (globe tiles rotate into the camera frame; identity in the forest scene)
-    vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (plantMatrix(pr) * octDecode(unpackSnorm2x16(hit.normal))));
+    // (normals by the inverse transpose: the plant may be scaled more across than up)
+    mat3 Mp = plantMatrix(pr);
+    mat3 Mn = mat3(Mp[0] / dot(Mp[0], Mp[0]), Mp[1] / dot(Mp[1], Mp[1]), Mp[2] / dot(Mp[2], Mp[2]));
+    vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (Mn * octDecode(unpackSnorm2x16(hit.normal))));
     // Grass and ferns have no bark (bmin.w = 1): pale / dry blades must not be classified as bark.
     // Otherwise: bark is grey-brown (g/r ~ 0.78); every leaf variant has g/r > 1.
     // Rocks, logs and cacti (bmin.w = 2) are solid: never foliage, however green.
@@ -25,6 +28,56 @@ void main() {
 
     // Baked visibility: x = a, y = length of the averaged normal, z = b.y (see bake.rgen).
     vec4 v = unpackUnorm4x8(hit.vis);
+    if (imps[vid].bmin.w > 2.5) {
+        // A building (city.rs): facades and roofs are flat, so the normal is the surface's. How
+        // much of the texel is glass was baked into the normal's length (building.rchit): the
+        // spread is 1 - 0.5 glass (main.rgen reflects it).
+        float skyVisB = clamp(v.x + (2.0 / 3.0) * (v.z - 0.5) * 3.0, 0.0, 1.0);
+        float glassB = clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0);
+        // (a road deck has no glass: its edges' mixed normals are a parapet and a deck, not a
+        // window to mirror the sky in)
+        bool deck = imps[vid].bmax.w > 1.5;
+        if (deck) glassB = 0.0;
+        // its own wall colour (building.rchit buildingTint, the same seed), on what is not glass
+        uint bs = plantSeed(pr);
+        const vec3 T[8] = vec3[8](vec3(0.97, 0.96, 0.93), vec3(1.0, 0.82, 0.58), vec3(1.0, 0.72, 0.58), vec3(0.86, 0.73, 0.56),
+                                  vec3(0.78, 0.92, 0.78), vec3(1.0, 0.91, 0.64), vec3(0.74, 0.67, 0.58), vec3(0.98, 0.70, 0.70));
+        vec3 tint = bs == 0u || deck ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
+        if (imps[vid].bmax.w > 0.5 && !deck) {
+            // a car: its paint (building.rchit carPaint)
+            const vec3 C[12] = vec3[12](vec3(1.0), vec3(1.0), vec3(0.06), vec3(0.06), vec3(0.62), vec3(0.62), vec3(0.32), vec3(0.65, 0.06, 0.05),
+                                        vec3(0.08, 0.16, 0.45), vec3(0.05, 0.07, 0.18), vec3(0.75, 0.66, 0.52), vec3(0.15));
+            tint = bs == 0u ? vec3(1.0) : C[pcg(bs * 2891336453u) % 12u];
+        }
+        pl.albedo = alb * mix(vec3(1.0), tint, 1.0 - glassB);
+        // roofs: the building's own membrane colour (building.rchit, the same seed)
+        {
+            const vec3 RT[6] = vec3[6](vec3(1.0), vec3(1.1, 1.02, 0.86), vec3(0.98, 0.88, 0.72), vec3(0.55, 0.56, 0.58), vec3(1.22, 1.2, 1.16), vec3(0.8, 0.8, 0.8));
+            float roofF = smoothstep(0.75, 0.9, dot(normalize(octDecode(unpackSnorm2x16(hit.normal))), vec3(0.0, 1.0, 0.0)));
+            vec3 rt = bs == 0u || deck ? vec3(1.0) : RT[pcg(bs * 1597334677u) % 6u];
+            pl.albedo = mix(pl.albedo, alb * rt, roofF * (1.0 - glassB));
+        }
+        pl.t = gl_HitTEXT;
+        pl.n = n;
+        pl.ng = n;
+        pl.flags = FLAG_IMPOSTOR | MAT_BUILDING | FLAG_BUILDING;
+        pl.ao = a.a * mix(0.75, 1.0, skyVisB);
+        pl.sunVis = 1.0;
+        pl.trans = vec3(0.0, 0.0, glassB);
+        // lit windows far away: the glass's share, on or off in cells of a window (1.6 m x a storey) of the building's own
+        // surface (in the building's own frame, so the cells line up with its facades), warm or cool (building.rchit)
+        mat3 Mb = plantMatrix(pr);
+        vec3 pb = transpose(Mb) * (gl_ObjectRayOriginEXT + gl_ObjectRayDirectionEXT * gl_HitTEXT - plantOrigin(pr)) / dot(Mb[0], Mb[0]);
+        vec3 q = floor(pb / vec3(1.6, 3.2, 1.6));
+        uint hq = pcg(uint(int(q.x) + 65536) * 73856093u ^ uint(int(q.y) + 65536) * 19349663u ^ uint(int(q.z) + 65536) * 83492791u);
+        float on = step(float(hq & 1023u) / 1023.0, 0.2);
+        vec3 room = (hq & 28672u) == 28672u ? vec3(0.85, 0.9, 1.0) : vec3(1.0, 0.56, 0.24);
+        // (walls only: the glass share leaks into the roofs' coarse mips)
+        float wallF = 1.0 - smoothstep(0.35, 0.6, abs(octDecode(unpackSnorm2x16(hit.normal)).y));
+        pl.wtan = room * on * glassB * wallF * mix(0.5, 1.0, float((hq >> 16) & 255u) / 255.0);
+        pl.shadowMask = 0xFFu;
+        return;
+    }
 
     pl.albedo = alb * treeTint(plantSeed(pr), leafiness);
     pl.albedo = mix(pl.albedo, dryTint(pl.albedo, plantDry(pr)), leafiness);
