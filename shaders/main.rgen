@@ -415,6 +415,9 @@ void main() {
                 // and only the wind's ripples remain; the open sea outside keeps its waves
                 if (g.city.x > 0.5) dep = min(dep, max(wfloor, 0.5) * 1.4 + 0.5);
                 oAmp = vec4(smoothstep(0.0, 25.0, dep), smoothstep(0.0, 8.0, dep), smoothstep(0.0, 2.0, dep), smoothstep(0.0, 0.4, dep));
+                // (a city's bay is sheltered: no swell, the wind's chop halved; the long cascades'
+                // tiling showed as zig-zag bands across it)
+                if (g.city.x > 0.5) oAmp *= vec4(0.0, 0.25, 0.6, 1.0);
                 // Real wave geometry: march the ray through the slab the waves fill (+-A around
                 // the mean level) against the height field, first crossing refined by bisection.
                 // Crests hide the troughs behind them at grazing angles; within 1.5 km.
