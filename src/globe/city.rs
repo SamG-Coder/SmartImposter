@@ -859,7 +859,12 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         let (dn, de) = ((bla - la) * 110_540.0, (blo - lo) * 111_320.0 * la.to_radians().cos());
         dn * dn + de * de < r * r
     });
-    let cluster = spot || bu(i.div_euclid(3), j.div_euclid(3), 8200) < 0.6;
+    // (round a spot, within 800 m, its own group is the only one: one cluster to an island)
+    let near_spot = !spot && TOWER_SPOTS.iter().any(|&(la, lo, _)| {
+        let (dn, de) = ((bla - la) * 110_540.0, (blo - lo) * 111_320.0 * la.to_radians().cos());
+        dn * dn + de * de < 800.0 * 800.0
+    });
+    let cluster = spot || (!near_spot && bu(i.div_euclid(3), j.div_euclid(3), 8200) < 0.6);
     let water_tower = z == 2
         && bu(i, j, 8100) < if spot { 0.6 } else if cluster { 0.28 } else { 0.04 }
         && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 70.0);
@@ -1000,11 +1005,11 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         // few big lots, or many small ones; never the same grain block after block)
         2 => {
             let u = bu(i, j, 7);
-            if u < 0.1 {
+            if u < 0.06 {
                 (1, 1)
-            } else if u < 0.25 {
+            } else if u < 0.18 {
                 (2, 1)
-            } else if u < 0.6 {
+            } else if u < 0.45 {
                 (2, 2)
             } else {
                 (3, 2)
@@ -1113,6 +1118,9 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 // 10-25 storeys)
                 let mut want = if z == 3 {
                     70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot))
+                } else if water_tower && spot {
+                    // (a spot's group is the tall one: 30-45 storeys, seen across the bay)
+                    100.0 + 50.0 * bu(i, j, 90 + lot)
                 } else if water_tower {
                     // (15 to 45 storeys, most of them mid-height)
                     50.0 + 100.0 * bu(i, j, 90 + lot).powf(1.3)
@@ -2216,7 +2224,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         for b in 0..cm {
             for a in 0..cn {
                 let cell = b * 16 + a;
-                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else if z == 2 { 0.75 } else { 0.6 } {
+                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else if z == 2 { 0.5 } else { 0.6 } {
                     continue;
                 }
                 let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);

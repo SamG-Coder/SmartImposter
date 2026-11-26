@@ -1118,6 +1118,45 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, format!("Building_Bridge_{k}"), 11.5, &mut meshes, &mut archs);
     }
+    // apartment blocks of other shapes, 4-14 storeys: long slabs, L-shaped blocks of two wings
+    // at different heights, blocks with rounded ends, a stepped block (a low base, a taller
+    // part on it); each wing its own convex volume
+    {
+        // (x, z) centre offset, w, d, chamfer, round, storeys; facade 0 punched, 1 white
+        // balconies, 2 ribbon
+        type Wing = ((f32, f32), f32, f32, f32, usize, usize);
+        let kinds: [(&[Wing], u8, u8, u8); 10] = [
+            (&[((0.0, 0.0), 62.0, 14.0, 0.0, 0, 6)], 1, 0, 0),
+            (&[((0.0, 0.0), 48.0, 16.0, 0.0, 0, 12)], 0, 1, 2),
+            (&[((-4.0, -6.0), 40.0, 16.0, 0.0, 0, 9), ((14.0, 9.0), 16.0, 30.0, 0.0, 0, 5)], 0, 4, 1),
+            (&[((0.0, -8.0), 38.0, 14.0, 0.0, 0, 14), ((-14.0, 8.0), 14.0, 28.0, 0.0, 0, 7)], 1, 0, 5),
+            (&[((0.0, 0.0), 46.0, 18.0, 8.9, 5, 10)], 1, 0, 4),
+            (&[((0.0, 0.0), 30.0, 30.0, 9.0, 4, 8)], 0, 5, 0),
+            (&[((0.0, 0.0), 42.0, 32.0, 0.0, 0, 4), ((4.0, -2.0), 26.0, 20.0, 4.0, 0, 12)], 2, 6, 2),
+            (&[((0.0, 0.0), 58.0, 22.0, 0.0, 0, 4)], 2, 7, 3),
+            (&[((-10.0, 0.0), 24.0, 26.0, 0.0, 0, 7), ((12.0, 0.0), 20.0, 26.0, 0.0, 0, 11)], 0, 1, 1),
+            (&[((0.0, 0.0), 36.0, 16.0, 7.9, 4, 13), ((0.0, 14.0), 22.0, 12.0, 0.0, 0, 4)], 1, 3, 4),
+        ];
+        for (k, &(wings, fac, wall, glass)) in kinds.iter().enumerate() {
+            let mut b = B::new();
+            let pal = Pal { wall, glass, frame: 2 };
+            let mut top = 0.0f32;
+            for &((ox, oz), w, d, chamfer, round, storeys) in wings {
+                let poly: Vec<Vec2> = footprint(w, d, chamfer, round).iter().map(|p| *p + Vec2::new(ox, oz)).collect();
+                let h = 3.1 * storeys as f32 + 1.0;
+                let f = match fac {
+                    0 => Fac::Punched { col: 3.1, w: 1.6, h: 1.7 },
+                    1 => Fac::Balcony { depth: 1.8, solid: true },
+                    _ => Fac::Ribbon { win: 0.45, col: 2.2 },
+                };
+                // (a stepped block's upper part stands on its base)
+                let y0 = if fac == 2 && storeys > 6 && wings.len() > 1 { 3.1 * wings[0].5 as f32 + 1.0 } else { 0.0 };
+                volume(&mut b, &poly, y0, h.max(y0 + 6.0), if y0 == 0.0 { 4.0 } else { 0.0 }, 3.1, f, &pal, true, &mut rng);
+                top = top.max(h.max(y0 + 6.0));
+            }
+            push(b, format!("Building_Apartments_Mix_{k}"), top + 4.0, &mut meshes, &mut archs);
+        }
+    }
     (meshes, archs)
 }
 

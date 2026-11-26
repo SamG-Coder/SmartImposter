@@ -666,7 +666,7 @@ void main() {
             // floor data says: the 15" ETOPO puts the bay's floor far too deep)
             if (globe() && g.city.x > 0.5) {
                 SIGMA = vec3(0.8, 0.34, 0.42);
-                body = vec3(0.044, 0.082, 0.068);
+                body = vec3(0.036, 0.062, 0.074);
                 Tv = exp(-SIGMA * under);
                 Ts = exp(-SIGMA * sunPath);
             }
