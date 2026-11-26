@@ -502,6 +502,7 @@ impl App {
         let (mut pack, mut cat) = catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?;
         // the globe's cities: procedural building archetypes, baked and placed like plants
         if a.globe {
+            catalog::add_city_palms(&mut pack, &mut cat);
             catalog::add_buildings(&mut pack, &mut cat);
         }
         let tris: usize = pack.meshes.iter().map(|m| m.tri_count() as usize).sum();

@@ -55,6 +55,8 @@ pub struct Species {
     /// building archetypes for the cities (globe/city.rs), and the palms of their streets
     pub buildings: Vec<super::city::ArchRef>,
     pub palms: Vec<usize>,
+    /// broad-crowned trees for the cities' yards and parks
+    pub city_trees: Vec<usize>,
 }
 
 /// Biomes an understory species belongs to (bit per biomes.rs number), by catalog name: desert
@@ -561,12 +563,20 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let field = |sp: usize| (CONTRAST as f32 * (field_at(sp, sp as f64, fu, fv) - 0.5)).exp();
             let biome = terrain.biome(lat, lon);
             let Some(sp) = roles.pick(biome, alt, wet, cool, &field, rng.f() as f32) else { continue };
-            // in a city most trees are palms
+            // in a city: palms and broad crowns only (no conifers, poplars or bamboo)
             let r_palm = rng.f();
-            let vars = if !im.palms.is_empty() && r_palm < 0.75 && super::city::in_city(lat, lon) { &im.palms } else { &im.species[sp].1 };
+            let city = super::city::in_city(lat, lon);
+            let vars = if city && !im.palms.is_empty() && (r_palm < 0.5 || im.city_trees.is_empty()) {
+                &im.palms
+            } else if city && !im.city_trees.is_empty() {
+                &im.city_trees
+            } else {
+                &im.species[sp].1
+            };
             // variants run from old (large) to young: stands of an age, also as smooth bands
             let age = (field_at(im.species.len(), 101.0, fu, fv) as f64 * 1.3 - 0.15 + (rng.f() - 0.5) * 0.35).clamp(0.0, 0.999);
             let k = ((age.powf(1.7) * vars.len() as f64) as usize).min(vars.len() - 1); // mostly mature
+            let k = if city { ((r_palm * 7919.0).fract() * vars.len() as f64) as usize % vars.len() } else { k };
             let vid = vars[k];
             let info = &im.infos[vid];
             // frame: up = local vertical, random yaw

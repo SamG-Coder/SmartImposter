@@ -503,10 +503,12 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
         let need = min_height(lvl);
         for j in (yl / BY).floor() as i64 - 1..=(yh / BY).floor() as i64 {
             for i in (xl / BX).floor() as i64 - 1..=(xh / BX).floor() as i64 {
+                let placed = block(k, archs, terrain, i, j, need);
                 if lvl == 0 && !sp.palms.is_empty() {
                     street_palms(k, terrain, sp, i, j, id, tile);
+                    lot_trees(k, terrain, sp, i, j, id, tile, &placed);
                 }
-                for p in block(k, archs, terrain, i, j, need) {
+                for p in placed {
                     let Some(d) = in_tile(k, p.x, p.y, id) else { continue };
                     if tile.recs.len() >= MAX_PER_TILE {
                         return;
@@ -570,6 +572,85 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
         let vid = sp.palms[(bh(i, j, 2000 + n) as usize) % sp.palms.len()];
         let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, 3000 + n) * std::f64::consts::TAU, 0.85 + 0.35 * bu(i, j, 4000 + n));
         push_rec(tile, rows, vid as u32 | (1 + bh(i, j, 5000 + n) % 8190) << 8, &sp.infos[vid]);
+    }
+}
+
+/// Trees on the lots of block (i, j), where globe.rchit cityGround leaves room for them: in the
+/// houses' front yards (on the side away from the driveway) and back yards (beyond the pools),
+/// palms along the planted edges of the parking lots, palms in the plazas' planters. Never under
+/// a building; those whose foot lies in tile `id`.
+#[allow(clippy::too_many_arguments)]
+fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, placed: &[Placed]) {
+    let (x0, y0, w, h) = interior(i, j);
+    let z = block_zone(k, i, j);
+    // (x, y, broad crown?, salt)
+    let mut spots: Vec<(f64, f64, bool, u32)> = Vec::new();
+    if z == 0 {
+        let n = (w / HOUSE_LOT).floor().max(1.0) as usize;
+        let lw = w / n as f64;
+        for row in 0..2 {
+            for l in 0..n {
+                let lot = (row * n + l) as u32;
+                let right = bu(i, j, 30 + lot) < 0.5;
+                let at = |u: f64, v: f64| (x0 + l as f64 * lw + u, if row == 0 { y0 + v } else { y0 + h - v });
+                if bu(i, j, 3100 + lot) < 0.6 {
+                    let (x, y) = at(if right { 2.6 } else { lw - 2.6 }, 2.8);
+                    spots.push((x, y, bu(i, j, 3200 + lot) < 0.4, 3300 + lot));
+                }
+                let backs = 1 + (bu(i, j, 3400 + lot) * 2.2) as u32;
+                for t in 0..backs {
+                    let u = 3.0 + (lw - 6.0) * bu(i, j, 3500 + lot * 4 + t);
+                    let (x, y) = at(u, h * 0.5 - 3.5 - 2.0 * bu(i, j, 3600 + lot * 4 + t));
+                    spots.push((x, y, bu(i, j, 3700 + lot * 4 + t) < 0.7, 3800 + lot * 4 + t));
+                }
+            }
+        }
+    } else if z == 1 || (z == 2 && bu(i, j, 3) < 0.5) {
+        // the planted strip round a parking lot (2.2 m wide)
+        let per = 2.0 * (w + h);
+        let n = (per / 15.0).floor() as u32;
+        for t in 0..n {
+            if bu(i, j, 4100 + t) > 0.5 {
+                continue;
+            }
+            let s = (t as f64 + 0.5) / n as f64 * per;
+            let (u, v) = if s < w {
+                (s, 1.1)
+            } else if s < w + h {
+                (w - 1.1, s - w)
+            } else if s < 2.0 * w + h {
+                (2.0 * w + h - s, h - 1.1)
+            } else {
+                (1.1, per - s)
+            };
+            spots.push((x0 + u, y0 + v, false, 4200 + t));
+        }
+    } else if bu(i, j, 5) >= 0.4 {
+        // plaza planters: one every 14 x 11 m, a palm in each
+        let (nx, ny) = ((w / 14.0).floor() as i64, (h / 11.0).floor() as i64);
+        for a in 0..nx {
+            for b in 0..ny {
+                spots.push((x0 + a as f64 * 14.0 + 3.0, y0 + b as f64 * 11.0 + 1.8, false, 4400 + (a * 31 + b) as u32));
+            }
+        }
+    }
+    for (x, y, broad, salt) in spots {
+        if placed.iter().any(|p| (x - p.x).abs() < p.hx + 1.5 && (y - p.y).abs() < p.hy + 1.5) {
+            continue;
+        }
+        let list = if broad && !sp.city_trees.is_empty() { &sp.city_trees } else { &sp.palms };
+        let Some(d) = in_tile(k, x, y, id) else { continue };
+        let (lat, lon) = lat_lon(d);
+        if !buildable(k, terrain, x, y) || terrain.cover.fractions(lat, lon, 30.0).map(|f| f[4]).unwrap_or(0.0) < 0.2 {
+            continue;
+        }
+        if tile.recs.len() >= MAX_PER_TILE {
+            return;
+        }
+        let vid = list[(bh(i, j, salt) as usize) % list.len()];
+        let sc = if broad { 0.6 + 0.35 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
+        let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, sc);
+        push_rec(tile, rows, vid as u32 | (1 + bh(i, j, salt + 70_000) % 8190) << 8, &sp.infos[vid]);
     }
 }
 

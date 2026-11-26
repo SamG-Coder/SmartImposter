@@ -1559,6 +1559,21 @@ impl Renderer {
                         });
                     }
                 }
+                // the city's trees: the tall palms (catalog.rs add_city_palms: street rows, most
+                // trees in a city) and broad,
+                // spreading crowns standing in for live oaks and figs (no conifers, poplars or
+                // bamboo in a Florida city)
+                for s in &r.catalog.species {
+                    let n = s.name.to_ascii_lowercase();
+                    let tall = |v: &usize| r.catalog.variants[*v].height > 3.5;
+                    if n == "city_palm" {
+                        sp.palms.extend(s.variants.clone().filter(tall));
+                    }
+                    if n.contains("english_oak") || n.contains("norway_maple") || n.contains("european_beech") {
+                        sp.city_trees.extend(s.variants.clone().filter(tall));
+                    }
+                }
+                println!("Cities: {} building archetypes, {} palm and {} broadleaf variants", sp.buildings.len(), sp.palms.len(), sp.city_trees.len());
                 if sp.dry_grass.is_empty() {
                     sp.dry_grass = sp.grass.clone();
                 }
