@@ -109,13 +109,15 @@ void main() {
         albedo = B_WALL[min(pal, 8u)] * grime * (mt == 10u ? 0.92 : 1.0) * buildingTint(instSeed(gl_InstanceCustomIndexEXT));
         // weathering: dirt splashed up the foot of the walls, rain streaks down them
         albedo *= mix(0.8, 1.0, smoothstep(0.0, 2.5, po.y));
-        albedo *= mix(1.0, mix(0.86, 1.0, vnoise(vec2((po.x + po.z) * 2.3, po.y * 0.07))), 0.8 * detail);
+        albedo *= mix(1.0, mix(0.72, 1.0, vnoise(vec2((po.x + po.z) * 2.3, po.y * 0.07))), mix(0.45, 0.9, detail));
+        // (sun-bleached, weathered stucco: a little darker and warmer than the paint chart)
+        albedo *= vec3(0.9, 0.85, 0.79);
     } else if (mt == 2u) {
         albedo = B_FRAME[min(pal, 3u)];
         glass = 0.25;
     } else if (mt == 3u) {
         // concrete: white (slabs, towers' bands), or weathered grey (bridges' parapets, piers)
-        albedo = (pal == 1u ? vec3(0.31, 0.30, 0.28) : vec3(0.74, 0.73, 0.70)) * grime;
+        albedo = (pal == 1u ? vec3(0.31, 0.30, 0.28) : vec3(0.67, 0.64, 0.59)) * grime;
     } else if (mt == 4u) {
         // flat roofs: membrane and gravel, stained
         float nr = vnoise(po.xz * 0.6) * 0.6 + vnoise(po.xz * 2.7) * 0.4;

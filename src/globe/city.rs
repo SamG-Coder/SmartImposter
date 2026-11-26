@@ -662,6 +662,15 @@ const CHANNELS: &[Channel] = &[
     // the river between downtown and Brickell: from the bay west, broad (180 m) and in long
     // S-bends, as the Miami River leads the eye to the towers
     Channel { a: (-1250.0, -1150.0), b: (-7600.0, 250.0), half: 90.0, amp: 260.0, wave: 2600.0 },
+    // a back channel north of it round a wooded island (from the river and back to it)
+    Channel { a: (-3147.0, -440.0), b: (-3420.0, -250.0), half: 34.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-3420.0, -250.0), b: (-3760.0, -235.0), half: 34.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-3760.0, -235.0), b: (-3938.0, -560.0), half: 34.0, amp: 0.0, wave: 1000.0 },
+    // a canal looping south off it round a peninsula
+    Channel { a: (-2690.0, -720.0), b: (-2620.0, -1080.0), half: 28.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-2620.0, -1080.0), b: (-2900.0, -1260.0), half: 28.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-2900.0, -1260.0), b: (-3200.0, -1120.0), half: 28.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-3200.0, -1120.0), b: (-3260.0, -560.0), half: 28.0, amp: 0.0, wave: 1000.0 },
     // Miami Beach's west side: residential canals behind the barrier island
     Channel { a: (3350.0, 900.0), b: (3550.0, 6200.0), half: 25.0, amp: 60.0, wave: 1400.0 },
     // and through the land at the west end of the beach, from the bay to the bay
@@ -1110,6 +1119,10 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 if r.class != class {
                     continue;
                 }
+                // (no supertowers: the skyline is a band of towers of 25-60 storeys)
+                if class == Class::Tower && r.height > 255.0 {
+                    continue;
+                }
                 // (the waterfront's towers are residential: white balcony bands over a podium,
                 // where one fits)
                 if water_tower && lot == tower_lot && !r.slim {
@@ -1142,7 +1155,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 archs
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| r.class == Class::Landmark && r.size[0] as f64 <= lw - 4.0 && r.size[1] as f64 <= lh - 4.0)
+                    .filter(|(_, r)| r.class == Class::Landmark && r.height <= 255.0 && r.size[0] as f64 <= lw - 4.0 && r.size[1] as f64 <= lh - 4.0)
                     .map(|(a, _)| (a, 0))
                     .collect()
             } else {
