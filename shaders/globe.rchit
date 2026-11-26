@@ -626,7 +626,8 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // wetland in the city: mangrove and dense shrub, a deep, uneven green
     vec3 mangrove = vec3(0.028, 0.05, 0.02) * mix(0.7, 1.3, fbmN(c * 0.25 + 77.0, 3));
     park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));
-    alb = mix(park, planned, smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)));
+    // (the streets run on through parks and wetland: no street, and no bridge, ends in a lawn)
+    alb = mix(park, planned, max(smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)), streetW));
     // the waterfront drive (globe/city.rs WATERFRONT): along the shore of the city's blocks
     // other than houses, following the shoreline field: a paved promenade at the seawall, a
     // planted verge, two lanes with a double yellow line and white edge lines, a sidewalk; the
@@ -734,6 +735,17 @@ void main() {
         sdSmooth = acc / 25.0;
     }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
+    bool inCity = cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT);
+    if (inCity) {
+        // a city's shore is built, a smooth line: the field averaged over an 8 m ring (the 10 m
+        // land cover pixels showed through as a sawtooth), no noise
+        float ru = 8.0 / max(cellM * float(FIELD), 1.0), acc = sd;
+        for (int k = 0; k < 8; ++k) {
+            float a = float(k) * 0.7853982;
+            acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+        }
+        sd = acc / 9.0;
+    } else
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));
     float level = waterLevel(V, tuv);
     bool hasLevel = abs(level) < 1e6;

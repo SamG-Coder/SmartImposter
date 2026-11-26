@@ -767,6 +767,10 @@ void main() {
                 vec3 sssCol = mix(vec3(0.0, 0.07, 0.055), vec3(0.0, 0.04, 0.065), open);
                 col += sssCol * E * sh * hn * (3.0 * back + 0.12 * face);
             }
+            // (a city's canals and sheltered bay: far calmer than the open sea's wind, so the
+            // sun makes a glint streak and the banks and towers are mirrored, not a wide sheet
+            // of glitter)
+            if (g.city.x > 0.5) { lostVar *= 0.12; gr *= 0.5; n = normalize(mix(n, normalize(gq), 0.5)); }
             float tHit = pl.t;
             // the ripples smaller than a pixel still tilt the surface: one random facet per pixel
             // and frame from their slope spread (the denoiser averages them), so far water blurs
