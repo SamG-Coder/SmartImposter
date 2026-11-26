@@ -171,8 +171,11 @@ void main() {
     if ((st & 2u) != 0u) return; // the mesh copy draws this plant
     PlantRec pr = plants[tree];
     mat3 M = plantMatrix(pr);
-    float s2 = dot(M[0], M[0]); // uniform scale squared
-    mat3 Minv = transpose(M) / s2;
+    // (a rotation and a scale per axis: a city's broad crowns are spread wider than tall; the
+    // inverse's rows are the columns over their squared lengths)
+    vec3 s2v = vec3(dot(M[0], M[0]), dot(M[1], M[1]), dot(M[2], M[2]));
+    float s2 = max(max(s2v.x, s2v.y), s2v.z);
+    mat3 Minv = transpose(mat3(M[0] / s2v.x, M[1] / s2v.y, M[2] / s2v.z));
     vec3 po = plantOrigin(pr);
     uint vid = plantVariant(pr); // atlas slot = plant variant
     ImpostorInfo info = imps[vid];

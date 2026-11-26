@@ -15,7 +15,10 @@ void main() {
     vec4 a = unpackUnorm4x8(hit.albedoAo);
     vec3 alb = a.rgb * a.rgb; // atlas stores sqrt(albedo) for precision
     // plant -> instance space -> world (globe tiles rotate into the camera frame; identity in the forest scene)
-    vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (plantMatrix(pr) * octDecode(unpackSnorm2x16(hit.normal))));
+    // (normals by the inverse transpose: the plant may be scaled more across than up)
+    mat3 Mp = plantMatrix(pr);
+    mat3 Mn = mat3(Mp[0] / dot(Mp[0], Mp[0]), Mp[1] / dot(Mp[1], Mp[1]), Mp[2] / dot(Mp[2], Mp[2]));
+    vec3 n = normalize(mat3(gl_ObjectToWorldEXT) * (Mn * octDecode(unpackSnorm2x16(hit.normal))));
     // Grass and ferns have no bark (bmin.w = 1): pale / dry blades must not be classified as bark.
     // Otherwise: bark is grey-brown (g/r ~ 0.78); every leaf variant has g/r > 1.
     // Rocks, logs and cacti (bmin.w = 2) are solid: never foliage, however green.

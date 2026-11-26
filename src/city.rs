@@ -909,9 +909,15 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, "Building_Dock".into(), 1.2, &mut meshes, &mut archs);
     }
-    // a back-yard pool (6 x 8 m with its coping and a strip of deck), placed with its house
+    // a back-yard pool (6 x 8 m with its coping and a strip of deck) in a paver patio of 11 x
+    // 12 m with a few loungers, placed with its house
     {
         let mut b = B::new();
+        b.bx(Vec3::new(-5.5, 0.0, -6.0), Vec3::new(5.5, 0.1, 6.0), m(TILE, 4), false);
+        for (k, x) in [-4.6f32, -4.6, 4.6].iter().enumerate() {
+            let z = [-1.5f32, 0.8, -3.0][k];
+            b.bx(Vec3::new(x - 0.35, 0.1, z - 0.9), Vec3::new(x + 0.35, 0.45, z + 0.9), m(PAINT, 0), false);
+        }
         b.bx(Vec3::new(-3.6, 0.0, -4.6), Vec3::new(3.6, 0.15, 4.6), m(SLAB, 0), false);
         b.bx(Vec3::new(-3.0, 0.15, -4.0), Vec3::new(3.0, 0.17, 4.0), m(POOL, 0), false);
         b.bx(Vec3::new(-3.6, 0.0, 4.6), Vec3::new(3.6, 0.1, 6.0), m(WOOD, 0), false);

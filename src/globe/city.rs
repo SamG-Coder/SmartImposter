@@ -863,8 +863,10 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                         continue;
                     }
                     let quarter = q + if bu(i, j, 20 + lot) < 0.5 { 2 } else { 0 };
-                    let scale = 0.94 + 0.08 * bu(i, j, 40 + lot);
                     let (ax, az) = if quarter % 2 == 0 { (r.size[0] as f64, r.size[1] as f64) } else { (r.size[1] as f64, r.size[0] as f64) };
+                    // (built up to a fifth larger where the lot has room: the house fills its lot
+                    // as Miami's do, not a small box on a lawn)
+                    let scale = (1.02 + 0.18 * bu(i, j, 40 + lot)).min((lw - 6.0) / ax).min(16.0 / az).max(0.94);
                     let (hx, hy) = (ax * 0.5 * scale, az * 0.5 * scale);
                     // along the street: centred in what the driveway leaves; back from the street
                     let u = if drive_right { 1.5 + (lw - 6.0) * 0.5 } else { 4.5 + (lw - 6.0) * 0.5 };
@@ -892,14 +894,14 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 let _ = depth;
                 let Some((a, px, py, quarter, scale, hx, hy)) = found else { continue };
                 out.push(Placed { arch: a, x: px, y: py, quarter, scale, hx, hy });
-                // its pool in the back yard (half the houses), only with the house
-                if bu(i, j, 600 + lot) < 0.5 {
+                // its pool and patio in the back yard (four houses in five), only with the house
+                if bu(i, j, 600 + lot) < 0.8 {
                     if let Some(pa) = archs.iter().position(|r| r.class == Class::Pool) {
                         let back = FRONT_YARD + 17.5 + 3.5 + 4.0;
-                        let (qx, qy) = (x0 + l as f64 * lw + 3.6 + (lw - 7.2) * bu(i, j, 620 + lot), if row == 0 { y0 + back } else { y0 + h - back });
-                        let pool_ok = back + 4.6 < h * 0.5 && buildable(k, terrain, qx, qy) && buildable(k, terrain, qx, qy + if row == 0 { 5.0 } else { -5.0 });
+                        let (qx, qy) = (x0 + l as f64 * lw + 5.5 + (lw - 11.0).max(0.0) * bu(i, j, 620 + lot), if row == 0 { y0 + back } else { y0 + h - back });
+                        let pool_ok = back + 6.0 < h * 0.5 && buildable(k, terrain, qx, qy) && buildable(k, terrain, qx, qy + if row == 0 { 6.0 } else { -6.0 });
                         if pool_ok && archs[pa].height >= need {
-                            out.push(Placed { arch: pa, x: qx, y: qy, quarter: if row == 0 { 2 } else { 0 }, scale: 1.0, hx: 3.6, hy: 4.6 });
+                            out.push(Placed { arch: pa, x: qx, y: qy, quarter: if row == 0 { 2 } else { 0 }, scale: 1.0, hx: 5.5, hy: 6.0 });
                         }
                     }
                 }
@@ -2141,7 +2143,10 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         let vid = list[(bh(i, j, salt) as usize) % list.len()];
         // (a grove's crowns grow big and meet: the canopy closes over the ground)
         let sc = if grove && broad { 0.95 + 0.4 * bu(i, j, salt + 50_000) } else if broad { 0.7 + 0.4 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
-        let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, sc);
+        // (the temperate stand-ins grew up in forests, tall and narrow: spread wider and lower,
+        // a city's live oaks, figs and mahoganies, domed crowns that merge into a carpet)
+        let (across, up_sc) = if broad && list.as_ptr() == sp.city_trees.as_ptr() { if grove { (sc * 1.45, sc * 0.8) } else { (sc * 1.3, sc * 0.88) } } else { (sc, sc) };
+        let rows = frame_rows_xy(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, across, up_sc);
         push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, salt + 70_000) % 8190) << 8), &sp.infos[vid]);
     }
 }
@@ -2149,6 +2154,11 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
 /// Object -> tile rows for something standing at direction `d` at height `h`, turned `yaw`
 /// from east towards north, scaled.
 fn frame_rows(d: DVec3, center: DVec3, h: f64, yaw: f64, sc: f64) -> [[f64; 4]; 3] {
+    frame_rows_xy(d, center, h, yaw, sc, sc)
+}
+
+/// As frame_rows, scaled `across` horizontally and `up` vertically (a crown spread wider).
+fn frame_rows_xy(d: DVec3, center: DVec3, h: f64, yaw: f64, across: f64, up_sc: f64) -> [[f64; 4]; 3] {
     // (turned with its street: the plan's axes bend with the warp)
     let (lat, lon) = lat_lon(d);
     let yaw = yaw + city_at(lat, lon).map(|(_, x, y)| twist(x, y)).unwrap_or(0.0);
@@ -2157,7 +2167,7 @@ fn frame_rows(d: DVec3, center: DVec3, h: f64, yaw: f64, sc: f64) -> [[f64; 4]; 
     let north = up.cross(east);
     let x = east * yaw.cos() + north * yaw.sin();
     let z = x.cross(up);
-    let (x, y, z) = (x * sc, up * sc, z * sc);
+    let (x, y, z) = (x * across, up * up_sc, z * across);
     let t = d * (R_EARTH + h) - center;
     [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]]
 }
