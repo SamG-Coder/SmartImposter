@@ -73,7 +73,7 @@ const CITIES: &[City] = &[City {
         // the broad urban fields round them: Miami Beach mid-rise all along, the city round
         // downtown (walk-ups and apartment blocks rather than houses)
         Core { lat: 25.8000, lon: -80.1280, strength: 0.4, radius: 1300.0 },  // Miami Beach
-        Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 2400.0 }, // downtown's fringe
+        Core { lat: 25.7760, lon: -80.2000, strength: 0.38, radius: 3800.0 }, // downtown's fringe
         // the beach's west end, round the canals: packed mid-rise
         Core { lat: 25.7860, lon: -80.1500, strength: 0.42, radius: 750.0 },
         // the island in the middle of the bay west of it: apartment blocks and a few towers
@@ -1011,6 +1011,16 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         }
         // (the mid-rise and walk-up blocks vary: a whole-block slab or court now and then, a
         // few big lots, or many small ones; never the same grain block after block)
+        2 if density_at_block(k, i, j) > 0.22 => {
+            let u = bu(i, j, 7);
+            if u < 0.25 {
+                (1, 1)
+            } else if u < 0.55 {
+                (2, 1)
+            } else {
+                (2, 2)
+            }
+        }
         2 => {
             let u = bu(i, j, 7);
             if u < 0.05 {
@@ -1090,9 +1100,9 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 if class == Class::Tower && z < 3 && !r.residential && archs.iter().any(|o| o.class == Class::Tower && o.residential && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
                     continue;
                 }
-                // (and its mid-rises apartments, condos and stucco blocks: an office block one
-                // lot in five)
-                if r.office && z < 3 && bu(i, j, 7700 + lot) < 0.8 && archs.iter().any(|o| o.class == class && !o.office && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
+                // (and its mid-rises apartments, condos and stucco blocks: an office block only
+                // where nothing else fits)
+                if r.office && z < 3 && archs.iter().any(|o| o.class == class && !o.office && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
                     continue;
                 }
                 let (ax, az) = (r.size[0] as f64, r.size[1] as f64);
@@ -2247,7 +2257,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 let open = placed.iter().map(|p| p.hx * p.hy * 4.0).sum::<f64>() < 0.12 * w * h;
                 // (built-up blocks keep their ground built: car parks, courts, palms; the canopy is
                 // the parks', the house blocks' and the islands')
-                if bu(i, j, 9000 + cell) > if open { 0.75 } else if z == 0 { 0.8 } else if z == 2 { 0.22 } else { 0.32 } {
+                if bu(i, j, 9000 + cell) > if open { 0.75 } else if z == 0 { 0.5 } else if z == 2 { 0.22 } else { 0.32 } {
                     continue;
                 }
                 let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);

@@ -1169,6 +1169,49 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             push(b, format!("Building_Apartments_Mix_{k}"), top + 4.0, &mut meshes, &mut archs);
         }
     }
+    // big blocks of the city round downtown: hotels, office and apartment complexes and parking
+    // structures of 55-90 m, 6-16 storeys, many on a podium of shops or parking: few, large
+    // buildings, as the city by its river is built
+    for k in 0..6 {
+        let mut b = B::new();
+        let (w, d, storeys, pod, wall, fac) = [
+            (72.0f32, 40.0f32, 12usize, 3usize, 1u8, 0u8),
+            (60.0, 48.0, 9, 0, 4, 1),
+            (86.0, 34.0, 8, 2, 3, 0),
+            (64.0, 44.0, 15, 4, 0, 1),
+            (78.0, 52.0, 6, 0, 5, 0),
+            (56.0, 56.0, 11, 3, 7, 1),
+        ][k];
+        let pal = Pal { wall, glass: [2, 0, 4, 5, 4, 5][k], frame: 2 };
+        let mut y0 = 0.0f32;
+        if pod > 0 {
+            let p = footprint(w + 8.0, d + 8.0, 0.0, 0);
+            volume(&mut b, &p, 0.0, 3.2 * pod as f32, 4.5, 3.2, if k % 2 == 0 { Fac::Garage } else { Fac::Ribbon { win: 0.4, col: 3.0 } }, &pal, true, &mut rng);
+            y0 = 3.2 * pod as f32;
+        }
+        // the block itself: a broad slab, or (k 1, 4) a block round a court (two long wings
+        // joined at the ends)
+        let h = y0 + 3.2 * storeys as f32;
+        let f = match fac {
+            0 => Fac::Punched { col: 3.1, w: 1.6, h: 1.7 },
+            1 => Fac::Balcony { depth: 1.8, solid: true },
+            _ => Fac::Ribbon { win: 0.45, col: 2.4 },
+        };
+        if k == 1 || k == 4 {
+            for zs in [-1.0f32, 1.0] {
+                let wing: Vec<Vec2> = footprint(w, 14.0, 0.0, 0).iter().map(|p| *p + Vec2::new(0.0, zs * (d * 0.5 - 7.0))).collect();
+                volume(&mut b, &wing, y0, h, if y0 == 0.0 { 4.5 } else { 0.0 }, 3.2, match fac { 1 => Fac::Balcony { depth: 1.8, solid: true }, _ => Fac::Punched { col: 3.1, w: 1.6, h: 1.7 } }, &pal, true, &mut rng);
+            }
+            for xs in [-1.0f32, 1.0] {
+                let end: Vec<Vec2> = footprint(14.0, d - 28.0, 0.0, 0).iter().map(|p| *p + Vec2::new(xs * (w * 0.5 - 7.0), 0.0)).collect();
+                volume(&mut b, &end, y0, h, if y0 == 0.0 { 4.5 } else { 0.0 }, 3.2, Fac::Punched { col: 3.1, w: 1.6, h: 1.7 }, &pal, true, &mut rng);
+            }
+        } else {
+            let poly = footprint(w, d.min(24.0), [0.0, 0.0, 6.0, 0.0, 0.0, 9.0][k], [0, 0, 0, 0, 0, 4][k]);
+            volume(&mut b, &poly, y0, h, if y0 == 0.0 { 4.5 } else { 0.0 }, 3.2, f, &pal, true, &mut rng);
+        }
+        push(b, format!("Building_Apartments_Mix_Big_{k}"), h + 4.0, &mut meshes, &mut archs);
+    }
     // big low blocks between them: a supermarket or a strip of shops, a showroom, a parking
     // deck; 1-3 storeys, 36-64 m, flat roofs crowded with plant (units, ducts, a tank)
     for k in 0..6 {
