@@ -602,12 +602,15 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         lot = mix(lot, bed, edge * 0.9);
         if (zone == 2) lot = mix(lot, pave, 0.25 * (1.0 - panel));
     }
+    // the lots' last 20 m or so to the water are a waterfront lawn, never a plaza or car park
+    // cut off by the shore
+    lot = mix(lot, lawnC * mix(0.85, 1.1, n2), 1.0 - smoothstep(16.0 + 6.0 * n1, 24.0 + 6.0 * n1, sd));
     // along every shore of the city's lots: a paved promenade at the seawall and a lawn
     // strip, 10 m in all, before any lot (globe/city.rs keeps buildings and cars back)
     {
-        vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1);
+        vec3 prom = vec3(0.20, 0.19, 0.175) * mix(0.85, 1.08, n1);
         float band = 1.0 - smoothstep(9.5, 10.0 + fw, sd);
-        lot = mix(lot, mix(prom, lawnC, smoothstep(4.0, 4.0 + fw, sd)), band * step(0.0, sd));
+        lot = mix(lot, mix(prom, lawnC, smoothstep(1.2, 1.2 + fw, sd)), band * step(0.0, sd));
     }
     // the canopy of the city's trees as the ground sees it from afar (where a crown is a pixel
     // or less): dark green clumps of ~20-60 m over the lots, as thick as the plan grows them
@@ -646,14 +649,14 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // the verge to the drive)
     const float D = 16.0;
     if (zone >= 2 && sd < D + 16.0 && sd > 0.0) {
-        vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
+        vec3 prom = vec3(0.20, 0.19, 0.175) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
         vec3 drive = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
         float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.0))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.4)));
         float wht = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 0.5))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 11.9)));
         drive = mix(drive, vec3(0.55, 0.42, 0.10), clamp(yel, 0.0, 1.0) * shown);
         drive = mix(drive, vec3(0.6, 0.6, 0.58), clamp(wht, 0.0, 1.0) * shown);
         vec3 wf = prom;
-        wf = mix(wf, lawnC, smoothstep(5.0, 5.0 + fw, sd));
+        wf = mix(wf, lawnC, smoothstep(1.5, 1.5 + fw, sd));
         wf = mix(wf, vec3(0.30, 0.29, 0.27), smoothstep(D - 0.3, D - 0.3 + fw, sd) * shown);
         wf = mix(wf, drive, smoothstep(D, D + fw, sd));
         wf = mix(wf, walk, smoothstep(D + 12.4, D + 12.4 + fw, sd));
@@ -828,7 +831,9 @@ void main() {
     bool seawall = water && cityNear(p) && (B.y < 0.6 || B.x > 0.08) && cityEdge(uvm) <= 1;
     if (seawall) depth = max(depth, 3.5);
     // (and everywhere in a city but its beaches: no bright shallow halo round every island)
-    if (water && cityNear(p) && cityEdge(uvm) != 3) depth = max(depth, 6.0);
+    // (a beach's shallows reach 12 m out, no more: the bay and the canals beyond are deep and
+    // murky, main.rgen)
+    if (water && cityNear(p) && (cityEdge(uvm) != 3 || sd < -12.0)) depth = max(depth, 6.0);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
     float band = max(2.5 * (0.4 + 1.2 * nW0), footprint * 1.5);
