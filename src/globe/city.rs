@@ -63,8 +63,8 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7520, lon: -80.2050, strength: 0.4, radius: 1200.0 },  // Coconut Grove side
         // the broad urban fields round them: Miami Beach mid-rise all along, the city round
         // downtown (walk-ups and apartment blocks rather than houses)
-        Core { lat: 25.8000, lon: -80.1320, strength: 0.4, radius: 2600.0 },  // Miami Beach
-        Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 3200.0 }, // downtown's fringe
+        Core { lat: 25.8000, lon: -80.1300, strength: 0.4, radius: 1800.0 },  // Miami Beach
+        Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 2400.0 }, // downtown's fringe
     ],
 }];
 
@@ -568,6 +568,13 @@ struct Placed {
     hy: f64,
 }
 
+/// How built-up the land cover says a place is, for the plan: in a Florida city the yards and
+/// street trees make much of the housing read as tree cover and grassland, so they count half
+/// (globe.rchit cityGround the same).
+fn urban_share(f: &[f32; lc::GROUPS]) -> f32 {
+    (f[4] + 0.5 * (f[lc::TREE] + f[lc::GRASS])).min(1.0)
+}
+
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (wx, wy) = to_world(x, y);
@@ -602,7 +609,7 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
     let dens = density(k, x0 + w * 0.5, y0 + h * 0.5);
     let built_at = |x: f64, y: f64| {
         let (la, lo) = to_lat_lon(k, x, y);
-        terrain.cover.fractions(la, lo, 40.0).map(|f| f[4]).unwrap_or(0.0)
+        terrain.cover.fractions(la, lo, 40.0).map(|f| urban_share(&f)).unwrap_or(0.0)
     };
     if z == 0 {
         // houses: two rows facing their streets
@@ -762,7 +769,7 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                 px = cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.3;
             }
             // (the waterfront drive runs along the water within WATERFRONT m: nothing built on it)
-            if near_water(k, terrain, px, py, hx.max(hy) * scale + WATERFRONT) {
+            if z >= 2 && near_water(k, terrain, px, py, hx.max(hy) * scale + WATERFRONT) {
                 continue;
             }
             if built_at(px, py) < if class == Class::Tower { 0.15 } else { 0.3 } {
@@ -1097,7 +1104,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
                     }
                     let bx = 2.2 + (st as f64 + 0.5) * 2.6 + (w - 4.4 - stalls as f64 * 2.6) * 0.5;
                     let (x, y) = (x0 + bx, y0 + by);
-                    if !free(x, y) || !buildable(k, terrain, x, y) || near_water(k, terrain, x, y, WATERFRONT) {
+                    if !free(x, y) || !buildable(k, terrain, x, y) || (z >= 2 && near_water(k, terrain, x, y, WATERFRONT)) {
                         continue;
                     }
                     let kind = (bh(i, j, 21_000 + n) % 5) as usize;
@@ -1382,7 +1389,7 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
         }
         let Some(d) = in_tile(k, x, y, id) else { continue };
         let (lat, lon) = lat_lon(d);
-        let built = terrain.cover.fractions(lat, lon, 30.0).map(|f| f[4]).unwrap_or(0.0);
+        let built = terrain.cover.fractions(lat, lon, 30.0).map(|f| urban_share(&f)).unwrap_or(0.0);
         if built < 0.25 || !buildable(k, terrain, x, y) {
             continue;
         }
@@ -1487,7 +1494,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         let list = if broad && !sp.city_trees.is_empty() { &sp.city_trees } else { &sp.palms };
         let Some(d) = in_tile(k, x, y, id) else { continue };
         let (lat, lon) = lat_lon(d);
-        if !buildable(k, terrain, x, y) || terrain.cover.fractions(lat, lon, 30.0).map(|f| f[4]).unwrap_or(0.0) < 0.2 {
+        if !buildable(k, terrain, x, y) || terrain.cover.fractions(lat, lon, 30.0).map(|f| urban_share(&f)).unwrap_or(0.0) < 0.2 {
             continue;
         }
         if tile.recs.len() >= MAX_PER_TILE {

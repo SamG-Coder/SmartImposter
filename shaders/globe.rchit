@@ -448,6 +448,14 @@ bool cityNear(vec3 p) {
     return dot(c, c) < gg.cityP.z * gg.cityP.z;
 }
 
+// What a city's shore is here, in stretches of a few hundred metres (Earth-fixed): 0 a
+// seawall, 1 riprap (rock armour), 2 a mangrove fringe, 3 a small sand beach. The land side
+// (below) and the water side (seawall: deep, no foam; the others shelve and lap) agree.
+int cityEdge(vec2 uvm) {
+    float e = fbmN(uvm * 0.004 + 211.0, 2) + 0.15 * fbmN(uvm * 0.02 + 5.0, 2) - 0.075;
+    return e < 0.47 ? 0 : e < 0.58 ? 1 : e < 0.7 ? 2 : 3;
+}
+
 float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, float sd, out vec3 alb) {
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
@@ -588,7 +596,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // other than houses, following the shoreline field: a paved promenade at the seawall, a
     // planted verge, two lanes with a double yellow line and white edge lines, a sidewalk; the
     // streets of the grid run into it
-    if (zone >= 1 && sd < 24.0 && sd > 0.0) {
+    if (zone >= 2 && sd < 24.0 && sd > 0.0) {
         vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
         vec3 drive = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
         float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.3))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - 13.7)));
@@ -724,7 +732,7 @@ void main() {
     }
     // in a city the water is held by seawalls (all but sand beaches and mangroves): deep right
     // up to the wall
-    bool seawall = water && cityNear(p) && (B.y < 0.6 || B.x > 0.08);
+    bool seawall = water && cityNear(p) && (B.y < 0.6 || B.x > 0.08) && cityEdge(uvm) <= 1;
     if (seawall) depth = max(depth, 3.5);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
@@ -739,11 +747,12 @@ void main() {
     } else if (cover || cityNear(p)) {
         // (in a city also where the land cover has no data: a former pond, the plan covers it)
         vec3 cityAlb;
-        float urban = cityGround(p, footprint, B.x, B.w, C.x, sdSmooth, cityAlb);
+        float urban = cityGround(p, footprint, min(B.x + 0.5 * (A.x + A.z), 1.0), B.w, C.x, sdSmooth, cityAlb);
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
         // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
         // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.
         float wall = cityNear(p) ? max(1.0 - smoothstep(0.55, 0.8, B.y), smoothstep(0.06, 0.18, B.x)) : 0.0;
+        int edge = cityNear(p) ? cityEdge(uvm) : 0;
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore * (1.0 - wall), biome, seaSide, ao);
         urban *= 1.0 - shore * (1.0 - wall);
         if (urban > 0.0) {
@@ -751,7 +760,33 @@ void main() {
             n = normalize(mix(n, up, urban));
             ao = mix(ao, 1.0, urban);
         }
-        if (wall > 0.0) {
+        if (wall > 0.0 && edge == 1) {
+            // riprap: a band of armour stone down to the water, boulders of a metre or so,
+            // each its own shade, dark gaps between them, wet and darker at the waterline
+            vec2 rq = uvm * 0.9;
+            vec2 rc = floor(rq);
+            float bh = fract(sin(dot(rc, vec2(12.9898, 78.233))) * 43758.5453);
+            vec2 rf = fract(rq) - 0.5;
+            float stone = smoothstep(0.5, 0.32, max(abs(rf.x), abs(rf.y)) + 0.12 * vnoise(uvm * 3.1));
+            vec3 rock = mix(vec3(0.20, 0.19, 0.17), vec3(0.36, 0.34, 0.30), bh) * mix(0.35, 1.0, mix(0.6, stone, 1.0 - smoothstep(0.3, 1.0, footprint)));
+            rock *= mix(0.55, 1.0, smoothstep(0.0, 1.2, sd));
+            float band = smoothstep(3.2 + footprint, 2.6, sd) * wall;
+            alb = mix(alb, rock, band);
+            ao = mix(ao, 0.75, band);
+        } else if (edge == 2) {
+            // a mangrove fringe: dense, dark, uneven green to the water
+            float band = smoothstep(7.0 + 3.0 * fbmN(uvm * 0.15, 2), 4.0, sd);
+            vec3 mg = vec3(0.022, 0.042, 0.016) * mix(0.6, 1.4, fbmN(uvm * 0.4 + 9.0, 3));
+            alb = mix(alb, mg, band);
+            ao = mix(ao, 0.6, band);
+        } else if (edge == 3) {
+            // a small beach: pale sand from the drive down to the water, wet and darker at the
+            // waterline
+            float band = smoothstep(9.0, 6.0, sd);
+            vec3 sand = vec3(0.46, 0.41, 0.32) * mix(0.9, 1.06, fbmN(uvm * 0.3 + 3.0, 2));
+            sand *= mix(0.62, 1.0, smoothstep(0.0, 1.5, sd));
+            alb = mix(alb, sand, band);
+        } else if (wall > 0.0) {
             // (a thin line: it fades out once it is under a pixel, never a bright outline)
             vec3 cap = vec3(0.23, 0.225, 0.21) * mix(0.85, 1.08, nW0);
             float thin = 1.0 - smoothstep(0.4, 1.2, footprint);
