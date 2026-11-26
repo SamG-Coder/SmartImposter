@@ -782,6 +782,15 @@ fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
     (urban_share(&f) + if pond { f[lc::WATER] } else { 0.0 }).min(1.0)
 }
 
+/// Places whose waterfront always has a group of towers (lat, lon, reach m): the west end
+/// of the beach by the canal mouth, and the islands across the bay.
+const TOWER_SPOTS: &[(f64, f64, f64)] = &[
+    (25.78599, -80.14275, 200.0),
+    (25.7840, -80.1620, 260.0),
+    (25.7790, -80.1700, 260.0),
+    (25.7935, -80.1600, 260.0),
+];
+
 /// Is block (i, j) of zone z a surface car park round its buildings? (A third of the walk-up
 /// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
 /// and shade trees.
@@ -843,11 +852,16 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     };
     // a waterfront mid-rise block now and then has a slender tower of 25-40 storeys at its
     // corner, as Miami's residential towers line its bay and river (its first lot)
-    // (they come in clusters: in two 3 x 3 block cells in five a few waterfront blocks have one,
+    // (they come in clusters: in three 3 x 3 block cells in five a few waterfront blocks have one,
     // elsewhere hardly any, so some islands have a few together and some none)
-    let cluster = bu(i.div_euclid(3), j.div_euclid(3), 8200) < 0.42;
+    let (bla, blo) = to_lat_lon(k, x0 + w * 0.5, y0 + h * 0.5);
+    let spot = TOWER_SPOTS.iter().any(|&(la, lo, r)| {
+        let (dn, de) = ((bla - la) * 110_540.0, (blo - lo) * 111_320.0 * la.to_radians().cos());
+        dn * dn + de * de < r * r
+    });
+    let cluster = spot || bu(i.div_euclid(3), j.div_euclid(3), 8200) < 0.6;
     let water_tower = z == 2
-        && bu(i, j, 8100) < if cluster { 0.28 } else { 0.04 }
+        && bu(i, j, 8100) < if spot { 0.6 } else if cluster { 0.28 } else { 0.04 }
         && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 70.0);
     let tower_cls: &[Class] = &[Class::Tower];
     if need > 0.0 && tallest(if water_tower { tower_cls } else { classes }) < need && tallest(classes) < need {
@@ -1015,13 +1029,32 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     // (a waterfront tower's block: four lots, the tower on one with its podium inside it)
     let (nx, ny) = if water_tower { (2, 2) } else { (nx, ny) };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
+    // (a tower block's tower stands on the lot farthest from the water: fewest water samples
+    // round its centre at 30 and 60 m)
+    let tower_lot: u32 = if water_tower {
+        (0..nx * ny)
+            .min_by_key(|&lot| {
+                let (lx, ly) = (lot % nx, lot / nx);
+                let (cx, cy) = (x0 + (lx as f64 + 0.5) * lw, y0 + (ly as f64 + 0.5) * lh);
+                (0..16)
+                    .flat_map(|n| [30.0, 60.0].map(|r| (n, r)))
+                    .filter(|&(n, r)| {
+                        let a = n as f64 * std::f64::consts::TAU / 16.0;
+                        water_at(k, terrain, cx + r * a.cos(), cy + r * a.sin())
+                    })
+                    .count()
+            })
+            .unwrap_or(0) as u32
+    } else {
+        0
+    };
     // (each model at most once in a block where another fits: no row of identical buildings)
     let mut used: Vec<usize> = Vec::new();
     for ly in 0..ny {
         for lx in 0..nx {
             let lot = (ly * nx + lx) as u32;
             // (the tower block's other lots are mid-rises: no second, squat tower beside it)
-            let class = if water_tower && lot == 0 {
+            let class = if water_tower && lot == tower_lot {
                 Class::Tower
             } else if water_tower {
                 Class::MidRise
@@ -1036,7 +1069,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 }
                 // (the waterfront's towers are residential: white balcony bands over a podium,
                 // where one fits)
-                if water_tower && lot == 0 && !r.slim {
+                if water_tower && lot == tower_lot && !r.slim {
                     continue;
                 }
                 // (outside the downtown cores a tower is an apartment tower, white banded, where

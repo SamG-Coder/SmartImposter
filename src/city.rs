@@ -491,9 +491,12 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 b.prism(&tank, y1 + 2.0, y1 + 4.6, m(EQUIP, 1), m(EQUIP, 2), true);
             }
             // a roof terrace: a timber deck behind a glass rail, a few planters
-            if !matches!(fac, Fac::Curtain { .. }) && ax > 10.0 && az > 8.0 && rng.f() < 0.4 {
-                let (dx0, dz0) = (lo.x + 0.5, lo.y + 0.5);
-                let (dx1, dz1) = (lo.x + ax * 0.45, lo.y + az * 0.55);
+            // (in the roof's own outline: a chamfered or rounded roof's bounding box corner is open)
+            let fits = |x0: f32, z0: f32, x1: f32, z1: f32| [Vec2::new(x0, z0), Vec2::new(x1, z0), Vec2::new(x1, z1), Vec2::new(x0, z1)].iter().all(|c| inside(&core, *c));
+            let (dx0, dz0) = (lo.x + 0.5, lo.y + 0.5);
+            let (dx1, dz1) = (lo.x + ax * 0.45, lo.y + az * 0.55);
+            // (the random draws as before, so the other buildings keep their roofs)
+            if !matches!(fac, Fac::Curtain { .. }) && ax > 10.0 && az > 8.0 && rng.f() < 0.4 && fits(dx0, dz0, dx1, dz1) {
                 b.bx(Vec3::new(dx0, y1, dz0), Vec3::new(dx1, y1 + 0.15, dz1), m(WOOD, 0), false);
                 let deck = [Vec2::new(dx0, dz0), Vec2::new(dx1, dz0), Vec2::new(dx1, dz1), Vec2::new(dx0, dz1)];
                 b.wall(deck[1], deck[2], y1 + 0.15, y1 + 1.15, 0.0, m(RAIL, 0), None);
@@ -506,8 +509,10 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 if ax > 16.0 && rng.f() < 0.7 {
                     let (px0, px1) = (lo.x + ax * 0.55, lo.x + ax * 0.55 + (ax * 0.4).min(12.0));
                     let (pz0, pz1) = (lo.y + 1.0, lo.y + 1.0 + (az * 0.4).min(5.0));
-                    b.bx(Vec3::new(px0 - 0.6, y1, pz0 - 0.6), Vec3::new(px1 + 0.6, y1 + 0.3, pz1 + 0.6), m(SLAB, 0), false);
-                    b.bx(Vec3::new(px0, y1 + 0.3, pz0), Vec3::new(px1, y1 + 0.32, pz1), m(POOL, 0), false);
+                    if fits(px0 - 0.6, pz0 - 0.6, px1 + 0.6, pz1 + 0.6) {
+                        b.bx(Vec3::new(px0 - 0.6, y1, pz0 - 0.6), Vec3::new(px1 + 0.6, y1 + 0.3, pz1 + 0.6), m(SLAB, 0), false);
+                        b.bx(Vec3::new(px0, y1 + 0.3, pz0), Vec3::new(px1, y1 + 0.32, pz1), m(POOL, 0), false);
+                    }
                 }
             }
         }
