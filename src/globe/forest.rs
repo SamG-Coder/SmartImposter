@@ -52,6 +52,9 @@ pub struct Species {
     pub deadwood: Vec<usize>,
     /// per variant: the biomes it grows in (bit = biomes.rs number; bit 0 = no biome data)
     pub biomes: Vec<u16>,
+    /// building archetypes for the cities (globe/city.rs), and the palms of their streets
+    pub buildings: Vec<super::city::ArchRef>,
+    pub palms: Vec<usize>,
 }
 
 /// Biomes an understory species belongs to (bit per biomes.rs number), by catalog name: desert
@@ -167,6 +170,7 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
     let (u0, v0, s) = id.uv();
     let edge = id.edge();
     let mut rng = Rng(hash(0xA5A5 ^ ((id.face as u64) << 56) ^ ((id.x as u64) << 24) ^ id.y as u64));
+    let mut blocks = super::city::Blocks::default();
     // (spacing m, layer): 0 shrubs, 1 ferns, 2 grass, 3 deadwood, 4 rocks
     for (spacing, layer) in [(3.4f64, 0u32), (2.1, 1), (2.3, 2), (6.0, 3), (5.0, 4)] {
         let n = (edge / spacing).ceil() as usize;
@@ -178,6 +182,9 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let (lat, lon) = lat_lon(d);
                 let Some(g) = terrain.cover.class_group(lat, lon) else { continue };
                 use super::landcover as lc;
+                if super::city::in_city(lat, lon) && blocks.blocked(lat, lon, &sp.buildings, terrain) {
+                    continue;
+                }
                 let biome = terrain.biome(lat, lon);
                 // deserts and dry scrub: dry grass only, and far fewer plants (mostly bare ground)
                 let arid = biome == b::DESERT;
@@ -466,7 +473,13 @@ impl Roles {
 pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> TreeTile {
     let center = id.center_dir() * R_EARTH;
     let mut tile = TreeTile { id, center, recs: Vec::new(), aabbs: Vec::new() };
-    if roles.is_empty() || terrain.cover.is_empty() {
+    if terrain.cover.is_empty() {
+        return tile;
+    }
+    // the city's buildings first (globe/city.rs); the trees keep out of its streets and buildings
+    super::city::grow(id, terrain, im, &mut tile);
+    let mut blocks = super::city::Blocks::default();
+    if roles.is_empty() {
         return tile;
     }
     let (u0, v0, s) = id.uv();
@@ -514,6 +527,9 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             if tree <= 0.0 || r_keep > tree as f64 * 0.95 {
                 continue;
             }
+            if super::city::in_city(lat, lon) && blocks.blocked(lat, lon, &im.buildings, terrain) {
+                continue;
+            }
             let h = terrain.height_at(lat, lon, spacing).max(0.0) as f64;
             // site: wet ground near water, altitude
             let wet = terrain.cover.fractions(lat, lon, 60.0).map(|g| g[super::landcover::WATER] + g[8]).unwrap_or(0.0);
@@ -545,7 +561,9 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let field = |sp: usize| (CONTRAST as f32 * (field_at(sp, sp as f64, fu, fv) - 0.5)).exp();
             let biome = terrain.biome(lat, lon);
             let Some(sp) = roles.pick(biome, alt, wet, cool, &field, rng.f() as f32) else { continue };
-            let vars = &im.species[sp].1;
+            // in a city most trees are palms
+            let r_palm = rng.f();
+            let vars = if !im.palms.is_empty() && r_palm < 0.75 && super::city::in_city(lat, lon) { &im.palms } else { &im.species[sp].1 };
             // variants run from old (large) to young: stands of an age, also as smooth bands
             let age = (field_at(im.species.len(), 101.0, fu, fv) as f64 * 1.3 - 0.15 + (rng.f() - 0.5) * 0.35).clamp(0.0, 0.999);
             let k = ((age.powf(1.7) * vars.len() as f64) as usize).min(vars.len() - 1); // mostly mature

@@ -15,6 +15,9 @@ pub enum Kind {
     Grass,
     /// Opaque scans without foliage: rocks, logs, snags, cacti (tools/fab_to_mtree.py solid)
     Rock,
+    /// Procedural building archetypes (city.rs): a facade material of their own (tri.rchit),
+    /// meshes much further out than plants, never thinned with distance
+    Building,
 }
 
 pub struct Species {
@@ -60,6 +63,11 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// Is this mesh one of the procedural buildings (city.rs)?
+    pub fn is_building_mesh(&self, mesh: usize) -> bool {
+        self.mesh_species.get(mesh).and_then(|&s| self.species.get(s as usize)).is_some_and(|s| s.kind == Kind::Building)
+    }
+
     /// Variants of the species whose name contains `key`.
     pub fn variants_of(&self, key: &str) -> Vec<usize> {
         self.species.iter().filter(|s| s.name.contains(key)).flat_map(|s| s.variants.clone()).collect()
@@ -171,6 +179,37 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
         });
     }
     Ok((pack, cat))
+}
+
+/// Append the procedural building archetypes (city.rs) as one more species, after the plants.
+pub fn add_buildings(pack: &mut TreePack, cat: &mut Catalog) {
+    let (p, archs) = crate::city::pack();
+    let si = cat.species.len();
+    let mesh_base = pack.meshes.len() as u32;
+    let first = pack.trees.len();
+    for (mut t, a) in p.trees.into_iter().zip(&archs) {
+        for part in &mut t.parts {
+            part.mesh += mesh_base;
+        }
+        // A building's mesh costs one instance, a plant's hundreds: the mesh band goes out to
+        // ~44 m x the LOD scale, 350 m for the tallest towers, where the impostor's texels are
+        // below a pixel and a half at 1440p.
+        let lod_scale = (a.height / 25.0).clamp(5.0, 10.0);
+        cat.variants.push(Variant { species: si, kind: Kind::Building, height: a.height, lod_scale, cull: 0.0, texel_scale: 1.0 });
+        pack.trees.push(t);
+    }
+    cat.mesh_species.extend(std::iter::repeat_n(si as u32, p.meshes.len()));
+    cat.mesh_alpha.extend(std::iter::repeat_n(false, p.meshes.len()));
+    pack.meshes.extend(p.meshes);
+    cat.species.push(Species {
+        name: "Buildings".into(),
+        kind: Kind::Building,
+        textures: [None, None, None, None],
+        leaf_tint: [0.5; 3],
+        bark_tint: [0.5; 3],
+        trans_tint: [0.0; 3],
+        variants: first..pack.trees.len(),
+    });
 }
 
 /// Ground layers in shader order (tri.rchit): Fab library folder name prefix of each Megascans

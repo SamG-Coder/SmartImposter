@@ -220,6 +220,7 @@ float traceShadow(vec3 o, vec3 d, float tmax, uint mask) {
 }
 
 void main() {
+    atmoHaze = 1.0 + g.city.y;
     uvec2 px = gl_LaunchIDEXT.xy;
     uvec2 size = gl_LaunchSizeEXT.xy;
     uint accumN = g.iparams.x;
@@ -374,7 +375,11 @@ void main() {
         bool lawn = (pl.flags & FLAG_LAWN) != 0u;
         bool terrain = mat == MAT_TERRAIN || lawn;
         float aoRange = terrain ? 30.0 : g.params.w;
-        if ((!imp || lawn) && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
+        // In a city (Globals.city.x) the buildings and the ground get one traced bounce of light
+        // instead (below): no AO rays there.
+        bool giOn = globe() && g.city.x > 0.5 && dbg == 0u && (profSkip & 2u) == 0u && pl.t < 8000.0
+                    && ((pl.flags & FLAG_BUILDING) != 0u || (mat == MAT_TERRAIN && (pl.flags & FLAG_WATER) == 0u));
+        if (!giOn && (!imp || lawn) && g.iparams.w > 0u && (profSkip & 2u) == 0u && pl.t < (terrain ? 600.0 : 150.0)) {
             float occ = 0.0;
             for (uint i = 0u; i < g.iparams.w; ++i) {
                 vec3 d2 = cosineSample(n, rng);
@@ -467,7 +472,46 @@ void main() {
             ground = skyUp * 0.25;
             amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
         }
-        col = direct + alb * amb * ao;
+        // the light from everything around (irradiance / PI): the sky model and AO, or in a city
+        // one traced bounce: a cosine-distributed ray, lit at what it hits by the sun (its own
+        // shadow ray) and the sky, or the sky's radiance where it escapes. Walls in shade take up
+        // the sunlit street and the towers across it; DLSS Ray Reconstruction averages the one
+        // sample per pixel.
+        vec3 indirect = amb * ao;
+        if (giOn) {
+            HitPayload keep = pl;
+            vec3 upW = normalize(gq);
+            vec3 d2 = cosineSample(nDir, rng);
+            if (dot(d2, ng) < 0.0) d2 = reflect(d2, ng);
+            vec3 o2 = p + ng * (0.02 + keep.t * 2e-4);
+            pl.t = -1.0;
+            pl.sunVis = 1.0;
+            pl.shadowMask = 0xFFu;
+            pl.trans = vec3(0.0);
+            pl.wdepth = 0.0;
+            pl.wlevel = 0.0;
+            pl.wfloor = 0.0;
+            traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, o2, 0.02, d2, 4000.0, 0);
+            vec3 Lin;
+            if (pl.t < 0.0) {
+                Lin = dot(d2, upW) > 0.0 ? globeSkyFrom(gq, d2) : skyUp * 0.25 / PI;
+                if (cloudsOn()) Lin *= 1.0 - 0.45 * cloudCover(cloudEarth(gq));
+            } else {
+                vec3 hp = o2 + d2 * pl.t;
+                vec3 hn = normalize(dot(pl.n, d2) > 0.0 ? -pl.n : pl.n);
+                vec3 hg = dot(pl.ng, d2) > 0.0 ? -pl.ng : pl.ng;
+                float hndl = dot(hn, L);
+                float hsh = hndl > 0.0 ? traceShadow(hp + hg * (0.02 + pl.t * 2e-4), L, 1.0e4, 0xFFu) * pl.sunVis : 0.0;
+                vec3 ha = pl.albedo;
+                if ((pl.flags & FLAG_BUILDING) != 0u) ha *= mix(1.0, 0.2, clamp(pl.trans.z, 0.0, 1.0));
+                if ((pl.flags & FLAG_WATER) != 0u) ha = vec3(0.02, 0.03, 0.035);
+                Lin = ha / PI * E * max(hndl, 0.0) * hsh + ha * skyUp * (0.6 + 0.4 * max(dot(hn, upW), 0.0)) / PI * pl.ao;
+            }
+            pl = keep;
+            // (on the scale of the sky model above: amb is PI x the zenith radiance)
+            indirect = Lin * PI * ao;
+        }
+        col = direct + alb * indirect;
         if (craftHit && dbg == 0u) {
             // The aircraft's paint and metal (aircraft.rchit: roughness, metal, emission): a GGX
             // sun highlight, and the sky above and the land below mirrored by how smooth the
@@ -508,6 +552,66 @@ void main() {
             gbAlb = diffA;
             gbRough = rough;
             gbSpec = max(envW.r, max(envW.g, envW.b));
+        }
+
+        if ((pl.flags & FLAG_BUILDING) != 0u && dbg == 0u) {
+            // A building (tri.rchit buildingHit, impostor.rchit): walls are matte; glass has a dark
+            // interior behind it and reflects by Fresnel, its coating tinting the reflection (the
+            // albedo is that tint). The reflection is traced (other towers, the bay, the sky),
+            // the sun's highlight is GGX.
+            float gls = clamp(pl.trans.z, 0.0, 1.0);
+            float rough = mix(0.85, 0.035, gls);
+            vec3 V = -dir;
+            float NdV = max(dot(nDir, V), 1e-3);
+            vec3 diffA = alb * mix(1.0, 0.07, gls);
+            vec3 F0 = mix(vec3(0.04), alb * 0.42, gls);
+            vec3 spec = vec3(0.0);
+            if (ndl > 0.0) {
+                vec3 H = normalize(L + V);
+                float NdH = max(dot(nDir, H), 0.0);
+                float a = rough * rough, a2 = a * a;
+                float dd = NdH * NdH * (a2 - 1.0) + 1.0;
+                float D = min(a2 / (PI * dd * dd), 400.0);
+                float k = a * 0.5;
+                float G = ndl / (ndl * (1.0 - k) + k) * NdV / (NdV * (1.0 - k) + k);
+                vec3 F = F0 + (1.0 - F0) * pow(1.0 - max(dot(H, V), 0.0), 5.0);
+                spec = E * F * (D * G / (4.0 * NdV)) * sh;
+            }
+            vec3 Fe = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdV, 5.0);
+            vec3 env = amb;
+            if (gls > 0.2) {
+                vec3 upW = globe() ? normalize(gq) : vec3(0.0, 1.0, 0.0);
+                vec3 R = reflect(dir, nDir);
+                vec3 org2 = p + ng * (0.05 + pl.t * 2e-4);
+                float tB = pl.t;
+                pl.t = -1.0;
+                pl.sunVis = 1.0;
+                pl.shadowMask = 0xFFu;
+                pl.trans = vec3(0.0);
+                traceRayEXT(tlas, gl_RayFlagsNoneEXT, 0xFF, 0, 0, 0, org2, 0.02, R, farRay(), 0);
+                if (pl.t < 0.0) {
+                    env = globe() ? globeSkyFrom(gq, R) : skyColor(R);
+                } else {
+                    vec3 rp = org2 + R * pl.t;
+                    vec3 rn = dot(pl.n, R) > 0.0 ? -pl.n : pl.n;
+                    vec3 rg = dot(pl.ng, R) > 0.0 ? -pl.ng : pl.ng;
+                    float rndl = dot(normalize(rn), L);
+                    float rsh = rndl > 0.0 ? traceShadow(rp + rg * (0.02 + pl.t * 2e-4), L, 1.0e4, 0xFFu) * pl.sunVis : 0.0;
+                    vec3 rA = (pl.flags & FLAG_BUILDING) != 0u ? pl.albedo * mix(1.0, 0.25, clamp(pl.trans.z, 0.0, 1.0)) : pl.albedo;
+                    env = rA / PI * E * max(rndl, 0.0) * rsh + rA * mix(ground, skyUp, dot(normalize(rn), upW) * 0.5 + 0.5) * pl.ao;
+                    if ((pl.flags & FLAG_WATER) != 0u) env = env * 0.3 + (globe() ? globeSkyFrom(gq, reflect(R, upW)) : skyColor(reflect(R, upW))) * 0.1;
+                    if (globe()) {
+                        vec3 Tr;
+                        vec3 S = atmosphere(gq, R, pl.t, L, g.sunDir.w, Tr);
+                        env = env * Tr + S;
+                    }
+                }
+                pl.t = tB;
+            }
+            col = diffA / PI * E * max(ndl, 0.0) * sh + diffA * indirect + spec + env * Fe;
+            gbAlb = diffA;
+            gbRough = rough;
+            gbSpec = max(Fe.r, max(Fe.g, Fe.b));
         }
 
         if (water && dbg == 0u) {

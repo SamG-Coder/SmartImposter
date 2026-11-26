@@ -866,6 +866,59 @@ The model as Blender renders it (`tools/make_f16.py --renders`):
   path. Inside a thick deck that tube is what keeps the aircraft in sight of the chase camera;
   the lane it leaves in thin or broken cloud is subtle.
 
+**Cities (`--globe`, work in progress).** A procedural city laid over a real place, drawn with
+the same impostor system as the trees. The first one is Miami (`--globe --at 25.790,-80.140,150,250,-8`
+looks west across Biscayne Bay at downtown):
+
+```
+cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20:00
+```
+
+- **Buildings as impostor variants** (`src/city.rs`). 41 archetypes are generated in code as real
+  geometry: glass office towers (curtain walls with mullion fins and floor bands, setbacks, podium
+  garages, mechanical crowns, masts), residential towers (slab balconies with glass rails, white
+  bands), office blocks with ribbon windows, stucco apartment blocks with recessed windows, shops,
+  hip-roofed and flat-roofed houses, parking garages, with parapets and rooftop plant. Each is a
+  variant of a species of its own (`catalog.rs` `Kind::Building`): baked into a hemi-octahedral
+  atlas like a tree (frames up to 768 texels, 4.5 cm x the LOD scale), placed by plant records in
+  the tree tiles, its mesh within 220-440 m (LOD scale 5-10, by height), never thinned with
+  distance, so the skyline stays whole to the horizon. Seen from the side and from above, which is
+  how a city is seen, the upper-hemisphere atlas holds up: walls and roofs are flat and the parallax
+  march puts them where they are.
+- **Facades** (`shaders/building.rchit`, its own hit records, so the plants' atlases are not
+  re-baked when it changes). Material ids and palettes per triangle; texture coordinates are facade
+  cells (window column, storey), so each window has its own tint and reflectivity, mullions and
+  spandrels are drawn where a pixel resolves them and averaged beyond. Glass reflects: `main.rgen`
+  traces the reflection (the other towers, the bay, the sky) with Fresnel and the coating's tint, a
+  dark interior behind it and a GGX sun highlight. The bake has no channel for glass, so it is
+  carried in the length of the baked normal (the "normal spread", ~1 on flat facades anyway) and
+  read back by `impostor.rchit`.
+- **The plan** (`src/globe/city.rs`). A street grid on the city's tangent plane: arterials (22 m,
+  every 6th / 5th street) and residential streets (14 m), blocks zoned by how close they are to the
+  downtown cores (towers, office and apartment blocks, shops and walk-ups, houses), lots cut per
+  zone. Every choice is an integer hash of the block and lot numbers, so any tile works out its own
+  buildings, the trees keep out of streets and footprints, and the terrain shader
+  (`globe.rchit cityGround`) draws the same plan on the ground: asphalt with lane paint, zebra
+  crossings at the arterials, sidewalks with kerbs and verges, houses in rows facing their streets
+  with lawns, driveways, patios, hedges and pools, shops on parking lots with stall lines, plazas
+  with planters downtown. Buildings, streets and lots go only where the 10 m land cover says the
+  ground is built up and dry, so the real coast, bay and islands shape the city. The 30 m elevation
+  is a surface model with the real city's buildings in it: inside the city the ground is capped to
+  the plain under them.
+- **Light** (near a city, `Globals.city`): one traced bounce of light for the buildings and the
+  ground instead of AO (a cosine ray, lit by the sun with its own shadow ray and the sky, or the
+  sky where it escapes; DLSS Ray Reconstruction averages it), so walls in shade take up the sunlit
+  street and the towers across it; humid coastal haze (5x the clear-day aerosol, `atmoHaze` in
+  `atmosphere.glsl`): the skyline a pale silhouette a few kilometres out, the sun warmer; a softer
+  tone curve (lifted toe, a little less saturation, warm highlights). `SI_CITY_GI=0`,
+  `SI_CITY_HAZE=<x>` and `SI_CITY_GRADE=0` turn them off or change them for comparisons.
+- **Palms** line the sidewalks (whole streets with or without), and three in four of the trees the
+  land cover puts in the city are palms.
+- **Still to do**: Florida broadleaf trees instead of the temperate stand-ins and trees in the
+  yards; seawalls, docks and calm water in canals and the bay; boats and their wakes; more varied
+  massing and materials (white concrete towers, podiums filling the lots, a height profile with a
+  peak); cars on the streets and in the parking lots; bridges.
+
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.
 
@@ -1111,10 +1164,12 @@ src/
   flight.rs     the flight model: atmosphere, forces, engine, fly-by-wire control laws
   pilot.rs      keys to stick and throttle, the chase / cockpit / fly-by cameras, the wake
   gamepad.rs    a game controller for the test flight (PlayStation over HID, the rest through gilrs)
+  city.rs       procedural building archetypes (towers, apartments, offices, shops, houses, garages)
   globe/        the 1:1 Earth as a mode of the renderer:
     scene.rs      streaming, pooled GPU storage, BLAS builds in the frame, TLAS instances
     tiles.rs      cube-sphere quadtree, tile meshes, shoreline fields
     forest.rs     tree and understory tiles, species by biome
+    city.rs       cities: the street plan, zones and lots, buildings and palms placed in the tree tiles
     ocean.rs      the FFT sea (spectrum, cascades, whitecaps) on its own thread
     sky.rs        UTC clock, sun and moon positions, moonlight
     etopo.rs / dem.rs / landcover.rs / biomes.rs   the data readers
@@ -1123,7 +1178,7 @@ native/
 shaders/
   main.rgen (+ SER variant)  bake.rgen  tri.rchit  tri.rahit  impostor.rint  impostor.rchit
   miss.rmiss  shadow.rmiss  taa.comp  resolve.comp  sharpen.comp  mip.comp  bcenc.comp
-  globe.rchit  aircraft.rchit  aircraft.rahit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl,
+  globe.rchit  aircraft.rchit  aircraft.rahit  building.rchit  (+ rt.glsl, globals.glsl, shared.glsl, lawn.glsl,
   lawnh.glsl, globe.glsl, atmosphere.glsl, clouds.glsl, aircraft.glsl)
 tools/   asset converters, the Earth data downloader, comparisons, tour recording (see Tools)
 tours/   tour files for --tour

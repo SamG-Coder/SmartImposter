@@ -11,6 +11,7 @@ mod biome;
 mod asset;
 mod bc7;
 mod catalog;
+mod city;
 mod cloudnoise;
 mod dlss;
 mod erosion;
@@ -498,7 +499,11 @@ impl App {
             std::env::set_var("SI_DUMP_ATLAS", prefix);
         }
         let t = Instant::now();
-        let (pack, cat) = catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?;
+        let (mut pack, mut cat) = catalog::load("assets/species", &a.asset, "assets/textures", a.species.as_deref())?;
+        // the globe's cities: procedural building archetypes, baked and placed like plants
+        if a.globe {
+            catalog::add_buildings(&mut pack, &mut cat);
+        }
         let tris: usize = pack.meshes.iter().map(|m| m.tri_count() as usize).sum();
         println!(
             "Catalog: {} species, {} variants, {} unique meshes, {:.1}M unique triangles",
@@ -1133,6 +1138,15 @@ impl App {
             cloud: [self.args.cloud_cover, if s.clouds { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
             biome: biome::current().ground_packed(),
             lawn: [[0.0; 4]; 4], // (set by the renderer)
+            // near a city: its bounce light, humid coastal haze and tone curve (SI_CITY_GI=0,
+            // SI_CITY_HAZE=<extra aerosol, x clear day> to compare)
+            city: match s.geo.as_ref().and_then(|geo| globe::city::shader_city(geo.ecef)) {
+                Some(_) => {
+                    let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+                    [env("SI_CITY_GI", 1.0), env("SI_CITY_HAZE", 4.0), env("SI_CITY_GRADE", 1.0), 0.0]
+                }
+                None => [0.0; 4],
+            },
             ..Default::default()
         };
         if let (Some(p), Some(geo)) = (s.pilot.as_mut(), s.geo.as_ref()) {

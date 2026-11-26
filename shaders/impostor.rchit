@@ -25,6 +25,22 @@ void main() {
 
     // Baked visibility: x = a, y = length of the averaged normal, z = b.y (see bake.rgen).
     vec4 v = unpackUnorm4x8(hit.vis);
+    if (imps[vid].bmin.w > 2.5) {
+        // A building (city.rs): facades and roofs are flat, so the normal is the surface's. How
+        // much of the texel is glass was baked into the normal's length (building.rchit): the
+        // spread is 1 - 0.5 glass (main.rgen reflects it).
+        float skyVisB = clamp(v.x + (2.0 / 3.0) * (v.z - 0.5) * 3.0, 0.0, 1.0);
+        pl.albedo = alb;
+        pl.t = gl_HitTEXT;
+        pl.n = n;
+        pl.ng = n;
+        pl.flags = FLAG_IMPOSTOR | MAT_BUILDING | FLAG_BUILDING;
+        pl.ao = a.a * mix(0.75, 1.0, skyVisB);
+        pl.sunVis = 1.0;
+        pl.trans = vec3(0.0, 0.0, clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0));
+        pl.shadowMask = 0xFFu;
+        return;
+    }
 
     pl.albedo = alb * treeTint(plantSeed(pr), leafiness);
     pl.albedo = mix(pl.albedo, dryTint(pl.albedo, plantDry(pr)), leafiness);

@@ -88,6 +88,10 @@ pub struct Globals {
     pub wake: [[f32; 4]; WAKE_POINTS],
     /// x condensation trail left there 0..1, y how much the air was stirred there 0..1
     pub wake_b: [[f32; 4]; WAKE_POINTS],
+    /// Globe, near a city (globe/city.rs): x 1 = one traced bounce of light on the buildings and
+    /// the ground (main.rgen), y extra coastal haze (atmosphere.glsl atmoHaze - 1), z 1 = the
+    /// softer tone curve (resolve.comp), w unused
+    pub city: [f32; 4],
 }
 
 /// Points of the aircraft's wake kept for the shaders (globals.glsl).
@@ -159,6 +163,15 @@ struct MeshInfoGpu {
 const MESH_ALPHA_TESTED: u32 = 1;
 /// Mesh flag: the lawn tile's blades (tri.rchit colours them itself).
 const MESH_LAWN_BLADE: u32 = 2;
+/// Mesh flag: a procedural building (city.rs): its material bytes are facade materials.
+const MESH_BUILDING: u32 = 4;
+/// Hit records of the buildings' meshes (city.rs): opaque, and dissolving in the LOD band.
+const SBT_BUILDING: u32 = 5;
+const SBT_BUILDING_BAND: u32 = 6;
+
+/// Building impostors may use frames up to this many texels: a 250 m tower at the plants' 448
+/// would have 0.6 m texels.
+const BUILDING_MAX_RES: u32 = 768;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -681,6 +694,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         gpu.shader_module(spv!("globe.rchit"))?,
         gpu.shader_module(spv!("aircraft.rchit"))?,
         gpu.shader_module(spv!("aircraft.rahit"))?,
+        gpu.shader_module(spv!("building.rchit"))?,
     ];
     let kinds = [
         vk::ShaderStageFlags::RAYGEN_KHR,
@@ -693,6 +707,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::CLOSEST_HIT_KHR,
         vk::ShaderStageFlags::ANY_HIT_KHR,
+        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
     ];
     let stages: Vec<_> = modules
         .iter()
@@ -710,7 +725,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     let u = vk::SHADER_UNUSED_KHR;
     // Hit records (instance SBT offset): 0 opaque triangles, 1 impostor AABBs,
     // 2 triangles of trees inside the mesh <-> impostor band (any-hit dissolve), 3 globe terrain,
-    // 4 the aircraft (its glass is seen through by the any-hit).
+    // 4 the aircraft (its glass is seen through by the any-hit), 5 buildings (building.rchit),
+    // 6 buildings inside the mesh <-> impostor band (any-hit dissolve).
     let groups = [
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 0, u, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::GENERAL, 1, u, u, u),
@@ -720,6 +736,8 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 3, 6, u),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 7, u, u),
         group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 8, 9, u),
+        group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 10, u, u),
+        group(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP, u, 10, 6, u),
     ];
     let info = vk::RayTracingPipelineCreateInfoKHR::default()
         .stages(&stages)
@@ -741,15 +759,15 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
     let ba = gpu.rt.base_alignment as u64;
     let off_miss = align_up(stride, ba);
     let off_hit = align_up(off_miss + 2 * stride, ba);
-    let total = off_hit + 5 * stride;
-    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 8, 8 * hs as usize)? };
+    let total = off_hit + 7 * stride;
+    let handles = unsafe { gpu.rt_fn.get_ray_tracing_shader_group_handles(pipe, 0, 10, 10 * hs as usize)? };
     let mut sbt = gpu.create_buffer(total + ba, vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR, MemoryLocation::CpuToGpu, "sbt")?;
     let base = align_up(sbt.addr, ba);
     let shift = (base - sbt.addr) as usize;
     {
         let m = sbt.mapped();
         for (group, off) in
-            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride), (7, off_hit + 4 * stride)]
+            [(0usize, 0u64), (1, off_miss), (2, off_miss + stride), (3, off_hit), (4, off_hit + stride), (5, off_hit + 2 * stride), (6, off_hit + 3 * stride), (7, off_hit + 4 * stride), (8, off_hit + 5 * stride), (9, off_hit + 6 * stride)]
         {
             let dst = shift + off as usize;
             m[dst..dst + hs as usize].copy_from_slice(&handles[group * hs as usize..(group + 1) * hs as usize]);
@@ -760,7 +778,7 @@ fn create_rt_pipeline(gpu: &Gpu, layout: vk::PipelineLayout, rgen: &[u8]) -> Res
         pipe,
         rgen: region(0, stride),
         miss: region(off_miss, 2 * stride),
-        hit: region(off_hit, 5 * stride),
+        hit: region(off_hit, 7 * stride),
         _sbt: sbt,
     })
 }
@@ -878,6 +896,8 @@ impl Renderer {
                 // a grid mesh (the terrain): its index buffer is only BLAS build input
                 let grid = all_meshes[i].grid;
                 let alpha = if catalog.mesh_alpha.get(i).copied().unwrap_or(false) { MESH_ALPHA_TESTED } else { 0 };
+                let building = catalog.mesh_species.get(i).and_then(|&s| catalog.species.get(s as usize)).is_some_and(|s| s.kind == crate::catalog::Kind::Building);
+                let alpha = alpha | if building && i < pack.meshes.len() { MESH_BUILDING } else { 0 };
                 MeshInfoGpu {
                     addr: [m.pos.addr, m.nrm.addr, if grid == 0 { m.idx.addr } else { 0 }, m.mat.addr, m.uv.addr],
                     tex_set: catalog.mesh_species.get(i).copied().unwrap_or(0),
@@ -989,7 +1009,8 @@ impl Renderer {
             let r = (t.bmax - t.bmin).length() * 0.5;
             // The square frame of the bounding sphere sets the texel size; the frame that is baked
             // and kept is that square cropped to the plant.
-            let square = imp.res_for(r / vi.texel_scale, vi.lod_scale);
+            let building = vi.kind == crate::catalog::Kind::Building;
+            let square = if building { ImpostorSettings { max_res: BUILDING_MAX_RES.max(imp.max_res), ..imp }.res_for(r, vi.lod_scale) } else { imp.res_for(r / vi.texel_scale, vi.lod_scale) };
             let mips = atlas_mips(square);
             let texels = square as f32 / (2.0 * r);
             let (res, crop) = frame_res(square, mips, reach[v].0 * texels, reach[v].1 * texels);
@@ -1005,6 +1026,8 @@ impl Renderer {
                     match vi.kind {
                         crate::catalog::Kind::Grass | crate::catalog::Kind::Plant => 1.0,
                         crate::catalog::Kind::Rock => 2.0,
+                        // 3 = a building (impostor.rchit: facade, glass; impostor.rint: no thinning)
+                        crate::catalog::Kind::Building => 3.0,
                         _ => 0.0,
                     },
                 ],
@@ -1030,6 +1053,8 @@ impl Renderer {
                 let m = &pack.meshes[p.mesh as usize];
                 k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
             });
+            // (building variants: their hit shader too; the plants' keys stay as they were)
+            let mesh_key = if building { mesh_key.bytes(spv!("building.rchit")) } else { mesh_key };
             let key = mesh_key.u64(square as u64).u64(res[0] as u64).u64(res[1] as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
             let path = crate::atlas::path_for(&t.name, key);
             let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, square, crop, skip, key, path, base, full: None, loading: false, upload: None, wanted: 0 };
@@ -1522,6 +1547,18 @@ impl Renderer {
                         _ => {}
                     }
                 }
+                // the building archetypes (city.rs) for the city plan (globe/city.rs)
+                for s in r.catalog.species.iter().filter(|s| s.kind == crate::catalog::Kind::Building) {
+                    for v in s.variants.clone() {
+                        let t = &r.pack.trees[v];
+                        sp.buildings.push(crate::globe::city::ArchRef {
+                            variant: v,
+                            class: crate::city::class_of(&t.name),
+                            size: [t.bmax.x - t.bmin.x, t.bmax.z - t.bmin.z],
+                            height: t.bmax.y,
+                        });
+                    }
+                }
                 if sp.dry_grass.is_empty() {
                     sp.dry_grass = sp.grass.clone();
                 }
@@ -1543,7 +1580,7 @@ impl Renderer {
                 r.globe = Some(crate::globe::scene::GlobeScene::new(&r.gpu, terrain, sp)?);
             }
             None => {
-                let ubo = r.gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe placeholder")?;
+                let ubo = r.gpu.create_buffer(512, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe placeholder")?;
                 let buf = r.gpu.create_buffer(16, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "globe placeholder")?;
                 let img = crate::textures::upload_with_mips(&r.gpu, 1, 1, &[0, 0, 0, 0], vk::Format::R8G8B8A8_UNORM, "globe placeholder")?;
                 r.globe_dummy = Some((ubo, buf, img));
@@ -1998,7 +2035,7 @@ impl Renderer {
                     .iter()
                     .map(|p| {
                         let alpha = self.catalog.mesh_alpha.get(p.mesh as usize).copied().unwrap_or(false);
-                        let (f, sbt) = if alpha { (alpha_flags, 2) } else { (flags, 0) };
+                        let (f, sbt) = if alpha { (alpha_flags, 2) } else if self.catalog.is_building_mesh(p.mesh as usize) { (flags, SBT_BUILDING) } else { (flags, 0) };
                         accel::make_instance(&p.xform, p.mesh, 0xFF, sbt, f, self.blas[p.mesh as usize].addr)
                     })
                     .collect(),
@@ -2921,6 +2958,7 @@ impl Renderer {
                     for (pi, p) in pack.trees[v].parts.iter().enumerate() {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
+                        let sbt = if catalog.is_building_mesh(p.mesh as usize) { if sbt == 0 { SBT_BUILDING } else { SBT_BUILDING_BAND } } else { sbt };
                         insts.push(accel::make_instance(&(plant * p.xform), p.mesh | seed, 1, sbt, flags, blas[p.mesh as usize].addr));
                         inst_data.push(InstInfo { center: center.to_array(), data, flags: iflags | (pi as u32) << INST_PART_SHIFT });
                     }
@@ -3022,6 +3060,15 @@ impl Renderer {
                     / (1u64 << crate::globe::forest::TREE_LEVEL) as f64) as f32,
                 scene.range as f32,
             ];
+            if let Some((ecef, rot, _)) = self.globe_view {
+                if let Some(c) = crate::globe::city::shader_city(ecef) {
+                    let v = |x: glam::DVec3| {
+                        let r = (rot * x).as_vec3();
+                        [r.x, r.y, r.z, 0.0]
+                    };
+                    (gg.city_o, gg.city_e, gg.city_n, gg.city_p, gg.city_cores) = (v(c.centre - ecef), v(c.east), v(c.north), c.params, c.cores);
+                }
+            }
             scene.write_globals(&gg);
             self.upload_pending = true;
         }
@@ -3112,7 +3159,7 @@ impl Renderer {
                     vk::PipelineStageFlags2::COMPUTE_SHADER,
                     vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
                 );
-                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), (globals.params[2] * self.fade).to_bits(), (globals.iparams[1] == 0) as u32];
+                let push: [u32; 4] = [1.0f32.to_bits(), 1.0f32.to_bits(), (globals.params[2] * self.fade).to_bits(), if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 } else { 1 }];
                 d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
                 d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.dlss_resolve_set], &[]);
                 d.cmd_push_constants(cb, self.resolve_layout, vk::ShaderStageFlags::COMPUTE, 0, bytemuck::cast_slice(&push));
@@ -3147,7 +3194,7 @@ impl Renderer {
                 (rw as f32 / w as f32).to_bits(),
                 1.0f32.to_bits(), // history is already an average
                 (globals.params[2] * self.fade).to_bits(),
-                (globals.iparams[1] == 0) as u32,
+                if globals.iparams[1] != 0 { 0 } else if globals.city[2] > 0.5 { 2 } else { 1 },
             ];
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_pipe);
             d.cmd_bind_descriptor_sets(cb, vk::PipelineBindPoint::COMPUTE, self.resolve_layout, 0, &[self.resolve_sets[p]], &[]);

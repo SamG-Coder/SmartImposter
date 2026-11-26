@@ -13,6 +13,8 @@
 #define FLAG_GLOSSY 1024u // waxy leaf top: gets a specular sun highlight
 #define FLAG_SEA 4096u    // globe: the water is sea (deep blue, salt), not a lake or river
 #define FLAG_LAWN 8192u   // a blade of the lawn (lawn.glsl): an impostor hit on the ground
+#define MAT_BUILDING 5u
+#define FLAG_BUILDING 32768u // a building (city.rs, tri.rchit buildingHit): payload trans.z = how much is glass
 #define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64

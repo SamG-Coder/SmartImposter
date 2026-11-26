@@ -355,6 +355,170 @@ vec3 landAlbedo(float lat, float elev, float slope) {
     return mix(c, vec3(0.78, 0.8, 0.84), ice);
 }
 
+// ---- the city's ground (globe/city.rs): the plan's streets, zones and lots on the city's
+// tangent plane, worked out with the same integer hashes as the CPU plan (keep in step with
+// city.rs PLAN). Arterials (every 6th street north-south, every 5th east-west) are 22 m with
+// double yellow centre lines, dashed lanes and zebra crossings; the other streets are 14 m, two
+// lanes and no paint. Between them the lots by zone: houses in two rows facing their streets
+// (lawn, driveway, a pool in some back yards, hedges), shops on asphalt parking with stall
+// lines, office and apartment blocks on parking or plazas, towers on plazas with planters.
+// Returns how much of the ground the city covers here (0 outside it, on water, wetland or at
+// the shore); `alb` takes its surface.
+uint cHash(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    return x ^ (x >> 16);
+}
+uint cBh(int i, int j, uint s) { return cHash(uint(i) * 0x9E3779B1u ^ cHash(uint(j) + s * 0x85EBCA6Bu)); }
+float cBu(int i, int j, uint s) { return float(cBh(i, j, s) >> 8) / 16777216.0; }
+int cMod(int i, int m) { return i - m * int(floor(float(i) / float(m))); }
+bool cArtX(int i) { return cMod(i, 6) == 0; }
+bool cArtY(int j) { return cMod(j, 5) == 0; }
+float cHalf(bool a) { return a ? 11.0 : 7.0; }
+float cSide(bool a) { return a ? 4.0 : 3.0; }
+float cDensity(vec2 c) {
+    float d = 0.0;
+    for (int k = 0; k < int(gg.cityP.w); ++k) {
+        vec4 core = gg.cityCores[k];
+        vec2 q = c - core.xy;
+        d = max(d, core.z * exp(-dot(q, q) / (core.w * core.w)));
+    }
+    return d;
+}
+// a filtered box: 1 inside [lo, hi] (per axis), soft over the pixel footprint
+float cBox(vec2 p, vec2 lo, vec2 hi, float fw) {
+    vec2 a = smoothstep(lo - fw, lo + fw, p) * (1.0 - smoothstep(hi - fw, hi + fw, p));
+    return a.x * a.y;
+}
+
+float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, out vec3 alb) {
+    alb = vec3(0.0);
+    if (gg.cityP.z <= 0.0) return 0.0;
+    vec3 v = p - gg.cityO.xyz;
+    vec2 c = vec2(dot(v, gg.cityE.xyz), dot(v, gg.cityN.xyz));
+    float r = length(c);
+    if (r > gg.cityP.z) return 0.0;
+    float BX = gg.cityP.x, BY = gg.cityP.y;
+    int i = int(floor(c.x / BX)), j = int(floor(c.y / BY));
+    vec2 f = c - vec2(float(i) * BX, float(j) * BY);
+    // the nearest street lines and how far from them
+    int li = f.x < 0.5 * BX ? i : i + 1, lj = f.y < 0.5 * BY ? j : j + 1;
+    vec2 e = vec2(min(f.x, BX - f.x), min(f.y, BY - f.y));
+    bool ax = cArtX(li), ay = cArtY(lj);
+    vec2 hw = vec2(cHalf(ax), cHalf(ay));
+    vec2 road = hw - vec2(cSide(ax), cSide(ay));
+    float fw = max(footprint, 0.03);
+    float inRX = 1.0 - smoothstep(road.x - fw, road.x + fw, e.x);
+    float inRY = 1.0 - smoothstep(road.y - fw, road.y + fw, e.y);
+    float inSX = 1.0 - smoothstep(hw.x - fw, hw.x + fw, e.x);
+    float inSY = 1.0 - smoothstep(hw.y - fw, hw.y + fw, e.y);
+    float roadW = max(inRX, inRY), streetW = max(inSX, inSY);
+    float n1 = fbmN(c * 0.12, 3), n2 = fbmN(c * 0.9 + 7.0, 2), n3 = fbmN(c * 0.02 + 3.0, 2);
+    float shown = 1.0 - smoothstep(0.25, 0.8, fw); // can a pixel show paint and joints?
+
+    // ---- streets
+    vec3 asphalt = vec3(0.075, 0.075, 0.078) * mix(0.8, 1.2, n1) * mix(0.92, 1.08, n2) * mix(0.85, 1.12, n3);
+    {
+        float only = 1.0 - min(inRX, inRY); // not in the crossing itself
+        float yel = 0.0, wht = 0.0;
+        if (ax) {
+            yel = max(yel, (1.0 - smoothstep(0.06, 0.06 + fw, abs(e.x - 0.2))) * inRX * only);
+            wht = max(wht, (1.0 - smoothstep(0.06, 0.06 + fw, abs(e.x - road.x * 0.5))) * step(fract(c.y / 9.0), 0.35) * inRX * only);
+        }
+        if (ay) {
+            yel = max(yel, (1.0 - smoothstep(0.06, 0.06 + fw, abs(e.y - 0.2))) * inRY * only);
+            wht = max(wht, (1.0 - smoothstep(0.06, 0.06 + fw, abs(e.y - road.y * 0.5))) * step(fract(c.x / 9.0), 0.35) * inRY * only);
+        }
+        // zebra crossings where an arterial is involved; stop bars on the side streets
+        if (ax || ay) {
+            wht = max(wht, inRX * step(road.y + 0.6, e.y) * step(e.y, road.y + 3.4) * step(fract(e.x / 1.0), 0.5));
+            wht = max(wht, inRY * step(road.x + 0.6, e.x) * step(e.x, road.x + 3.4) * step(fract(e.y / 1.0), 0.5));
+        }
+        float amt = max(yel, wht) * shown * mix(0.7, 1.0, n2);
+        asphalt = mix(asphalt, yel > wht ? vec3(0.55, 0.42, 0.10) : vec3(0.6, 0.6, 0.58), amt);
+        asphalt += vec3(0.012) * (1.0 - shown) * (ax || ay ? 1.0 : 0.0);
+    }
+    vec2 sj = abs(fract(c / 1.5) - 0.5);
+    float joint = (1.0 - smoothstep(0.46, 0.5, max(sj.x, sj.y))) * shown;
+    vec3 walk = vec3(0.21, 0.205, 0.195) * mix(0.8, 1.1, n1) * mix(1.0, 0.86, 1.0 - joint);
+    float curb = max((1.0 - smoothstep(0.0, 0.25 + fw, abs(e.x - road.x))) * inSX, (1.0 - smoothstep(0.0, 0.25 + fw, abs(e.y - road.y))) * inSY);
+    walk = mix(walk, vec3(0.30, 0.295, 0.28), curb * shown);
+    // a strip of grass between the kerb and the walk on the residential streets
+    float verge = (!ax ? (1.0 - smoothstep(road.x + 1.4, road.x + 1.4 + fw, e.x)) * inSX : 0.0) + (!ay ? (1.0 - smoothstep(road.y + 1.4, road.y + 1.4 + fw, e.y)) * inSY : 0.0);
+    // lawn: St Augustine grass, patchy, browner where it dries out, darker in tufts
+    float nl = fbmN(c * 0.3 + 5.0, 3), nd = fbmN(c * 0.07 + 13.0, 3);
+    vec3 lawnC = mix(vec3(0.062, 0.085, 0.030), vec3(0.105, 0.098, 0.052), smoothstep(0.45, 0.8, nd)) * mix(0.72, 1.18, nl) * mix(0.88, 1.08, fbmN(c * 2.1 + 9.0, 2));
+    walk = mix(walk, lawnC, clamp(verge, 0.0, 1.0) * (1.0 - curb));
+
+    // ---- the block's lots
+    float hx0 = cHalf(cArtX(i)), hx1 = cHalf(cArtX(i + 1)), hy0 = cHalf(cArtY(j)), hy1 = cHalf(cArtY(j + 1));
+    vec2 b = f - vec2(hx0, hy0);
+    float W = BX - hx0 - hx1, H = BY - hy0 - hy1;
+    vec2 bc = vec2(float(i) * BX + hx0 + 0.5 * W, float(j) * BY + hy0 + 0.5 * H);
+    float dz = cDensity(bc) + (cBu(i, j, 1u) - 0.5) * 0.12;
+    int zone = dz > 0.5 ? 3 : dz > 0.28 ? 2 : dz > 0.1 ? 1 : 0;
+    vec3 pave = vec3(0.15, 0.145, 0.135) * mix(0.82, 1.1, n1);
+    vec2 tj = abs(fract(c / vec2(1.2, 0.6)) - 0.5);
+    vec3 plaza = vec3(0.175, 0.165, 0.15) * mix(0.82, 1.1, n1) * mix(0.9, 1.06, n3) * mix(1.0, 0.9, (1.0 - smoothstep(0.44, 0.5, max(tj.x, tj.y))) * shown);
+    vec3 lot;
+    if (zone == 0) {
+        float n = max(floor(W / 21.0), 1.0);
+        float lw = W / n;
+        bool south = b.y < 0.5 * H;
+        float dv = south ? b.y : H - b.y; // back from the street
+        float l = clamp(floor(b.x / lw), 0.0, n - 1.0);
+        float u = b.x - l * lw;
+        uint lotN = uint((south ? 0.0 : n) + l);
+        bool right = cBu(i, j, 30u + lotN) < 0.5;
+        vec2 q = vec2(u, dv);
+        lot = lawnC * mix(0.85, 1.15, cBu(i, j, 700u + lotN));
+        // driveway from the street to the carport, and the front path
+        float drive = right ? cBox(q, vec2(lw - 4.6, -1.0), vec2(lw - 1.4, 20.0), fw) : cBox(q, vec2(1.4, -1.0), vec2(4.6, 20.0), fw);
+        lot = mix(lot, vec3(0.20, 0.195, 0.185) * mix(0.8, 1.05, n2), drive);
+        lot = mix(lot, vec3(0.22, 0.21, 0.19), cBox(q, vec2(0.5 * lw - 0.6, -1.0), vec2(0.5 * lw + 0.6, 6.5), fw));
+        // the back yard: a patio and, in some, a pool with its coping
+        float back = 6.0 + 17.5;
+        lot = mix(lot, vec3(0.23, 0.215, 0.195), cBox(q, vec2(2.0, back), vec2(lw - 2.0, back + 2.5), fw));
+        if (cBu(i, j, 600u + lotN) < 0.5) {
+            float px = 2.5 + (lw - 12.0) * cBu(i, j, 620u + lotN);
+            vec2 lo = vec2(px, back + 3.5), hi = vec2(px + 4.5 + 3.0 * cBu(i, j, 640u + lotN), back + 3.5 + 7.5);
+            lot = mix(lot, vec3(0.42, 0.40, 0.37), cBox(q, lo - 0.6, hi + 0.6, fw));
+            vec2 pq = (q - lo) / max(hi - lo, vec2(1.0));
+            vec3 water = mix(vec3(0.05, 0.30, 0.34), vec3(0.10, 0.42, 0.46), smoothstep(0.0, 1.0, pq.y)) * mix(0.9, 1.1, n2);
+            lot = mix(lot, water, cBox(q, lo, hi, fw));
+        }
+        // hedges along the lot lines
+        float hedge = max(1.0 - smoothstep(0.5, 0.5 + fw, min(u, lw - u)), 1.0 - smoothstep(0.6, 0.6 + fw, 0.5 * H - dv));
+        lot = mix(lot, vec3(0.035, 0.06, 0.02) * mix(0.8, 1.2, n2), hedge * step(6.0, dv));
+    } else if (zone == 1 || (zone == 2 && cBu(i, j, 3u) < 0.5)) {
+        // asphalt parking: bays of 2.6 m stalls either side of 7 m aisles, rows every 18 m,
+        // a planted strip round the edge
+        float rowV = mod(b.y - 2.0, 18.0);
+        float bay = step(rowV, 5.5) + step(12.5, rowV);
+        float lineS = (1.0 - smoothstep(0.06, 0.06 + fw, min(mod(b.x, 2.6), 2.6 - mod(b.x, 2.6)))) * bay;
+        lot = vec3(0.085, 0.085, 0.088) * mix(0.8, 1.2, n1) * mix(0.9, 1.1, n3);
+        lot = mix(lot, vec3(0.55, 0.55, 0.52), lineS * shown * 0.85);
+        float edge = 1.0 - cBox(b, vec2(2.2), vec2(W, H) - 2.2, fw);
+        lot = mix(lot, lawnC, edge);
+    } else {
+        // plazas: stone paving, planters, lawn panels
+        lot = plaza;
+        vec2 pm = mod(b, vec2(14.0, 11.0));
+        float planter = cBox(pm, vec2(1.0, 1.0), vec2(5.0, 2.6), fw) * step(0.4, cBu(i, j, 5u));
+        lot = mix(lot, lawnC * 0.8, planter);
+        float edge = 1.0 - cBox(b, vec2(1.6), vec2(W, H) - 1.6, fw);
+        lot = mix(lot, lawnC, edge * 0.8);
+        if (zone == 2) lot = mix(lot, pave, 0.4);
+    }
+    alb = mix(lot, mix(walk, asphalt, roadW), streetW);
+    // the city keeps off water and wetland; it fades in with the built-up land and out at its rim
+    float urban = smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z));
+    urban *= (1.0 - smoothstep(0.02, 0.2, waterF)) * (1.0 - smoothstep(0.1, 0.4, wetF));
+    return urban;
+}
+
 void main() {
     Verts V = Verts(table.vtx[gl_InstanceCustomIndexEXT]);
     Indices I = Indices(packUint2x32(gg.addr.xy));
@@ -449,6 +613,13 @@ void main() {
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
     } else if (cover) {
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
+        vec3 cityAlb;
+        float urban = cityGround(p, footprint, B.x, B.w, C.x, cityAlb) * (1.0 - shore);
+        if (urban > 0.0) {
+            alb = mix(alb, cityAlb, urban);
+            n = normalize(mix(n, up, urban));
+            ao = mix(ao, 1.0, urban);
+        }
         // wet: right at the mapped water, and just above the water level along the contour
         float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd);
         alb *= mix(1.0, 0.55, damp);

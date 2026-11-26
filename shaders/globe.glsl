@@ -14,6 +14,14 @@ struct GlobeGlobals {
     vec4 params;  // x exposure, y frame, z debug view, w ground scans present (bit mask)
     vec4 misc;    // x pixel angle (rad); trees (forest.rs): y every tree within, z SPLIT x finest tile edge, w range (horizon)
     uvec4 addr;   // xy shared index buffer address, z smooth tree thinning (1) or stepped (0)
+    // the city nearest the camera (globe/city.rs shader_city): its plane's origin relative to the
+    // camera, its east and north axes; x block pitch east-west, y north-south, z radius (0 =
+    // none), w number of cores; the cores: x, y in the plane, strength, radius
+    vec4 cityO;
+    vec4 cityE;
+    vec4 cityN;
+    vec4 cityP;
+    vec4 cityCores[6];
 };
 
 

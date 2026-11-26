@@ -36,6 +36,14 @@ pub struct GlobeGlobals {
     pub misc: [f32; 4],
     /// xy shared index buffer address (lo, hi)
     pub addr: [u32; 4],
+    /// the city nearest the camera (globe/city.rs shader_city): its plane's origin relative to
+    /// the camera, its east and north axes (camera frame); block x, block y, radius (0: no
+    /// city), number of cores; the cores (x, y in the plane, strength, radius)
+    pub city_o: [f32; 4],
+    pub city_e: [f32; 4],
+    pub city_n: [f32; 4],
+    pub city_p: [f32; 4],
+    pub city_cores: [[f32; 4]; super::city::MAX_CORES],
 }
 
 const CACHE_TILES: usize = 14_000;
@@ -576,7 +584,7 @@ impl GlobeScene {
             "etopo",
         )?;
         println!("Elevation grid on the GPU ({:.1}s)", t.elapsed().as_secs_f32());
-        let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
+        let ubo = gpu.create_buffer(512, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
         let table = gpu.create_buffer(MAX_TERRAIN_TILES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
         let recs = forest::CAPACITY as u64;
         let plants = gpu.create_buffer(recs * PLANT_REC_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "globe plants")?;
