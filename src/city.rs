@@ -937,7 +937,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     }
     // elevated road decks, 20 m along (+x), deck top at 10 m: the highway (six lanes, a median
     // barrier, two columns on a crossbeam) and a ramp (one lane, one column); the columns run
-    // 6 m into the ground, so a deck sunk for a ramp's climb still stands on them
+    // 14 m below the deck's foot, so a deck sunk for a ramp's climb still stands on them
     for (k, &width) in [30.0f32, 11.0].iter().enumerate() {
         let mut b = B::new();
         let hw = width * 0.5;
@@ -950,10 +950,10 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             b.bx(Vec3::new(-10.05, 10.0, -0.3), Vec3::new(10.05, 10.85, 0.3), m(SLAB, 0), false);
             b.bx(Vec3::new(-1.2, 7.4, -hw + 2.0), Vec3::new(1.2, 8.6, hw - 2.0), m(SLAB, 0), false);
             for z in [-7.0f32, 7.0] {
-                b.bx(Vec3::new(-0.9, -6.0, z - 0.9), Vec3::new(0.9, 7.4, z + 0.9), m(SLAB, 0), false);
+                b.bx(Vec3::new(-0.9, -14.0, z - 0.9), Vec3::new(0.9, 7.4, z + 0.9), m(SLAB, 0), false);
             }
         } else {
-            b.bx(Vec3::new(-0.8, -6.0, -0.8), Vec3::new(0.8, 8.6, 0.8), m(SLAB, 0), false);
+            b.bx(Vec3::new(-0.8, -14.0, -0.8), Vec3::new(0.8, 8.6, 0.8), m(SLAB, 0), false);
         }
         push(b, format!("Building_Highway_{k}"), 11.0, &mut meshes, &mut archs);
     }
