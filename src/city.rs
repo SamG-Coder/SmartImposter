@@ -357,6 +357,9 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
             }
         }
         Fac::Punched { col, w, h } => {
+            // small balconies (a slab and a glass rail) under every other window of most
+            // walk-ups and apartment blocks
+            let balconies = floors >= 3 && w >= 1.4 && h >= 1.5 && rng.f() < 0.65;
             for k in 0..n {
                 let (a, c) = (poly[k], poly[(k + 1) % n]);
                 let u0 = perimeter_u(poly, k);
@@ -390,6 +393,11 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                         b.quad([v(p0, s1), v(p1, s1), v(q1, s1), v(q0, s1)], m(WALL, pal.wall));
                         b.quad([v(p0, s0), v(p0, s1), v(q0, s1), v(q0, s0)], m(WALL, pal.wall));
                         b.quad([v(q1, s0), v(q1, s1), v(p1, s1), v(p1, s0)], m(WALL, pal.wall));
+                        if balconies && f >= 1 && j % 2 == 0 {
+                            let (a0, a1) = (p0 - dir * 0.35, p1 + dir * 0.35);
+                            b.strip(a0, a1, y - 0.02, y + 0.14, 0.0, 1.0, m(SLAB, 0));
+                            b.wall(a0, a1, y + 0.14, y + 1.05, 0.98, m(RAIL, pal.glass), Some((cu * ww, ww, y, 1.0)));
+                        }
                     }
                 }
             }
@@ -423,12 +431,35 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
         let core = inset(poly, 3.0);
         let (lo, hi) = core.iter().fold((Vec2::splat(f32::MAX), Vec2::splat(f32::MIN)), |(l, h), p| (l.min(*p), h.max(*p)));
         if hi.x - lo.x > 4.0 && hi.y - lo.y > 4.0 {
-            for _ in 0..(2 + rng.pick(4)) {
+            for _ in 0..(3 + rng.pick(6)) {
                 let (sx, sz) = (rng.range(1.5, ((hi.x - lo.x) * 0.35).max(1.6)), rng.range(1.5, ((hi.y - lo.y) * 0.35).max(1.6)));
                 let cx = rng.range(lo.x + sx * 0.5, hi.x - sx * 0.5);
                 let cz = rng.range(lo.y + sz * 0.5, hi.y - sz * 0.5);
                 let h = rng.range(1.2, 3.2);
                 b.bx(Vec3::new(cx - sx * 0.5, y1, cz - sz * 0.5), Vec3::new(cx + sx * 0.5, y1 + h, cz + sz * 0.5), m(EQUIP, rng.pick(3) as u8), false);
+            }
+            let (ax, az) = (hi.x - lo.x, hi.y - lo.y);
+            // a water tank on legs
+            if ax * az > 200.0 && rng.f() < 0.45 {
+                let (cx, cz) = (rng.range(lo.x + 2.0, hi.x - 2.0), rng.range(lo.y + 2.0, hi.y - 2.0));
+                let tank: Vec<Vec2> = footprint(2.6, 2.6, 0.75, 0).iter().map(|p| *p + Vec2::new(cx, cz)).collect();
+                for (dx, dz) in [(-0.9f32, -0.9f32), (0.9, -0.9), (0.9, 0.9), (-0.9, 0.9)] {
+                    b.bx(Vec3::new(cx + dx - 0.08, y1, cz + dz - 0.08), Vec3::new(cx + dx + 0.08, y1 + 2.0, cz + dz + 0.08), m(FRAME, 0), false);
+                }
+                b.prism(&tank, y1 + 2.0, y1 + 4.6, m(EQUIP, 1), m(EQUIP, 2), true);
+            }
+            // a roof terrace: a timber deck behind a glass rail, a few planters
+            if !matches!(fac, Fac::Curtain { .. }) && ax > 10.0 && az > 8.0 && rng.f() < 0.4 {
+                let (dx0, dz0) = (lo.x + 0.5, lo.y + 0.5);
+                let (dx1, dz1) = (lo.x + ax * 0.45, lo.y + az * 0.55);
+                b.bx(Vec3::new(dx0, y1, dz0), Vec3::new(dx1, y1 + 0.15, dz1), m(WOOD, 0), false);
+                let deck = [Vec2::new(dx0, dz0), Vec2::new(dx1, dz0), Vec2::new(dx1, dz1), Vec2::new(dx0, dz1)];
+                b.wall(deck[1], deck[2], y1 + 0.15, y1 + 1.15, 0.0, m(RAIL, 0), None);
+                b.wall(deck[2], deck[3], y1 + 0.15, y1 + 1.15, 0.0, m(RAIL, 0), None);
+                for t in 0..3 {
+                    let px = dx0 + (dx1 - dx0) * (0.2 + 0.3 * t as f32);
+                    b.bx(Vec3::new(px - 0.5, y1 + 0.15, dz1 - 1.4), Vec3::new(px + 0.5, y1 + 0.8, dz1 - 0.4), m(TILE, 2), false);
+                }
             }
         }
     }

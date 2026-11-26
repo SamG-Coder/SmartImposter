@@ -46,7 +46,7 @@ struct City {
 }
 
 /// Most cores a city has (the shader's globals hold this many).
-pub const MAX_CORES: usize = 6;
+pub const MAX_CORES: usize = 8;
 
 /// Miami: downtown and Brickell on the west shore of Biscayne Bay, Edgewater north of them, the
 /// high-rises along Miami Beach across the bay.
@@ -61,6 +61,10 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7790, lon: -80.1310, strength: 0.6, radius: 600.0 },   // South Beach
         Core { lat: 25.8100, lon: -80.1240, strength: 0.65, radius: 900.0 },  // Mid-Beach
         Core { lat: 25.7520, lon: -80.2050, strength: 0.4, radius: 1200.0 },  // Coconut Grove side
+        // the broad urban fields round them: Miami Beach mid-rise all along, the city round
+        // downtown (walk-ups and apartment blocks rather than houses)
+        Core { lat: 25.8000, lon: -80.1320, strength: 0.4, radius: 2600.0 },  // Miami Beach
+        Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 3200.0 }, // downtown's fringe
     ],
 }];
 
@@ -236,6 +240,11 @@ fn density(k: usize, x: f64, y: f64) -> f64 {
         .fold(0.0, f64::max)
 }
 
+fn density_at_block(k: usize, i: i64, j: i64) -> f64 {
+    let (x0, y0, w, h) = interior(i, j);
+    density(k, x0 + w * 0.5, y0 + h * 0.5)
+}
+
 fn block_zone(k: usize, i: i64, j: i64) -> u32 {
     let (x0, y0, w, h) = interior(i, j);
     let z = zone(density(k, x0 + w * 0.5, y0 + h * 0.5) + (bu(i, j, 1) - 0.5) * 0.12);
@@ -313,7 +322,9 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
     let tallest = |cls: &[Class]| archs.iter().filter(|a| cls.contains(&a.class)).map(|a| a.height).fold(0.0f32, f32::max);
     let classes: &[Class] = match z {
         3 => &[Class::Tower, Class::Tower, Class::Tower, Class::MidRise],
-        2 => &[Class::MidRise, Class::MidRise, Class::Tower, Class::LowRise],
+        // (a tower in the mid-rise zone only next to a core)
+        2 if density_at_block(k, i, j) > 0.38 => &[Class::MidRise, Class::MidRise, Class::Tower, Class::LowRise],
+        2 => &[Class::MidRise, Class::MidRise, Class::MidRise, Class::LowRise],
         1 => &[Class::LowRise, Class::LowRise, Class::MidRise],
         _ => &[Class::House],
     };
@@ -387,7 +398,13 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                 (2, 1)
             }
         }
-        2 => (2, 2),
+        2 => {
+            if bu(i, j, 7) < 0.5 {
+                (3, 2)
+            } else {
+                (2, 2)
+            }
+        }
         _ => {
             if bu(i, j, 4) < 0.4 {
                 (2, 2)
@@ -420,8 +437,10 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
             }
             let pick = if class == Class::Tower {
                 // taller towers nearer the core centres, and now and then a much taller one
-                let mut want = 70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot));
-                if bu(i, j, 95 + lot) < 0.15 {
+                // (outside the cores only the shortest towers: the mid-rise city round them is
+                // 10-25 storeys)
+                let mut want = if z == 3 { 70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot)) } else { 55.0 + 35.0 * bu(i, j, 90 + lot) };
+                if z == 3 && bu(i, j, 95 + lot) < 0.15 {
                     want *= 1.6;
                 }
                 let mut best = fits[0];
@@ -726,7 +745,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
     let z = block_zone(k, i, j);
     let free = |x: f64, y: f64| !placed.iter().any(|p| (x - p.x).abs() < p.hx + 1.2 && (y - p.y).abs() < p.hy + 1.2);
     let mut n = 0u32;
-    if z == 1 || (z == 2 && bu(i, j, 3) < 0.5) {
+    if z == 1 || (z == 2 && bu(i, j, 3) < 0.3) {
         // stalls of 2.6 m either side of 7 m aisles, rows every 18 m (from 2 m in)
         let mut row = 0;
         loop {
@@ -980,7 +999,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 }
             }
         }
-    } else if z == 1 || (z == 2 && bu(i, j, 3) < 0.5) {
+    } else if z == 1 || (z == 2 && bu(i, j, 3) < 0.3) {
         // the planted strip round a parking lot (2.2 m wide)
         let per = 2.0 * (w + h);
         let n = (per / 15.0).floor() as u32;
