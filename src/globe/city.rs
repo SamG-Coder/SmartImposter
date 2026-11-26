@@ -940,9 +940,9 @@ fn car_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Vec<&ArchRef>) {
 /// Does the street through (x, y) cross water here on a bridge? Short crossings (canals, the
 /// river: land within 160 m both ways along the street) always; long ones (across the bay, to
 /// 1.6 km) only on every other arterial, as causeways.
-fn bridged(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> bool {
+fn crossing(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> Option<(f64, f64)> {
     if !water_at(k, terrain, x, y) {
-        return false;
+        return None;
     }
     // decided for the whole crossing, the same at every point of it: walk out both ways to the
     // first bank (30 m of solid land), within reach (canals for the side streets, rivers for
@@ -964,10 +964,19 @@ fn bridged(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial:
         }
         None
     };
-    let (Some(a), Some(b)) = (bank(-1.0), bank(1.0)) else { return false };
+    let (Some(a), Some(b)) = (bank(-1.0), bank(1.0)) else { return None };
     let (mx, my) = pt((b - a) * 0.5);
     let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
-    water_at(k, terrain, mx + px, my + py) && water_at(k, terrain, mx - px, my - py)
+    (water_at(k, terrain, mx + px, my + py) && water_at(k, terrain, mx - px, my - py)).then_some((a, b))
+}
+
+/// A crossing's arch at a point (a back to its bank, b on to the other): the deck's height
+/// over the water level and its slope along the street.
+fn arch(a: f64, b: f64) -> (f64, f64) {
+    let span = (a + b).max(1.0);
+    let rise = (span * 0.035).min(7.0);
+    let f = a / span;
+    (rise * (std::f64::consts::PI * f).sin(), rise * std::f64::consts::PI / span * (std::f64::consts::PI * f).cos())
 }
 
 /// Bridge decks and traffic on the street lines of block (i, j) (as street_palms: the
@@ -990,8 +999,18 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
         let mut n = 0u32;
         while s < len {
             let (x, y) = at(s, 0.0);
-            if bridged(k, terrain, x, y, along_x, a, line) {
-                put_at(k, sp, decks[if a { 0 } else { 1 }], x, y, 0.0, yaw0, bh(i, j, 6000 + n + along_x as u32 * 50), id, tile);
+            if let Some((ca, cb)) = crossing(k, terrain, x, y, along_x, a, line) {
+                // (the arch's slope along increasing s: a counts back from the near bank)
+                let (h, dh) = arch(ca, cb);
+                let (wx, wy) = to_world(x, y);
+                // (heading from the street's own tangent in the city's plane, so the pieces
+                // follow its curve end to end)
+                let tang = |s: f64| {
+                    let (p0, p1) = (at(s - 2.0, 0.0), at(s + 2.0, 0.0));
+                    let (a0, a1) = (to_world(p0.0, p0.1), to_world(p1.0, p1.1));
+                    (a1.1 - a0.1).atan2(a1.0 - a0.0)
+                };
+                put_world(k, sp, decks[if a { 0 } else { 1 }], wx, wy, h, tang(s), dh.atan(), bh(i, j, 6000 + n + along_x as u32 * 50), id, tile);
             }
             s += 20.0;
             n += 1;
@@ -1017,10 +1036,16 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
                     let forward = if along_x { off < 0.0 } else { off > 0.0 };
                     let yaw = yaw0 + if forward { 0.0 } else { std::f64::consts::PI };
                     let kind = if a && bu(i, j, salt + 500) < 0.04 { 5 } else { (bh(i, j, salt + 600) % 5) as usize };
-                    let over = water_at(k, terrain, x, y);
-                    if !over || bridged(k, terrain, x, y, along_x, a, line) {
-                        let h = if over { 2.92 } else { ground(k, terrain, x, y) };
-                        put_at(k, sp, kinds[kind], x, y, h, yaw, bh(i, j, salt + 700), id, tile);
+                    if !water_at(k, terrain, x, y) {
+                        put_at(k, sp, kinds[kind], x, y, ground(k, terrain, x, y), yaw, bh(i, j, salt + 700), id, tile);
+                    } else if let Some((ca, cb)) = crossing(k, terrain, x, y, along_x, a, line) {
+                        let (h, dh) = arch(ca, cb);
+                        let pitch = if forward { dh.atan() } else { -dh.atan() };
+                        let (wx, wy) = to_world(x, y);
+                        let (p0, p1) = (at(s - 2.0, off), at(s + 2.0, off));
+                        let (a0, a1) = (to_world(p0.0, p0.1), to_world(p1.0, p1.1));
+                        let tyaw = (a1.1 - a0.1).atan2(a1.0 - a0.0) + if forward { 0.0 } else { std::f64::consts::PI };
+                        put_world(k, sp, kinds[kind], wx, wy, h + 2.94, tyaw, pitch, bh(i, j, salt + 700), id, tile);
                     }
                 }
                 s += if a { 16.0 + 30.0 * bu(i, j, salt + 800) } else { 25.0 + 50.0 * bu(i, j, salt + 800) };

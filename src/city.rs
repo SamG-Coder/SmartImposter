@@ -924,18 +924,36 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, format!("Building_Highway_{k}"), 11.0, &mut meshes, &mut archs);
     }
-    // bridge decks, 20 m along the street (+x): an arterial's 22 m and a side street's 14 m,
-    // deck on two piers, parapets, the roadway asphalt
+    // bridge decks, 20 m along the street (+x, 21 m long: the pieces of a crossing overlap,
+    // and are pitched with its arch, globe/city.rs streets): an arterial's 22 m and a side
+    // street's 14 m. A thin deck over a darker soffit and edge girders, thin concrete parapets
+    // with a rail, a pier of two columns on a crossbeam reaching down into the water, a lamp
+    // post on each side
     for (k, &width) in [22.0f32, 14.0].iter().enumerate() {
         let mut b = B::new();
         let hw = width * 0.5;
-        b.bx(Vec3::new(-10.0, 1.7, -hw), Vec3::new(10.0, 2.9, hw), m(SLAB, 0), true);
-        b.quad([Vec3::new(-10.0, 2.92, -hw + 0.6), Vec3::new(10.0, 2.92, -hw + 0.6), Vec3::new(10.0, 2.92, hw - 0.6), Vec3::new(-10.0, 2.92, hw - 0.6)], m(ASPHALT, k as u8));
-        for z in [-hw, hw - 0.5] {
-            b.bx(Vec3::new(-10.0, 2.9, z), Vec3::new(10.0, 3.9, z + 0.5), m(SLAB, 0), false);
+        let (x0, x1) = (-10.5f32, 10.5f32);
+        b.bx(Vec3::new(x0, 2.3, -hw), Vec3::new(x1, 2.9, hw), m(SLAB, 0), false);
+        b.bx(Vec3::new(x0, 1.5, -hw + 0.6), Vec3::new(x1, 2.3, -hw + 1.6), m(GARAGE, 2), false);
+        b.bx(Vec3::new(x0, 1.5, hw - 1.6), Vec3::new(x1, 2.3, hw - 0.6), m(GARAGE, 2), false);
+        b.cap(&ccw(vec![Vec2::new(x0, -hw), Vec2::new(x1, -hw), Vec2::new(x1, hw), Vec2::new(x0, hw)]), 2.3, false, m(GARAGE, 2));
+        b.quad([Vec3::new(x0, 2.92, -hw + 0.6), Vec3::new(x1, 2.92, -hw + 0.6), Vec3::new(x1, 2.92, hw - 0.6), Vec3::new(x0, 2.92, hw - 0.6)], m(ASPHALT, k as u8));
+        for zs in [-1.0f32, 1.0] {
+            let z = zs * (hw - 0.15);
+            b.bx(Vec3::new(x0, 2.9, z - 0.15), Vec3::new(x1, 3.7, z + 0.15), m(SLAB, 0), false);
+            b.bx(Vec3::new(x0, 3.85, z - 0.04), Vec3::new(x1, 3.93, z + 0.04), m(FRAME, 1), false);
+            // the lamp: a post, an arm out over the road, the head
+            let zi = z - zs * 0.1;
+            b.bx(Vec3::new(-0.1, 3.7, zi - 0.1), Vec3::new(0.1, 11.5, zi + 0.1), m(FRAME, 1), false);
+            b.bx(Vec3::new(-0.06, 11.3, zi - zs * 2.2), Vec3::new(0.06, 11.45, zi), m(FRAME, 1), false);
+            b.bx(Vec3::new(-0.3, 11.1, zi - zs * 2.5 - 0.18), Vec3::new(0.3, 11.35, zi - zs * 2.5 + 0.18), m(FRAME, 0), false);
         }
-        b.bx(Vec3::new(-1.2, -3.0, -hw + 1.0), Vec3::new(1.2, 1.7, hw - 1.0), m(SLAB, 0), false);
-        push(b, format!("Building_Bridge_{k}"), 3.9, &mut meshes, &mut archs);
+        b.bx(Vec3::new(-0.9, 0.9, -hw + 1.2), Vec3::new(0.9, 1.5, hw - 1.2), m(SLAB, 0), false);
+        for zs in [-1.0f32, 1.0] {
+            let col: Vec<Vec2> = footprint(1.3, 1.3, 0.65, 3).iter().map(|p| *p + Vec2::new(0.0, zs * (hw * 0.5))).collect();
+            b.prism(&col, -14.0, 0.9, m(SLAB, 0), m(SLAB, 0), false);
+        }
+        push(b, format!("Building_Bridge_{k}"), 11.5, &mut meshes, &mut archs);
     }
     (meshes, archs)
 }
