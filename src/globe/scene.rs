@@ -1381,11 +1381,12 @@ globe workers: {} terrain tiles at {:.2} ms ({:.2} ms shoreline field), {} tree 
             ) + &{
                 let u = |k: usize, i: usize| UNDER[k][i].load(std::sync::atomic::Ordering::Relaxed) as f64;
                 format!(
-                    " [{} tree tiles at {:.2} ms, {} understory tiles at {:.2} ms]",
+                    " [{} tree tiles at {:.2} ms, {} understory tiles at {:.2} ms] city ms total: grow {:.0} streets {:.0} ways {:.0} blocked {:.0} block {:.0}",
                     u(0, 1),
                     u(0, 0) / u(0, 1).max(1.0) / 1e6,
                     u(1, 1),
                     u(1, 0) / u(1, 1).max(1.0) / 1e6
+                    , super::city::CITY_NS[0].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[1].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[2].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[3].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6, super::city::CITY_NS[4].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
                 )
             }
         }

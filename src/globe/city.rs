@@ -355,6 +355,7 @@ fn on_way(x: f64, y: f64, pad: f64) -> bool {
 /// whose feet lie in tile `id` (box `lo`..`hi` in the city's plane).
 #[allow(clippy::too_many_arguments)]
 fn way_items(k: usize, terrain: &Terrain, sp: &Species, id: TileId, tile: &mut TreeTile, lvl: u8, lo: (f64, f64), hi: (f64, f64)) {
+    let _t = Timer(2, std::time::Instant::now());
     let (kinds, _) = car_kinds(&sp.buildings);
     let decks: Vec<&ArchRef> = sp.buildings.iter().filter(|a| a.class == Class::Highway).collect();
     if decks.len() < 2 || kinds.len() < 6 {
@@ -481,17 +482,20 @@ fn put_world_v(k: usize, sp: &Species, vid: usize, x: f64, y: f64, h: f64, yaw: 
 
 /// The city whose plan covers lat / lon, and the point in its plan (m, before the warp).
 fn city_at(lat: f64, lon: f64) -> Option<(usize, f64, f64)> {
+    let (k, x, y) = city_at_world(lat, lon)?;
+    let (px, py) = to_plan(x, y);
+    Some((k, px, py))
+}
+
+/// The city covering lat / lon and the point in its plane (m), without the plan's warp.
+fn city_at_world(lat: f64, lon: f64) -> Option<(usize, f64, f64)> {
     CITIES.iter().enumerate().find_map(|(k, c)| {
         // (a quick test first)
         if (lat - c.lat).abs() > c.radius / 100_000.0 || (lon - c.lon).abs() * c.lat.to_radians().cos() > c.radius / 100_000.0 {
             return None;
         }
         let (x, y) = plane(k, super::tiles::dir_from_lat_lon(lat, lon));
-        if x * x + y * y >= c.radius * c.radius {
-            return None;
-        }
-        let (px, py) = to_plan(x, y);
-        Some((k, px, py))
+        (x * x + y * y < c.radius * c.radius).then_some((k, x, y))
     })
 }
 
@@ -560,7 +564,7 @@ pub fn shader_city(cam: DVec3) -> Option<ShaderCity> {
 /// buildings and trees in it, blurred); there the ground is the plain the city stands on, a few
 /// metres above the sea. Water and the sea floor stay as they are.
 pub fn ground_cap(lat: f64, lon: f64) -> Option<f32> {
-    let (k, x, y) = city_at(lat, lon)?;
+    let (k, x, y) = city_at_world(lat, lon)?;
     let r = (x * x + y * y).sqrt() / CITIES[k].radius;
     // fade back to the data over the last fifth of the radius
     let t = ((r - 0.8) / 0.2).clamp(0.0, 1.0);
@@ -568,6 +572,7 @@ pub fn ground_cap(lat: f64, lon: f64) -> Option<f32> {
 }
 
 /// One building of the plan: archetype, centre (plane m), yaw in quarter turns, scale.
+#[derive(Clone)]
 struct Placed {
     arch: usize,
     x: f64,
@@ -609,6 +614,29 @@ fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
 /// worked out; every choice comes from hashes of the block and lot, so a lot has the same
 /// building whoever asks.
 fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f32) -> Vec<Placed> {
+    // (every block is asked for by the tiles round it and by each of its uses: per thread, the
+    // answer is kept)
+    let key = (k, i, j, need.to_bits());
+    if let Some(v) = BLOCKS.with(|c| c.borrow().get(&key).cloned()) {
+        return v;
+    }
+    let v = block_plan(k, archs, terrain, i, j, need);
+    BLOCKS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 200_000 {
+            c.clear();
+        }
+        c.insert(key, v.clone());
+    });
+    v
+}
+
+thread_local! {
+    static BLOCKS: std::cell::RefCell<std::collections::HashMap<(usize, i64, i64, u32), Vec<Placed>>> = Default::default();
+}
+
+fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f32) -> Vec<Placed> {
+    let _t = Timer(4, std::time::Instant::now());
     let mut out = Vec::new();
     let (x0, y0, w, h) = interior(i, j);
     let z = block_zone(k, i, j);
@@ -666,7 +694,7 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                     let d = |f: &(usize, u32)| if f.1 == 0 { archs[f.0].size[1] } else { archs[f.0].size[0] };
                     d(x).total_cmp(&d(y))
                 });
-                order.extend(rest);
+                order.extend(rest.into_iter().take(2));
                 let mut found = None;
                 'try_house: for &(a, q) in &order {
                     let r = &archs[a];
@@ -864,7 +892,7 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
 
 /// Is lat / lon in a city? (A cheap test before `Blocks::blocked`.)
 pub fn in_city(lat: f64, lon: f64) -> bool {
-    city_at(lat, lon).is_some()
+    city_at_world(lat, lon).is_some()
 }
 
 /// The buildings' footprints of the blocks asked about so far (one tile's trees ask about the
@@ -877,6 +905,7 @@ pub struct Blocks {
 impl Blocks {
     /// Is lat / lon in a city's roadway, or under a building? (Trees keep out of both.)
     pub fn blocked(&mut self, lat: f64, lon: f64, archs: &[ArchRef], terrain: &Terrain) -> bool {
+        let _t = Timer(3, std::time::Instant::now());
         let Some((k, x, y)) = city_at(lat, lon) else { return false };
         if archs.is_empty() {
             return false;
@@ -912,8 +941,13 @@ fn min_height(k: u8) -> f32 {
 
 /// Is the plane point's foot in tree tile `id`?
 fn in_tile(k: usize, x: f64, y: f64, id: TileId) -> Option<DVec3> {
+    // (a cheap test first: outside the tile's box in the plan, 2 m round)
+    let (bl, bh_, cl, ch) = TILE_BOX.with(|b| b.get());
+    if x < bl - 2.0 || x > bh_ + 2.0 || y < cl - 2.0 || y > ch + 2.0 {
+        return None;
+    }
     let (lat, lon) = to_lat_lon(k, x, y);
-    if city_at(lat, lon).map(|v| v.0) != Some(k) {
+    if city_at_world(lat, lon).map(|v| v.0) != Some(k) {
         return None;
     }
     let d = super::tiles::dir_from_lat_lon(lat, lon);
@@ -926,6 +960,7 @@ fn in_tile(k: usize, x: f64, y: f64, id: TileId) -> Option<DVec3> {
 /// The buildings whose centres lie in tree tile `id`, as plant records into `tile`; on the
 /// finest tiles also the palms along the sidewalks.
 pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
+    let _t = Timer(0, std::time::Instant::now());
     let (archs, infos) = (&sp.buildings[..], &sp.infos[..]);
     if archs.is_empty() {
         return;
@@ -946,11 +981,18 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
         if xh < -c.radius || xl > c.radius || yh < -c.radius || yl > c.radius {
             continue;
         }
+        TILE_BOX.with(|b| b.set((xl, xh, yl, yh)));
         let (xl, xh, yl, yh) = (xl.max(-c.radius), xh.min(c.radius), yl.max(-c.radius), yh.min(c.radius));
         let lvl = TREE_LEVEL.saturating_sub(id.level);
         let need = min_height(lvl);
-        for j in (yl / BY).floor() as i64 - 1..=(yh / BY).floor() as i64 + 1 {
-            for i in (xl / BX).floor() as i64 - 1..=(xh / BX).floor() as i64 + 1 {
+        // (the blocks the tile overlaps, and 30 m round: the lines are moved by up to 12 m, and
+        // a block's palms, docks and decks reach a little past it)
+        let wet_tile = {
+            let (la, lo) = lat_lon(id.center_dir());
+            terrain.cover.fractions(la, lo, id.edge() * 1.5).map(|f| f[lc::WATER] > 0.0).unwrap_or(true)
+        };
+        for j in ((yl - 30.0) / BY).floor() as i64..=((yh + 30.0) / BY).floor() as i64 {
+            for i in ((xl - 30.0) / BX).floor() as i64..=((xh + 30.0) / BX).floor() as i64 {
                 let placed = block(k, archs, terrain, i, j, need);
                 for p in &placed {
                     let Some(d) = in_tile(k, p.x, p.y, id) else { continue };
@@ -974,7 +1016,8 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     docks(k, terrain, sp, i, j, id, tile, &placed);
                     parked(k, terrain, sp, i, j, id, tile, &placed);
                 }
-                if lvl <= 2 {
+                // (on the coarser tiles only the bridge decks: none where there is no water)
+                if lvl == 0 || (lvl <= 2 && wet_tile) {
                     streets(k, terrain, sp, i, j, id, tile, lvl == 0);
                 }
             }
@@ -997,32 +1040,74 @@ fn car_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Vec<&ArchRef>) {
     (archs.iter().filter(|a| a.class == Class::Car).collect(), archs.iter().filter(|a| a.class == Class::Bridge).collect())
 }
 
-/// Does the street through (x, y) cross water here on a bridge? Short crossings (canals, the
+thread_local! {
+    /// `crossing`'s water test, per thread (the same points are asked for by every 20 m of a
+    /// crossing and by every street of a tile)
+    static WET: std::cell::RefCell<std::collections::HashMap<(usize, i64, i64), bool>> = Default::default();
+    static CROSS: std::cell::RefCell<std::collections::HashMap<(usize, bool, i64, i64), Option<(f64, f64)>>> = Default::default();
+}
+
+/// Is the plan point on mapped water whose lower quartile of heights over ~200 m is the sea's?
+fn wet_at(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
+    let (la, lo) = to_lat_lon(k, x, y);
+    if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
+        return false;
+    }
+    let (dla, dlo) = (30.0 / 110_540.0, 30.0 / (111_320.0 * la.to_radians().cos()));
+    let mut h: Vec<f32> = Vec::with_capacity(49);
+    for a in -3..=3 {
+        for b in -3..=3 {
+            let (pa, po) = (la + a as f64 * dla, lo + b as f64 * dlo);
+            if terrain.cover.class_group(pa, po) == Some(lc::WATER) {
+                h.push(terrain.height(pa, po));
+            }
+        }
+    }
+    h.sort_by(|a, b| a.total_cmp(b));
+    h[h.len() / 4] < 0.6
+}
+
+/// The bridge, if the street through (x, y) crosses water here: how far back and on to its banks. Short crossings (canals, the
 /// river: land within 160 m both ways along the street) always; long ones (across the bay, to
 /// 1.6 km) only on every other arterial, as causeways.
 fn crossing(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> Option<(f64, f64)> {
+    // (kept per thread, by the point quantised to 2 m)
+    let along = if along_x { x } else { y };
+    let key = (k, along_x, line, (along * 0.5).round() as i64);
+    if let Some(v) = CROSS.with(|c| c.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = crossing_at(k, terrain, x, y, along_x, arterial, line);
+    CROSS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 1 << 20 {
+            c.clear();
+        }
+        c.insert(key, v);
+    });
+    v
+}
+
+fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> Option<(f64, f64)> {
     // (crossings are decided on the land cover's water alone: the 30 m data is a surface
     // model, the real bridges and causeways are in it as raised ground, which would cut ours in
     // two)
     // ponds above sea level are not crossed: the lower quartile of the water's heights over
     // ~200 m round about must be the sea's (a causeway is a thin line in that window)
     let wet = |x: f64, y: f64| {
-        let (la, lo) = to_lat_lon(k, x, y);
-        if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
-            return false;
+        let key = (k, (x * 0.2).round() as i64, (y * 0.2).round() as i64);
+        if let Some(v) = WET.with(|c| c.borrow().get(&key).copied()) {
+            return v;
         }
-        let (dla, dlo) = (30.0 / 110_540.0, 30.0 / (111_320.0 * la.to_radians().cos()));
-        let mut h: Vec<f32> = Vec::with_capacity(49);
-        for a in -3..=3 {
-            for b in -3..=3 {
-                let (pa, po) = (la + a as f64 * dla, lo + b as f64 * dlo);
-                if terrain.cover.class_group(pa, po) == Some(lc::WATER) {
-                    h.push(terrain.height(pa, po));
-                }
+        let v = wet_at(k, terrain, x, y);
+        WET.with(|c| {
+            let mut c = c.borrow_mut();
+            if c.len() > 1 << 21 {
+                c.clear();
             }
-        }
-        h.sort_by(|a, b| a.total_cmp(b));
-        h[h.len() / 4] < 0.6
+            c.insert(key, v);
+        });
+        v
     };
     if !wet(x, y) {
         return None;
@@ -1069,6 +1154,7 @@ fn arch(a: f64, b: f64) -> (f64, f64) {
 /// along its x span, crossings included). `cars`: also the traffic (finest tiles only).
 #[allow(clippy::too_many_arguments)]
 fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, cars: bool) {
+    let _t = Timer(1, std::time::Instant::now());
     let (kinds, decks) = car_kinds(&sp.buildings);
     if decks.len() < 2 {
         return;
@@ -1077,6 +1163,14 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
         let (line, a) = if along_x { (j, art_y(j)) } else { (i, art_x(i)) };
         let (start, len) = if along_x { (line_x(i), line_x(i + 1) - line_x(i)) } else { (line_y(j), line_y(j + 1) - line_y(j)) };
         let fixed = if along_x { line_y(j) } else { line_x(i) };
+        // (a street that does not pass the tile has nothing for it)
+        {
+            let (bl, bh_, cl, ch) = TILE_BOX.with(|b| b.get());
+            let (lo, hi, flo, fhi) = if along_x { (bl, bh_, cl, ch) } else { (cl, ch, bl, bh_) };
+            if fixed < flo - 20.0 || fixed > fhi + 20.0 || start + len < lo - 20.0 || start > hi + 20.0 {
+                continue;
+            }
+        }
         let at = |s: f64, off: f64| if along_x { (start + s, fixed + off) } else { (fixed + off, start + s) };
         let yaw0 = if along_x { 0.0 } else { std::f64::consts::FRAC_PI_2 };
         // decks every 20 m where the street is over water
@@ -1353,6 +1447,29 @@ fn sea_level_water(terrain: &Terrain, la: f64, lo: f64) -> bool {
     if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
         return false;
     }
+    // (kept per thread by the point quantised to ~4 m: the corner checks ask again and again)
+    let key = ((la * 25_000.0).round() as i64, (lo * 25_000.0).round() as i64);
+    if let Some(v) = SEA.with(|c| c.borrow().get(&key).copied()) {
+        return v;
+    }
+    let v = sea_level_water_at(terrain, la, lo);
+    SEA.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() > 1 << 21 {
+            c.clear();
+        }
+        c.insert(key, v);
+    });
+    v
+}
+
+thread_local! {
+    /// the tile being grown: its box in the plan (in_tile's quick test)
+    static TILE_BOX: std::cell::Cell<(f64, f64, f64, f64)> = const { std::cell::Cell::new((f64::MIN, f64::MAX, f64::MIN, f64::MAX)) };
+    static SEA: std::cell::RefCell<std::collections::HashMap<(i64, i64), bool>> = Default::default();
+}
+
+fn sea_level_water_at(terrain: &Terrain, la: f64, lo: f64) -> bool {
     let (dla, dlo) = (12.0 / 110_540.0, 12.0 / (111_320.0 * la.to_radians().cos()));
     let mut h: Vec<f32> = Vec::with_capacity(25);
     for a in -2..=2 {
@@ -1688,4 +1805,13 @@ fn push_rec(tile: &mut TreeTile, rows: [[f64; 4]; 3], data: u32, info: &Impostor
     }
     tile.recs.push(rec);
     tile.aabbs.push([lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]]);
+}
+
+/// Thread time spent in the city's plan (stats_line): grow, streets, way items, blocked, block.
+pub static CITY_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+struct Timer(usize, std::time::Instant);
+impl Drop for Timer {
+    fn drop(&mut self) {
+        CITY_NS[self.0].fetch_add(self.1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
 }
