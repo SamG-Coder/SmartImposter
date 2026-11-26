@@ -1164,12 +1164,17 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 let room = (lw - 4.0) * (lh - 4.0);
                 let fresh: Vec<(usize, u32)> = fits.iter().copied().filter(|f| !used.contains(&f.0)).collect();
                 let fits = if fresh.is_empty() { fits.clone() } else { fresh };
+                // (each district of 3 x 3 blocks builds from its own third of the models: no one
+                // model all over the city, and a district its own character)
+                let (di, dj) = (i.div_euclid(3), j.div_euclid(3));
+                let local: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| bh(di, dj, 9900 + a as u32) % 3 == 0).collect();
+                let fits = if local.is_empty() { fits } else { local };
                 let big: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| (archs[a].size[0] * archs[a].size[1]) as f64 >= 0.4 * room).collect();
                 let from = if big.is_empty() { &fits } else { &big };
                 // (two lots in three take one of the shaped blocks where one fits: the boxes
                 // are the minority)
                 let shaped: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| archs[a].shaped).collect();
-                let from = if !shaped.is_empty() && bu(i, j, 7800 + lot) < 0.85 { &shaped } else { from };
+                let from = if !shaped.is_empty() && bu(i, j, 7800 + lot) < 0.5 { &shaped } else { from };
                 from[(bh(i, j, 12 + lot) as usize) % from.len()]
             };
             let r = &archs[pick.0];
