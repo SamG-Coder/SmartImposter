@@ -537,7 +537,9 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let (lat, lon) = lat_lon(d);
             let Some(f) = terrain.cover.fractions(lat, lon, 30.0) else { continue };
             let tree = f[super::landcover::TREE];
-            if tree <= 0.0 || r_keep > tree as f64 * 0.95 {
+            // in a city the canopy is lusher (planted, watered) and the parks have trees
+            let keep = if super::city::in_city(lat, lon) { (tree as f64 * 1.3 + f[super::landcover::GRASS] as f64 * 0.12).min(1.0) } else { tree as f64 * 0.95 };
+            if keep <= 0.0 || r_keep > keep {
                 continue;
             }
             if super::city::in_city(lat, lon) && blocks.blocked(lat, lon, &im.buildings, terrain) {

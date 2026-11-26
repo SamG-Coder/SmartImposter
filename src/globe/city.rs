@@ -631,18 +631,21 @@ fn bridged(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial:
     if !water_at(k, terrain, x + px, y + py) || !water_at(k, terrain, x - px, y - py) {
         return false;
     }
-    let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 1600.0 } else { 160.0 };
+    // (canals for the side streets, the river and the like for the arterials; the bay only on
+    // the causeways)
+    let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 1600.0 } else if arterial { 250.0 } else { 70.0 };
     let land = |dir: f64| {
-        let mut s = 20.0;
+        let mut s = 10.0;
         while s <= reach {
             let (px, py) = if along_x { (x + dir * s, y) } else { (x, y + dir * s) };
             if !water_at(k, terrain, px, py) {
                 return true;
             }
-            s += 20.0;
+            s += 10.0;
         }
         false
     };
+    // (both banks within reach: the whole crossing is shorter than about twice that)
     land(1.0) && land(-1.0)
 }
 
@@ -896,32 +899,35 @@ fn docks(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, 
 /// y = j BY), both sides of the street, one every ~12 m near the kerb, on built-up dry land;
 /// whole streets have palms or none. Those whose foot lies in tile `id`.
 fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile) {
+    // (x, y, salt, palm?) : two streets in three are palm-lined, the rest have shade trees
     let mut spots = Vec::new();
     // the north-south street at x = i BX, along this block's y span
-    if bh(i, 0, 50) % 3 != 0 {
+    {
+        let palm = bh(i, 0, 50) % 3 != 0;
         let a = art_x(i);
         let off = half_width(a) - sidewalk(a) + 1.1;
         let (ys, ye) = (line_y(j) + half_width(art_y(j)) + 4.0, line_y(j + 1) - half_width(art_y(j + 1)) - 4.0);
-        let n = ((ye - ys) / 12.0).floor().max(1.0) as usize;
+        let n = ((ye - ys) / if palm { 12.0 } else { 15.0 }).floor().max(1.0) as usize;
         for s in 0..=n {
             let y = ys + (ye - ys) * s as f64 / n as f64;
-            spots.push((line_x(i) - off, y, s as u32));
-            spots.push((line_x(i) + off, y, 100 + s as u32));
+            spots.push((line_x(i) - off, y, s as u32, palm));
+            spots.push((line_x(i) + off, y, 100 + s as u32, palm));
         }
     }
     // the east-west street at y = j BY, along this block's x span
-    if bh(0, j, 51) % 3 != 0 {
+    {
+        let palm = bh(0, j, 51) % 3 != 0;
         let a = art_y(j);
         let off = half_width(a) - sidewalk(a) + 1.1;
         let (xs, xe) = (line_x(i) + half_width(art_x(i)) + 4.0, line_x(i + 1) - half_width(art_x(i + 1)) - 4.0);
-        let n = ((xe - xs) / 12.0).floor().max(1.0) as usize;
+        let n = ((xe - xs) / if palm { 12.0 } else { 15.0 }).floor().max(1.0) as usize;
         for s in 0..=n {
             let x = xs + (xe - xs) * s as f64 / n as f64;
-            spots.push((x, line_y(j) - off, 200 + s as u32));
-            spots.push((x, line_y(j) + off, 300 + s as u32));
+            spots.push((x, line_y(j) - off, 200 + s as u32, palm));
+            spots.push((x, line_y(j) + off, 300 + s as u32, palm));
         }
     }
-    for (x, y, n) in spots {
+    for (x, y, n, palm) in spots {
         if bu(i, j, 1000 + n) > 0.85 {
             continue;
         }
@@ -934,8 +940,10 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
         if tile.recs.len() >= MAX_PER_TILE {
             return;
         }
-        let vid = sp.palms[(bh(i, j, 2000 + n) as usize) % sp.palms.len()];
-        let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, 3000 + n) * std::f64::consts::TAU, 0.85 + 0.35 * bu(i, j, 4000 + n));
+        let list = if palm || sp.city_trees.is_empty() { &sp.palms } else { &sp.city_trees };
+        let vid = list[(bh(i, j, 2000 + n) as usize) % list.len()];
+        let sc = if palm { 0.85 + 0.35 * bu(i, j, 4000 + n) } else { 0.55 + 0.3 * bu(i, j, 4000 + n) };
+        let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, 3000 + n) * std::f64::consts::TAU, sc);
         push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, 5000 + n) % 8190) << 8), &sp.infos[vid]);
     }
 }
@@ -958,11 +966,11 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 let lot = (row * n + l) as u32;
                 let right = bu(i, j, 30 + lot) < 0.5;
                 let at = |u: f64, v: f64| (x0 + l as f64 * lw + u, if row == 0 { y0 + v } else { y0 + h - v });
-                if bu(i, j, 3100 + lot) < 0.6 {
+                if bu(i, j, 3100 + lot) < 0.85 {
                     let (x, y) = at(if right { 2.6 } else { lw - 2.6 }, 2.8);
                     spots.push((x, y, bu(i, j, 3200 + lot) < 0.4, 3300 + lot));
                 }
-                let backs = 1 + (bu(i, j, 3400 + lot) * 2.2) as u32;
+                let backs = 2 + (bu(i, j, 3400 + lot) * 2.5) as u32;
                 for t in 0..backs {
                     let u = 3.0 + (lw - 6.0) * bu(i, j, 3500 + lot * 4 + t);
                     let (x, y) = at(u, h * 0.5 - 3.5 - 2.0 * bu(i, j, 3600 + lot * 4 + t));
@@ -999,6 +1007,30 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             }
         }
     }
+    // the waterfront: palms and broad crowns along every edge of the block that the water
+    // comes within 12 m of (the canal banks, the bay shore), every ~8 m
+    {
+        let per = 2.0 * (w + h);
+        let n = (per / 8.0).floor() as u32;
+        for t in 0..n {
+            let s = (t as f64 + 0.5) / n as f64 * per;
+            let (u, v, nx, ny) = if s < w {
+                (s, 1.5, 0.0, -1.0)
+            } else if s < w + h {
+                (w - 1.5, s - w, 1.0, 0.0)
+            } else if s < 2.0 * w + h {
+                (2.0 * w + h - s, h - 1.5, 0.0, 1.0)
+            } else {
+                (1.5, per - s, -1.0, 0.0)
+            };
+            let (x, y) = (x0 + u, y0 + v);
+            // water just beyond this edge (past the street) or right here at a lot's back
+            let near = water_at(k, terrain, x + nx * 12.0, y + ny * 12.0) || water_at(k, terrain, x - nx * 6.0 + ny * 6.0, y - ny * 6.0 + nx * 6.0);
+            if near && bu(i, j, 8000 + t) < 0.8 {
+                spots.push((x, y, bu(i, j, 8100 + t) < 0.35, 8200 + t));
+            }
+        }
+    }
     for (x, y, broad, salt) in spots {
         if placed.iter().any(|p| (x - p.x).abs() < p.hx + 1.5 && (y - p.y).abs() < p.hy + 1.5) {
             continue;
@@ -1013,7 +1045,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             return;
         }
         let vid = list[(bh(i, j, salt) as usize) % list.len()];
-        let sc = if broad { 0.6 + 0.35 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
+        let sc = if broad { 0.7 + 0.4 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
         let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, sc);
         push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, salt + 70_000) % 8190) << 8), &sp.infos[vid]);
     }
