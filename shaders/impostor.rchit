@@ -33,8 +33,8 @@ void main() {
         float glassB = clamp((1.0 - v.y) * 2.0 - 0.04, 0.0, 1.0);
         // its own wall colour (building.rchit buildingTint, the same seed), on what is not glass
         uint bs = plantSeed(pr);
-        const vec3 T[8] = vec3[8](vec3(1.0), vec3(1.0, 0.95, 0.86), vec3(1.0, 0.9, 0.88), vec3(0.92, 0.96, 1.0),
-                                  vec3(0.94, 1.0, 0.93), vec3(1.0, 0.97, 0.88), vec3(0.86, 0.86, 0.85), vec3(1.0, 0.98, 0.95));
+        const vec3 T[8] = vec3[8](vec3(0.96), vec3(0.97, 0.86, 0.70), vec3(0.95, 0.79, 0.70), vec3(0.85, 0.79, 0.69),
+                                  vec3(0.90, 0.92, 0.87), vec3(0.99, 0.92, 0.76), vec3(0.76, 0.72, 0.66), vec3(0.92, 0.83, 0.79));
         vec3 tint = bs == 0u ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
         if (imps[vid].bmax.w > 0.5) {
             // a car: its paint (building.rchit carPaint)

@@ -28,8 +28,8 @@ const vec3 B_FRAME[4] = vec3[4](vec3(0.10, 0.105, 0.11), vec3(0.46, 0.47, 0.48),
 // in step with impostor.rchit): a palette of whites, creams and pastels; seed 0 (the bake) none.
 vec3 buildingTint(uint seed) {
     if (seed == 0u) return vec3(1.0);
-    const vec3 T[8] = vec3[8](vec3(1.0), vec3(1.0, 0.95, 0.86), vec3(1.0, 0.9, 0.88), vec3(0.92, 0.96, 1.0),
-                              vec3(0.94, 1.0, 0.93), vec3(1.0, 0.97, 0.88), vec3(0.86, 0.86, 0.85), vec3(1.0, 0.98, 0.95));
+    const vec3 T[8] = vec3[8](vec3(0.96), vec3(0.97, 0.86, 0.70), vec3(0.95, 0.79, 0.70), vec3(0.85, 0.79, 0.69),
+                              vec3(0.90, 0.92, 0.87), vec3(0.99, 0.92, 0.76), vec3(0.76, 0.72, 0.66), vec3(0.92, 0.83, 0.79));
     return T[pcg(seed * 747796405u) & 7u];
 }
 
@@ -125,7 +125,7 @@ void main() {
         if (rs != 0u) albedo *= RT[pcg(rs * 1597334677u) % 6u];
     } else if (mt == 5u) {
         // clay roof tiles: courses down the slope, every tile its own shade
-        vec3 tc = pal == 0u ? vec3(0.46, 0.20, 0.12) : pal == 1u ? vec3(0.54, 0.31, 0.18) : pal == 2u ? vec3(0.40, 0.24, 0.17) : pal == 3u ? vec3(0.27, 0.28, 0.29) : vec3(0.66, 0.65, 0.62);
+        vec3 tc = pal == 0u ? vec3(0.46, 0.20, 0.12) : pal == 1u ? vec3(0.54, 0.31, 0.18) : pal == 2u ? vec3(0.40, 0.24, 0.17) : pal == 3u ? vec3(0.27, 0.28, 0.29) : vec3(0.56, 0.45, 0.36); // (4: faded sun-bleached clay)
         vec2 q = vec2(po.x + po.z, po.y) * vec2(3.2, 4.0);
         float course = smoothstep(0.0, 0.25, fract(q.y));
         albedo = tc * mix(1.0, mix(0.75, 1.15, bHash(floor(q), 7u)) * mix(0.8, 1.0, course), detail) * grime;
