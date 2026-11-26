@@ -334,9 +334,11 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 for k in 0..n {
                     b.wall(poly[k], poly[(k + 1) % n], y - 0.3, y, 0.0, m(SLAB, 0), None);
                     if solid {
-                        // a solid white parapet, the slab's edge carried up
-                        b.wall(poly[k], poly[(k + 1) % n], y, y + 1.1, 0.0, m(SLAB, 0), None);
-                        b.strip(poly[k], poly[(k + 1) % n], y + 1.1, y + 1.18, -0.2, 0.0, m(SLAB, 0));
+                        // a solid parapet, the slab's edge carried up: white concrete on a white
+                        // block (wall 0), the block's own stucco on the others
+                        let pm = if pal.wall == 0 { m(SLAB, 0) } else { m(WALL, pal.wall) };
+                        b.wall(poly[k], poly[(k + 1) % n], y, y + 1.1, 0.0, pm, None);
+                        b.strip(poly[k], poly[(k + 1) % n], y + 1.1, y + 1.18, -0.2, 0.0, pm);
                         continue;
                     }
                     // glass rail on the slab edge, with a top rail
@@ -1126,22 +1128,22 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         // balconies, 2 ribbon
         type Wing = ((f32, f32), f32, f32, f32, usize, usize);
         let kinds: [(&[Wing], u8, u8, u8); 16] = [
-            (&[((0.0, 0.0), 62.0, 14.0, 0.0, 0, 6)], 1, 0, 0),
+            (&[((0.0, 0.0), 62.0, 14.0, 0.0, 0, 6)], 1, 1, 0),
             (&[((0.0, 0.0), 48.0, 16.0, 0.0, 0, 12)], 0, 1, 2),
             (&[((-4.0, -6.0), 40.0, 16.0, 0.0, 0, 9), ((14.0, 9.0), 16.0, 30.0, 0.0, 0, 5)], 0, 4, 1),
-            (&[((0.0, -8.0), 38.0, 14.0, 0.0, 0, 14), ((-14.0, 8.0), 14.0, 28.0, 0.0, 0, 7)], 1, 0, 5),
+            (&[((0.0, -8.0), 38.0, 14.0, 0.0, 0, 14), ((-14.0, 8.0), 14.0, 28.0, 0.0, 0, 7)], 1, 5, 5),
             (&[((0.0, 0.0), 46.0, 18.0, 8.9, 5, 10)], 1, 0, 4),
-            (&[((0.0, 0.0), 30.0, 30.0, 9.0, 4, 8)], 0, 5, 0),
+            (&[((0.0, 0.0), 30.0, 30.0, 9.0, 4, 8)], 0, 4, 0),
             (&[((0.0, 0.0), 42.0, 32.0, 0.0, 0, 4), ((4.0, -2.0), 26.0, 20.0, 4.0, 0, 12)], 2, 6, 2),
             (&[((0.0, 0.0), 58.0, 22.0, 0.0, 0, 4)], 2, 7, 3),
             (&[((-10.0, 0.0), 24.0, 26.0, 0.0, 0, 7), ((12.0, 0.0), 20.0, 26.0, 0.0, 0, 11)], 0, 1, 1),
             (&[((0.0, 0.0), 36.0, 16.0, 7.9, 4, 13), ((0.0, 14.0), 22.0, 12.0, 0.0, 0, 4)], 1, 3, 4),
             // (small ones, for the lots of a block split six ways: 20-32 m)
-            (&[((-3.0, -5.0), 24.0, 12.0, 0.0, 0, 6), ((7.0, 5.0), 10.0, 22.0, 0.0, 0, 4)], 0, 1, 0),
-            (&[((0.0, 0.0), 28.0, 16.0, 7.9, 4, 7)], 1, 0, 5),
+            (&[((-3.0, -5.0), 24.0, 12.0, 0.0, 0, 6), ((7.0, 5.0), 10.0, 22.0, 0.0, 0, 4)], 0, 4, 0),
+            (&[((0.0, 0.0), 28.0, 16.0, 7.9, 4, 7)], 1, 7, 5),
             (&[((0.0, 0.0), 32.0, 12.0, 0.0, 0, 9)], 0, 4, 2),
             (&[((-7.0, 0.0), 12.0, 22.0, 0.0, 0, 5), ((7.0, 0.0), 12.0, 22.0, 0.0, 0, 8)], 1, 5, 4),
-            (&[((0.0, 0.0), 22.0, 22.0, 5.0, 0, 11)], 1, 0, 1),
+            (&[((0.0, 0.0), 22.0, 22.0, 5.0, 0, 11)], 1, 3, 1),
             (&[((0.0, -4.0), 26.0, 14.0, 0.0, 0, 3), ((0.0, 5.0), 16.0, 10.0, 0.0, 0, 6)], 2, 7, 0),
         ];
         for (k, &(wings, fac, wall, glass)) in kinds.iter().enumerate() {
@@ -1163,6 +1165,32 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             }
             push(b, format!("Building_Apartments_Mix_{k}"), top + 4.0, &mut meshes, &mut archs);
         }
+    }
+    // big low blocks between them: a supermarket or a strip of shops, a showroom, a parking
+    // deck; 1-3 storeys, 36-64 m, flat roofs crowded with plant (units, ducts, a tank)
+    for k in 0..6 {
+        let mut b = B::new();
+        let (w, d, storeys, wall, garage) = [(56.0f32, 40.0f32, 1usize, 1u8, false), (64.0, 30.0, 2, 4, false), (44.0, 36.0, 1, 3, false), (48.0, 44.0, 3, 6, true), (40.0, 28.0, 2, 5, false), (60.0, 38.0, 1, 7, false)][k];
+        let pal = Pal { wall, glass: [0, 2, 1, 0, 3, 2][k], frame: 2 };
+        let poly = footprint(w, d, 0.0, 0);
+        let h = if garage { 3.1 * storeys as f32 } else { 5.0 + (storeys - 1) as f32 * 3.8 };
+        let fac = if garage { Fac::Garage } else { Fac::Ribbon { win: 0.35, col: 3.0 } };
+        volume(&mut b, &poly, 0.0, h, if garage { 0.0 } else { 5.0 }, 3.8, fac, &pal, true, &mut rng);
+        // the plant: a grid of units over most of the roof
+        let (nx, nz) = ((w / 9.0) as i32, (d / 9.0) as i32);
+        for ix in 0..nx {
+            for iz in 0..nz {
+                if rng.f() < 0.45 {
+                    continue;
+                }
+                let (cx, cz) = (-w * 0.5 + (ix as f32 + 0.5) * w / nx as f32 + rng.range(-1.5, 1.5), -d * 0.5 + (iz as f32 + 0.5) * d / nz as f32 + rng.range(-1.5, 1.5));
+                let (sx, sz, sh) = (rng.range(1.6, 3.8), rng.range(1.4, 2.8), rng.range(0.9, 1.8));
+                b.bx(Vec3::new(cx - sx * 0.5, h, cz - sz * 0.5), Vec3::new(cx + sx * 0.5, h + sh, cz + sz * 0.5), m(EQUIP, rng.pick(3) as u8), false);
+            }
+        }
+        // a duct run across it
+        b.bx(Vec3::new(-w * 0.35, h + 0.4, -0.5), Vec3::new(w * 0.35, h + 1.2, 0.5), m(EQUIP, 1), false);
+        push(b, format!("Building_Retail_{k}"), h + 4.0, &mut meshes, &mut archs);
     }
     (meshes, archs)
 }
