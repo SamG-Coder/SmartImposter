@@ -733,11 +733,12 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let (w, d, storeys) = [(28.0f32, 18.0f32, 3usize), (34.0, 20.0, 4), (24.0, 16.0, 3), (30.0, 22.0, 5), (36.0, 18.0, 3), (26.0, 20.0, 4)][k];
         let poly = footprint(w, d, 5.0, 4);
         let h = 3.3 * storeys as f32 + 0.6;
-        volume(&mut b, &poly, 0.0, h, 0.0, 3.3, Fac::Punched { col: 2.8, w: 1.7, h: 1.4 }, &pal, true, &mut rng);
+        volume(&mut b, &poly, 0.0, h, 0.0, 3.3, Fac::Punched { col: 2.6, w: 1.9, h: 1.7 }, &pal, true, &mut rng);
         for f in 1..=storeys {
             let y = f as f32 * 3.3 - 0.75;
             for e in 0..poly.len() {
-                b.strip(poly[e], poly[(e + 1) % poly.len()], y, y + 0.14, 0.0, 0.7, m(SLAB, 0));
+                // (shallow, in a darker shade of the wall: from above the windows show between them)
+                b.strip(poly[e], poly[(e + 1) % poly.len()], y, y + 0.12, 0.0, 0.4, m(SPANDREL, pal.wall));
             }
         }
         // the fin over the entrance on the street side (-z)

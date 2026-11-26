@@ -590,14 +590,17 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         float edge = 1.0 - cBox(b, vec2(2.2), vec2(W, H) - 2.2, fw);
         lot = mix(lot, lawnC, edge);
     } else {
-        // plazas: stone paving, planters, lawn panels
-        lot = plaza;
-        vec2 pm = mod(b, vec2(14.0, 11.0));
-        float planter = cBox(pm, vec2(1.0, 1.0), vec2(5.0, 2.6), fw) * step(0.4, cBu(i, j, 5u));
-        lot = mix(lot, lawnC * 0.8, planter);
-        float edge = 1.0 - cBox(b, vec2(1.6), vec2(W, H) - 1.6, fw);
-        lot = mix(lot, lawnC, edge * 0.8);
-        if (zone == 2) lot = mix(lot, pave, 0.4);
+        // plazas: lawn panels between paved paths 4 m wide every 18 x 15 m (globe/city.rs
+        // lot_trees puts a shade tree on most panels), planting beds along the edges,
+        // varied paving under the paths
+        vec2 pm = mod(b, vec2(18.0, 15.0));
+        float panel = cBox(pm, vec2(4.0, 4.0), vec2(18.0, 15.0), fw);
+        vec3 bed = vec3(0.04, 0.065, 0.022) * mix(0.7, 1.3, fbmN(c * 0.8 + 3.0, 2));
+        vec3 grass = mix(lawnC, bed, smoothstep(0.55, 0.75, fbmN(c * 0.15 + 21.0, 2)));
+        lot = mix(plaza, grass, panel);
+        float edge = 1.0 - cBox(b, vec2(2.0), vec2(W, H) - 2.0, fw);
+        lot = mix(lot, bed, edge * 0.9);
+        if (zone == 2) lot = mix(lot, pave, 0.25 * (1.0 - panel));
     }
     vec3 planned = mix(lot, mix(walk, asphalt, roadW), streetW);
     {
@@ -641,6 +644,17 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         float cover = 1.0 - smoothstep(D + 15.5, D + 15.5 + fw, sd);
         cover *= 1.0 - roadW * (1.0 - smoothstep(D - 1.0, D, sd)); // the streets run through
         alb = mix(alb, wf, cover);
+    }
+    // inside the interchanges: landscaped ground (globe/city.rs CLEAR)
+    {
+        const vec3 CLEAR[1] = vec3[1](vec3(-3061.0, -1660.0, 190.0));
+        for (int q = 0; q < 1; ++q) {
+            float dq = length(cw - CLEAR[q].xy);
+            float inC = 1.0 - smoothstep(CLEAR[q].z - 6.0, CLEAR[q].z, dq);
+            inC *= 1.0 - streetW; // (the streets run on under the interchange)
+            vec3 land = mix(lawnC, vec3(0.04, 0.065, 0.022), smoothstep(0.5, 0.7, fbmN(c * 0.05 + 77.0, 3)));
+            alb = mix(alb, land, inC);
+        }
     }
     // the roads of their own: an avenue's asphalt, lane lines and planted median; the ground
     // under an elevated road is a mown verge
@@ -698,16 +712,16 @@ void main() {
     float cellM = V.v[NVERT * 12u];
     float sd = shoreDist(V, tuv);
     // the city's waterfront drive follows a low-passed shore: the field (before its noise)
-    // averaged over a ring of 14 m round the point
+    // averaged over a ring of 30 m round the point
     float sdSmooth = sd;
     {
-        float ru = 14.0 / max(cellM * float(FIELD), 1.0);
+        float ru = 30.0 / max(cellM * float(FIELD), 1.0);
         float acc = sd;
-        for (int k = 0; k < 8; ++k) {
-            float a = float(k) * 0.7853982;
+        for (int k = 0; k < 12; ++k) {
+            float a = float(k) * 0.5235988;
             acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
         }
-        sdSmooth = acc / 9.0;
+        sdSmooth = acc / 13.0;
     }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));

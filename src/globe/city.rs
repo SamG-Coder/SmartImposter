@@ -346,6 +346,14 @@ impl Way {
     }
 }
 
+/// Ground kept clear inside the interchanges (landscaped, nothing built or parked): circles in
+/// the city's plane, x, y, radius (globe.rchit C_CLEAR the same).
+const CLEAR: &[(f64, f64, f64)] = &[(-3061.0, -1660.0, 190.0)];
+
+fn in_clear(x: f64, y: f64) -> bool {
+    CLEAR.iter().any(|&(cx, cy, r)| (x - cx).powi(2) + (y - cy).powi(2) < r * r)
+}
+
 /// Is the city-plane point on one of the roads (within its half width plus `pad`)?
 fn on_way(x: f64, y: f64, pad: f64) -> bool {
     WAYS.iter().any(|w| w.dist(x, y, w.half + pad).is_some())
@@ -611,7 +619,7 @@ fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (wx, wy) = to_world(x, y);
-    if on_way(wx, wy, 1.0) {
+    if on_way(wx, wy, 1.0) || in_clear(wx, wy) {
         return false;
     }
     let (la, lo) = to_lat_lon(k, x, y);
@@ -1759,12 +1767,16 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             };
             spots.push((x0 + u, y0 + v, false, 4200 + t));
         }
-    } else if bu(i, j, 5) >= 0.4 {
-        // plaza planters: one every 14 x 11 m, a palm in each
-        let (nx, ny) = ((w / 14.0).floor() as i64, (h / 11.0).floor() as i64);
+    } else {
+        // plazas: shade trees on the lawn panels (globe.rchit: lawn between 4 m paths every
+        // 18 x 15 m), a broad crown in most, a palm in some
+        let (nx, ny) = ((w / 18.0).floor() as i64, (h / 15.0).floor() as i64);
         for a in 0..nx {
             for b in 0..ny {
-                spots.push((x0 + a as f64 * 14.0 + 3.0, y0 + b as f64 * 11.0 + 1.8, false, 4400 + (a * 31 + b) as u32));
+                let salt = 4400 + (a * 31 + b) as u32;
+                if bu(i, j, salt + 7) < 0.8 {
+                    spots.push((x0 + a as f64 * 18.0 + 11.0, y0 + b as f64 * 15.0 + 9.5, bu(i, j, salt + 9) < 0.75, salt));
+                }
             }
         }
     }
