@@ -706,7 +706,21 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
             if fits.is_empty() {
                 continue;
             }
-            let pick = if class == Class::Tower {
+            // a landmark tower now and then on the first lot of a block in the heart of a core
+            let landmark = class == Class::Tower && z == 3 && lot == 0 && dens > 0.8 && bu(i, j, 97) < 0.22;
+            let marks: Vec<(usize, u32)> = if landmark {
+                archs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| r.class == Class::Landmark && r.size[0] as f64 <= lw - 4.0 && r.size[1] as f64 <= lh - 4.0)
+                    .map(|(a, _)| (a, 0))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let pick = if !marks.is_empty() {
+                marks[(bh(i, j, 98) as usize) % marks.len()]
+            } else if class == Class::Tower {
                 // taller towers nearer the core centres, and now and then a much taller one
                 // (outside the cores only the shortest towers: the mid-rise city round them is
                 // 10-25 storeys)
@@ -1101,6 +1115,61 @@ fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64,
 
 const BOAT_CELL: f64 = 130.0;
 
+/// Marinas off the waterfront of block (i, j) (the city's blocks other than houses): where the
+/// water reaches out beyond an edge of the block, a walkway runs along the edge 14 m out, finger
+/// docks off it every 9 m, and boats moored either side of most fingers.
+#[allow(clippy::too_many_arguments)]
+fn marinas(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, dock: &ArchRef, boats: &[&ArchRef]) {
+    if boats.len() < 3 {
+        return;
+    }
+    let (x0, y0, w, h) = interior(i, j);
+    // edges: start, direction along, outward normal, length
+    let edges = [
+        ((x0, y0), (1.0, 0.0), (0.0, -1.0), w),
+        ((x0 + w, y0), (0.0, 1.0), (1.0, 0.0), h),
+        ((x0 + w, y0 + h), (-1.0, 0.0), (0.0, 1.0), w),
+        ((x0, y0 + h), (0.0, -1.0), (-1.0, 0.0), h),
+    ];
+    for (e, &((sx, sy), (ax, ay), (nx, ny), len)) in edges.iter().enumerate() {
+        if bu(i, j, 9800 + e as u32) > 0.25 {
+            continue;
+        }
+        let mut t = 6.0;
+        let mut n = 0u32;
+        while t < len - 6.0 {
+            let (bx, by) = (sx + ax * t, sy + ay * t);
+            n += 1;
+            t += 9.0;
+            // the walkway's place and the fingers' far ends must be water
+            let wx = (bx + nx * 14.0, by + ny * 14.0);
+            if !water_at(k, terrain, wx.0, wx.1) || !water_at(k, terrain, bx + nx * 28.0, by + ny * 28.0) || !water_at(k, terrain, bx + nx * 70.0, by + ny * 70.0) {
+                continue;
+            }
+            let salt = 10_000 + e as u32 * 1000 + n;
+            let along = ay.atan2(ax);
+            let out = ny.atan2(nx);
+            // the walkway: a dock lying along the edge (its 13 m from x = 0)
+            put_boat(k, sp, dock, wx.0 - ax * 4.5, wx.1 - ay * 4.5, along, bh(i, j, salt), id, tile);
+            // the finger, out from the walkway
+            put_boat(k, sp, dock, wx.0 + nx * 1.4, wx.1 + ny * 1.4, out, bh(i, j, salt + 1), id, tile);
+            for side in [-1.0f64, 1.0] {
+                if bu(i, j, salt + 2 + (side > 0.0) as u32) > 0.8 {
+                    continue;
+                }
+                let kind = if bu(i, j, salt + 4 + (side > 0.0) as u32) < 0.6 { 0 } else if bu(i, j, salt + 6) < 0.9 { 1 } else { 2 };
+                let r = boats[kind];
+                let off = 1.4 + r.size[1] as f64 * 0.5 + 0.3;
+                let reach = 1.4 + r.size[0] as f64 * 0.5 + 0.5;
+                let (px, py) = (wx.0 + nx * reach + ax * side * off, wx.1 + ny * reach + ay * side * off);
+                if water_at(k, terrain, px + nx * r.size[0] as f64 * 0.5, py + ny * r.size[0] as f64 * 0.5) {
+                    put_boat(k, sp, r, px, py, out + if bu(i, j, salt + 8) < 0.5 { 0.0 } else { std::f64::consts::PI }, bh(i, j, salt + 9), id, tile);
+                }
+            }
+        }
+    }
+}
+
 /// The boat archetypes (runabout, cruiser, yacht) and the dock, in that order.
 fn boat_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Option<&ArchRef>) {
     (archs.iter().filter(|a| a.class == Class::Boat).collect(), archs.iter().find(|a| a.class == Class::Dock))
@@ -1160,7 +1229,11 @@ fn open_water_boat(k: usize, terrain: &Terrain, sp: &Species, a: i64, b: i64, lv
 fn docks(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, placed: &[Placed]) {
     let (boats, dock) = boat_kinds(&sp.buildings);
     let Some(dock) = dock else { return };
-    if block_zone(k, i, j) != 0 || placed.is_empty() {
+    if block_zone(k, i, j) != 0 {
+        marinas(k, terrain, sp, i, j, id, tile, dock, &boats);
+        return;
+    }
+    if placed.is_empty() {
         return;
     }
     let (x0, y0, w, h) = interior(i, j);

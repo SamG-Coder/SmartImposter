@@ -47,6 +47,8 @@ pub enum Class {
     Bridge,
     /// elevated highway and ramp decks
     Highway,
+    /// towers of their own shapes: one each in the densest cores
+    Landmark,
 }
 
 pub struct Arch {
@@ -462,6 +464,13 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                     let px = dx0 + (dx1 - dx0) * (0.2 + 0.3 * t as f32);
                     b.bx(Vec3::new(px - 0.5, y1 + 0.15, dz1 - 1.4), Vec3::new(px + 0.5, y1 + 0.8, dz1 - 0.4), m(TILE, 2), false);
                 }
+                // and on most, a pool in its coping on the other half of the roof
+                if ax > 16.0 && rng.f() < 0.7 {
+                    let (px0, px1) = (lo.x + ax * 0.55, lo.x + ax * 0.55 + (ax * 0.4).min(12.0));
+                    let (pz0, pz1) = (lo.y + 1.0, lo.y + 1.0 + (az * 0.4).min(5.0));
+                    b.bx(Vec3::new(px0 - 0.6, y1, pz0 - 0.6), Vec3::new(px1 + 0.6, y1 + 0.3, pz1 + 0.6), m(SLAB, 0), false);
+                    b.bx(Vec3::new(px0, y1 + 0.3, pz0), Vec3::new(px1, y1 + 0.32, pz1), m(POOL, 0), false);
+                }
             }
         }
     }
@@ -572,6 +581,57 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             top += 30.0;
         }
         push(b, format!("Building_Tower_{k}"), top, &mut meshes, &mut archs);
+    }
+    // landmarks: three towers with silhouettes of their own for the skyline's peaks: a tapering
+    // tower stepped back every few floors under a needle spire, a cylinder whose crown is a
+    // ring of fins round an open top, a slab with a curved sail crown sweeping above its roof
+    {
+        let mut b = B::new();
+        let pal = Pal { wall: 2, glass: 4, frame: 1 };
+        let mut lo = 0.0f32;
+        let (mut w, mut d) = (40.0f32, 40.0f32);
+        for t in 0..6 {
+            let hi = lo + [70.0f32, 55.0, 45.0, 40.0, 30.0, 25.0][t];
+            let poly = footprint(w, d, w * 0.22, 0);
+            volume(&mut b, &poly, lo, hi, if lo == 0.0 { 7.0 } else { 0.0 }, 4.0, Fac::Curtain { col: 1.5, fin: 0.3 }, &pal, true, &mut rng);
+            lo = hi;
+            w -= 5.0;
+            d -= 5.0;
+        }
+        b.bx(Vec3::new(-0.7, lo, -0.7), Vec3::new(0.7, lo + 70.0, 0.7), m(FRAME, 2), false);
+        push(b, "Building_Landmark_0".into(), lo + 70.0, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        let pal = Pal { wall: 0, glass: 5, frame: 2 };
+        let poly = footprint(38.0, 38.0, 19.0, 6);
+        volume(&mut b, &poly, 0.0, 250.0, 7.0, 3.4, Fac::Balcony { depth: 2.2 }, &pal, false, &mut rng);
+        b.cap(&poly, 250.0, true, m(ROOF, 0));
+        // the crown: fins standing round the rim, open between them
+        for k in 0..16 {
+            let a = k as f32 / 16.0 * std::f32::consts::TAU;
+            let (c, s) = (a.cos(), a.sin());
+            let (r0, r1) = (17.0f32, 19.5f32);
+            let p = |r: f32, t: f32| Vec2::new(c * r - s * t, s * r + c * t);
+            let fin = ccw(vec![p(r0, -0.4), p(r1, -0.4), p(r1, 0.4), p(r0, 0.4)]);
+            b.prism(&fin, 250.0, 278.0, m(SLAB, 0), m(SLAB, 0), false);
+        }
+        push(b, "Building_Landmark_1".into(), 278.0, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        let pal = Pal { wall: 0, glass: 1, frame: 2 };
+        let poly = footprint(54.0, 26.0, 0.0, 0);
+        volume(&mut b, &poly, 0.0, 230.0, 7.0, 3.6, Fac::Curtain { col: 1.6, fin: 0.25 }, &pal, true, &mut rng);
+        // the sail: a curved plate rising off one end, leaning back over the roof
+        let n = 12;
+        for k in 0..n {
+            let (t0, t1) = (k as f32 / n as f32, (k + 1) as f32 / n as f32);
+            let x = |t: f32| -27.0 + 30.0 * t * t;
+            let y = |t: f32| 230.0 + 60.0 * t;
+            b.bx(Vec3::new(x(t0).min(x(t1)) - 0.6, y(t0), -13.0), Vec3::new(x(t0).max(x(t1)) + 0.6, y(t1), 13.0), m(GLASS, 4), false);
+        }
+        push(b, "Building_Landmark_2".into(), 290.0, &mut meshes, &mut archs);
     }
     // residential towers: white slab bands, glass rails, blue-green glass (the Miami look)
     for k in 0..9 {
@@ -985,7 +1045,9 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("Highway") {
+    if name.contains("Landmark") {
+        Class::Landmark
+    } else if name.contains("Highway") {
         Class::Highway
     } else if name.contains("Boat_Wake") {
         Class::Underway
