@@ -674,6 +674,9 @@ void main() {
             // bridges and the buildings cast their shadows on the water)
             vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 * (globe() ? mix(0.15, 1.0, sh) : 1.0) + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
+            // (a city's channels darken towards their banks: the walls' and the trees' shade, the
+            // silt stirred up along them; the shore distance is wq.z, < 0 out on the water)
+            if (globe() && g.city.x > 0.5) refr *= mix(0.68, 1.0, smoothstep(1.0, 16.0, -wq.z));
             // flowing ripples: two octaves drifting at different speeds and directions, fixed to
             // the ground (globe: the Earth-fixed water coordinates, not the camera frame)
             float tm = g.extra.w;
@@ -707,6 +710,22 @@ void main() {
                 lostVar += g.ocean0.y;
                 // whitecaps where the crests fold (ocean.rs: the coverage for the wind)
                 waveFoam = max(oA(1, x, lod.y).w * oAmp.y, oA(2, x, lod.z).w * oAmp.z);
+                // a city's sheltered water: the swell is gone, the wind's own ripples (3 m to
+                // 3 cm, noise stretched along their crests) are what break the mirror up close
+                if (g.city.x > 0.5) {
+                    for (int i = 1; i < 10; ++i) {
+                        float fi = float(i);
+                        float lam = 5.0 * pow(0.6, fi);
+                        float ang = 0.7 + sin(fi * 2.399) * (0.45 + 0.05 * fi);
+                        vec2 dd = vec2(cos(ang), sin(ang)), cc = vec2(-dd.y, dd.x);
+                        float speed = sqrt(9.81 * lam / 6.2831853);
+                        vec2 sp = vec2((dot(q, dd) - speed * tm) / lam, dot(q, cc) / (lam * 1.4)) + fi * 17.3;
+                        vec3 nd = vnoiseD(sp);
+                        float keep = 1.0 - smoothstep(lam * 0.15, lam * 0.5, pxM);
+                        gr += (dd * nd.y + cc * nd.z / 1.4) * (i < 3 ? 0.045 : 0.07) * keep;
+                        lostVar += 0.18 * 0.0049 * (1.0 - keep * keep);
+                    }
+                }
             } else if (globeWater) {
                 // wind waves: directional swells from 12 cm to 7 m spread around the wind, slope
                 // ~0.04 each, gusts (slow patches) varying their strength; waves smaller than a
@@ -775,6 +794,13 @@ void main() {
             p = ps;
             pl.t = tSurf;
             col = refr;
+            // (a city's calm water up close: each ripple facet takes the sun's light into the
+            // water a little more or less as it faces the sun, a fine texture over the body
+            // colour that the weak Fresnel reflection at steep angles cannot give)
+            if (globeWater && g.city.x > 0.5) {
+                vec2 Lt = vec2(dot(L, wtan), dot(L, wvd));
+                col *= clamp(1.0 - 2.3 * dot(gr, Lt) / max(dot(L, normalize(gq)), 0.2), 0.85, 1.15);
+            }
             if (seaFFT) {
                 // Light through the thin wave crests (Atlas GDC 2019 water BSDF, simplified): the
                 // crests glow green-blue when the sun is behind them, a little on the faces too

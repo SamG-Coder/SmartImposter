@@ -1195,7 +1195,10 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     let seed = 1 + (bh((p.x * 4.0) as i64, (p.y * 4.0) as i64, 7) % 8190);
                     // (sunk a little: the ground under a footprint is never quite flat; no
                     // thinning level: impostor.rint never thins buildings)
-                    let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.4, p.quarter as f64 * std::f64::consts::FRAC_PI_2, p.scale);
+                    // (a pool and its patio lie flat on the ground, a few cm up: sunk as the
+                    // buildings are, all 20 cm of it was under the lawn)
+                    let sink = if r.class == Class::Pool { -0.03 } else { 0.4 };
+                    let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - sink, p.quarter as f64 * std::f64::consts::FRAC_PI_2, p.scale);
                     push_rec(tile, rows, super::forest::rec_data(r.variant, seed << 8), &infos[r.variant]);
                 }
                 // (the buildings first: a tile full of cars must not lose a tower)
