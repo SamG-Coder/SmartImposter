@@ -101,8 +101,8 @@ void main() {
             glass = mix(glass, 0.15, fm);
             // a lit room behind about two windows in five, warm or cool, some dimmer; its
             // average where the pixel holds many windows
-            float lit = mix(0.28, step(bHash(cell, meshId * 31u + 3u), 0.28), detail);
-            vec3 room = mix(vec3(1.0, 0.68, 0.36), vec3(0.85, 0.9, 1.0), step(0.88, r1)) * mix(0.5, 1.0, r2);
+            float lit = mix(0.2, step(bHash(cell, meshId * 31u + 3u), 0.2), detail);
+            vec3 room = mix(vec3(1.0, 0.56, 0.24), vec3(0.85, 0.9, 1.0), step(0.88, r1)) * mix(0.5, 1.0, r2);
             emit = room * lit * (1.0 - fm) * (1.0 - fs);
         }
     } else if (mt == 0u || mt == 10u) {

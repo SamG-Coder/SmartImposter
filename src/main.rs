@@ -1093,6 +1093,10 @@ impl App {
             // (a half moon gives ~2.4e-6 of daylight; ^0.85 leaves a moonlit night ~3 stops darker
             // than day, as a dark-adapted eye sees it; airglow and starlight keep a floor)
             let target = ((4.6 / (day + moon_up + 2e-8)).powf(0.85)).clamp(1.0, 1e6) as f32;
+            // over a city at dusk, expose as a photographer does: up to ~2 stops more, so the
+            // afterglow and the lit city read instead of sinking into the dark
+            let city_dusk = if globe::city::shader_city(geo.ecef).is_some() { 1.0 + 3.0 * (1.0 - smoothstep(-0.1, 0.1, sun_e.dot(up_e))) } else { 1.0 };
+            let target = target * city_dusk as f32;
             // high up the whole view is sunlit ground and cloud tops: expose down as a camera in
             // orbit does (about a stop and a half from ~200 km)
             let alt = geo.ecef.length() - globe::tiles::R_EARTH;

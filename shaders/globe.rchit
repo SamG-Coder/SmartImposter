@@ -456,6 +456,28 @@ int cityEdge(vec2 uvm) {
     return e < 0.47 ? 0 : e < 0.58 ? 1 : e < 0.7 ? 2 : 3;
 }
 
+// The street lamps' light on the ground (globe/city.rs streets puts the lamps: every 30 m
+// from 6 m past the crossing, alternate sides, the head 2.4 m in from the kerb, 8.7 m up):
+// relative irradiance at plan point c from the lamps of the street through line `line` at
+// across-offset `d` (signed, from the line) and along-distance `s` from the block's start line,
+// whose crossings take h0 at the start and h1 at the end of a block `len` long.
+float cLampPool(float d, float s, float len, float h0, float h1, float kerb) {
+    float n = floor((s - h0 - 6.0 + 15.0) / 30.0);
+    float acc = 0.0;
+    for (float k = n - 1.0; k <= n + 1.0; k += 1.0) {
+        float sn = h0 + 6.0 + 30.0 * k;
+        if (k < 0.0 || sn >= len - h1 - 4.0) continue;
+        float side = mod(k, 2.0) < 0.5 ? -1.0 : 1.0;
+        vec2 q = vec2(d - side * (kerb - 2.4), s - sn);
+        float r2 = dot(q, q) + 8.7 * 8.7;
+        // cosine-weighted inverse square, ~1 under the head; the fixture's cut-off keeps it to
+        // a pool of ~16 m
+        acc += 8.7 / (r2 * sqrt(r2)) * 75.0 * smoothstep(16.0, 5.0, length(q));
+    }
+    return acc;
+}
+vec3 cityLamp = vec3(0.0); // set by cityGround: the lamps' light here (main.rgen adds it at dusk)
+
 float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, float sd, out vec3 alb) {
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
@@ -575,6 +597,13 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         if (zone == 2) lot = mix(lot, pave, 0.4);
     }
     vec3 planned = mix(lot, mix(walk, asphalt, roadW), streetW);
+    {
+        // the lamps of the nearest north-south and east-west streets
+        float ky = cHalf(ax) - cSide(ax) + 0.6, kx = cHalf(ay) - cSide(ay) + 0.6;
+        float lampNS = cLampPool(f.x - (li == i ? 0.0 : bw), f.y, bh, cHalf(cArtY(j)), cHalf(cArtY(j + 1)), ky);
+        float lampEW = cLampPool(f.y - (lj == j ? 0.0 : bh), f.x, bw, cHalf(cArtX(i)), cHalf(cArtX(i + 1)), kx);
+        cityLamp = vec3(1.0, 0.78, 0.5) * (lampNS + lampEW);
+    }
     // where the land cover is not built up (parks, grounds, open land in the city): kept lawn
     // under scattered shade, with paths, never the bare native soil showing through
     float shade = smoothstep(0.55, 0.75, fbmN(c * 0.06 + 31.0, 3) * 0.7 + fbmN(c * 0.4 + 2.0, 2) * 0.3);
@@ -843,6 +872,7 @@ void main() {
     pl.shadowMask = 0xFFu;
     pl.trans = vec3(0.0);
     pl.wdepth = depth;
+    pl.wtan = water ? vec3(0.0) : cityLamp; // (land: the street lamps' light, main.rgen)
     if (water) {
         // Earth-fixed water coordinates for main.rgen's ripples and foam: the texture coordinates
         // (m), the shore distance, the direction of the first coordinate, the surface height

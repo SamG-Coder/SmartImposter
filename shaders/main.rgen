@@ -516,6 +516,11 @@ void main() {
             indirect = Lin * PI * ao;
         }
         col = direct + alb * indirect;
+        // a city at dusk: the street lamps' pools of light on the ground (globe.rchit cityLamp)
+        if (globe() && mat == MAT_TERRAIN && !globeWater && g.city.x > 0.5) {
+            float duskG = smoothstep(0.15, -0.06, dot(L, normalize(gq)));
+            col += alb / PI * pl.wtan * (g.sunDir.w * 0.06 * duskG);
+        }
         if (craftHit && dbg == 0u) {
             // The aircraft's paint and metal (aircraft.rchit: roughness, metal, emission): a GGX
             // sun highlight, and the sky above and the land below mirrored by how smooth the
@@ -624,7 +629,7 @@ void main() {
             // reads dark as on a real car seen from above)
             if (plainGlass) { Fe *= 0.5; diffA *= 0.3; }
             col = diffA / PI * E * max(ndl, 0.0) * sh + diffA * indirect + spec + env * Fe;
-            col += emitB * (g.sunDir.w * 3e-3 * dusk);
+            col += emitB * (g.sunDir.w * 4.5e-3 * dusk);
             gbAlb = diffA;
             gbRough = rough;
             gbSpec = max(Fe.r, max(Fe.g, Fe.b));
