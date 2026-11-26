@@ -974,10 +974,10 @@ fn car(b: &mut B, len: f32, wid: f32, hgt: f32, kind: u32) {
     // tapered: the windscreen and the rear window raked, the sides leaning in (tumblehome), so
     // the glass shows from above as it does on a real car; the roof is paint
     let (rake_f, rake_r, tumble) = match kind {
-        0 => (0.95, 0.65, 0.16),
-        1 => (0.7, 0.25, 0.12),
-        2 => (0.6, 0.06, 0.12),
-        3 => (0.9, 0.08, 0.1),
+        0 => (1.0, 0.7, 0.24),
+        1 => (0.8, 0.35, 0.2),
+        2 => (0.65, 0.1, 0.18),
+        3 => (0.95, 0.12, 0.15),
         _ => (0.12, 0.05, 0.02),
     };
     let (zb, zt) = (hw - inset, hw - inset - tumble);
@@ -1008,13 +1008,31 @@ fn car(b: &mut B, len: f32, wid: f32, hgt: f32, kind: u32) {
         // the bed: low walls round an open box
         b.bx(Vec3::new(-hl, belt - 0.05, -hw), Vec3::new(x0 - 0.1, belt + 0.05, hw), m(DARK, 0), false);
     }
-    // wheels
+    // wheels: tyres standing a little proud of the body, a silver rim on the outer face, a
+    // dark arch cut round each in the body side
     let r = if kind == 4 { 0.5 } else { 0.34 };
     for &x in &[-hl * 0.68, hl * 0.62] {
-        for z in [-hw - 0.01, hw - 0.24] {
-            b.bx(Vec3::new(x - r, 0.0, z), Vec3::new(x + r, 2.0 * r, z + 0.25), m(DARK, 0), false);
+        for zs in [-1.0f32, 1.0] {
+            let z = zs * (hw - 0.12);
+            b.bx(Vec3::new(x - r, 0.0, z - 0.13), Vec3::new(x + r, 2.0 * r, z + 0.13), m(DARK, 0), false);
+            let face = zs * (hw + 0.015);
+            b.bx(Vec3::new(x - r * 0.6, r * 0.4, face - 0.01), Vec3::new(x + r * 0.6, r * 1.6, face + 0.01), m(FRAME, 1), false);
+            // the arch: a dark band over the tyre on the side
+            b.bx(Vec3::new(x - r - 0.08, 2.0 * r - 0.02, zs * hw - 0.012), Vec3::new(x + r + 0.08, 2.0 * r + 0.1, zs * hw + 0.012), m(DARK, 0), false);
         }
     }
+    if kind < 4 {
+        // door mirrors, a dark trim line round the glasshouse's foot, the grille
+        for zs in [-1.0f32, 1.0] {
+            b.bx(Vec3::new(x1 - 0.25, belt + 0.02, zs * hw - 0.1), Vec3::new(x1 - 0.05, belt + 0.16, zs * (hw + 0.16)), m(CARPAINT, 0), false);
+        }
+        b.prism(&g_trim(x0 - 0.02, x1 + 0.02, hw - inset + 0.03), belt - 0.03, belt + 0.03, m(DARK, 0), m(DARK, 0), false);
+        b.bx(Vec3::new(hl - 0.03, sill + 0.2, -hw * 0.45), Vec3::new(hl + 0.02, belt - 0.3, hw * 0.45), m(DARK, 0), false);
+    }
+}
+
+fn g_trim(x0: f32, x1: f32, z: f32) -> Vec<Vec2> {
+    ccw(vec![Vec2::new(x0, -z), Vec2::new(x1, -z), Vec2::new(x1, z), Vec2::new(x0, z)])
 }
 
 fn boat(b: &mut B, len: f32, beam: f32, kind: u32, pal: u8) -> f32 {

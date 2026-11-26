@@ -138,6 +138,11 @@ void main() {
         // car paint: each car's own colour (its record's seed; white in the bake, the impostor
         // applies the same colour: impostor.rchit carPaint), glossy
         albedo = vec3(0.85) * carPaint(instSeed(gl_InstanceCustomIndexEXT));
+        // panel shading: the sills and the lower doors a shade darker (road grime, the body's
+        // turn under), a shut line along the bonnet and the roof's edge
+        albedo *= mix(0.72, 1.0, smoothstep(0.3, 0.75, po.y));
+
+        albedo *= mix(1.0, 0.8, (1.0 - smoothstep(0.0, 0.04, abs(abs(po.z) - 0.55))) * step(0.9, po.y) * detail);
         coat = 1.0;
     } else if (mt == 15u) {
         // a bridge's roadway: asphalt with its centre line
