@@ -55,7 +55,7 @@ struct City {
 }
 
 /// Most cores a city has (the shader's globals hold this many).
-pub const MAX_CORES: usize = 14;
+pub const MAX_CORES: usize = 16;
 
 /// Miami: downtown and Brickell on the west shore of Biscayne Bay, Edgewater north of them, the
 /// high-rises along Miami Beach across the bay.
@@ -76,6 +76,8 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7760, lon: -80.2000, strength: 0.38, radius: 3800.0 }, // downtown's fringe
         // the beach's west end, round the canals: packed mid-rise
         Core { lat: 25.7860, lon: -80.1500, strength: 0.42, radius: 750.0 },
+        // downtown's west end on the lagoon's far shore: towers on the water
+        Core { lat: 25.7755, lon: -80.1925, strength: 0.9, radius: 380.0 },
         // the island in the middle of the bay west of it: apartment blocks and a few towers
         // (broad, mid-rise; its two built-up ends, a block or two each, reach tower density:
         // one or two towers; its middle is a park)
@@ -247,13 +249,22 @@ fn plane(k: usize, d: DVec3) -> (f64, f64) {
 
 // ---- the plan bends: a smooth warp from the plan (where the grid is straight) to the city's
 // plane, so the streets curve over a few hundred metres and the blocks are never quite square.
-// The same functions are in globe.rchit (cWarp); keep them in step. Its slope stays under 0.3,
-// so the inverse (a fixed point) converges in a few steps.
+// The same functions are in globe.rchit (cWarp); keep them in step. The inverse is Newton's
+// (globe.rchit cToPlan the same).
+//
+// Round the river west of downtown the grid turns to follow it (ROT: a centre in the plan,
+// the turn there, rad): a spiral, the turn easing to none between 900 and 2800 m out.
+const ROT: (f64, f64, f64) = (-4700.0, -650.0, -0.24);
 
 fn warp(x: f64, y: f64) -> (f64, f64) {
+    let (dx, dy) = (x - ROT.0, y - ROT.1);
+    let r = (dx * dx + dy * dy).sqrt();
+    let t = ((2800.0 - r) / 1900.0).clamp(0.0, 1.0);
+    let a = ROT.2 * t * t * (3.0 - 2.0 * t);
+    let (s, c) = a.sin_cos();
     (
-        50.0 * (y / 330.0 + 1.3).sin() + 18.0 * (y / 140.0 + x / 500.0 + 0.4).sin(),
-        40.0 * (x / 380.0 + 2.1).sin() + 15.0 * (x / 150.0 + y / 520.0 + 2.9).sin(),
+        50.0 * (y / 330.0 + 1.3).sin() + 18.0 * (y / 140.0 + x / 500.0 + 0.4).sin() + (dx * c - dy * s - dx),
+        40.0 * (x / 380.0 + 2.1).sin() + 15.0 * (x / 150.0 + y / 520.0 + 2.9).sin() + (dx * s + dy * c - dy),
     )
 }
 
@@ -265,11 +276,21 @@ pub fn to_world(x: f64, y: f64) -> (f64, f64) {
 
 /// The city's plane -> the plan.
 pub fn to_plan(x: f64, y: f64) -> (f64, f64) {
+    // (Newton's, the Jacobian by central differences of 1 m)
     let (mut qx, mut qy) = (x, y);
-    for _ in 0..6 {
-        let w = warp(qx, qy);
-        qx = x - w.0;
-        qy = y - w.1;
+    for _ in 0..8 {
+        let (fx, fy) = to_world(qx, qy);
+        let (ex, ey) = (fx - x, fy - y);
+        let (a1, a0) = (to_world(qx + 1.0, qy), to_world(qx - 1.0, qy));
+        let (b1, b0) = (to_world(qx, qy + 1.0), to_world(qx, qy - 1.0));
+        let (j00, j10) = ((a1.0 - a0.0) * 0.5, (a1.1 - a0.1) * 0.5);
+        let (j01, j11) = ((b1.0 - b0.0) * 0.5, (b1.1 - b0.1) * 0.5);
+        let det = j00 * j11 - j01 * j10;
+        if det.abs() < 1e-6 {
+            break;
+        }
+        qx -= (j11 * ex - j01 * ey) / det;
+        qy -= (-j10 * ex + j00 * ey) / det;
     }
     (qx, qy)
 }
@@ -277,12 +298,10 @@ pub fn to_plan(x: f64, y: f64) -> (f64, f64) {
 /// How much the warp turns the plan's axes at a plan point (rad, from east towards north):
 /// buildings and cars turn with their streets.
 fn twist(x: f64, y: f64) -> f64 {
-    let a2 = y / 140.0 + x / 500.0 + 0.4;
-    let b2 = x / 150.0 + y / 520.0 + 2.9;
-    let j00 = 1.0 + 18.0 * a2.cos() / 500.0;
-    let j01 = 50.0 * (y / 330.0 + 1.3).cos() / 330.0 + 18.0 * a2.cos() / 140.0;
-    let j10 = 40.0 * (x / 380.0 + 2.1).cos() / 380.0 + 15.0 * b2.cos() / 150.0;
-    let j11 = 1.0 + 15.0 * b2.cos() / 520.0;
+    let (a1, a0) = (to_world(x + 1.0, y), to_world(x - 1.0, y));
+    let (b1, b0) = (to_world(x, y + 1.0), to_world(x, y - 1.0));
+    let (j00, j10) = ((a1.0 - a0.0) * 0.5, (a1.1 - a0.1) * 0.5);
+    let (j01, j11) = ((b1.0 - b0.0) * 0.5, (b1.1 - b0.1) * 0.5);
     0.5 * (j10.atan2(j00) + (-j01).atan2(j11))
 }
 
@@ -600,6 +619,13 @@ fn density_at_block(k: usize, i: i64, j: i64) -> f64 {
 
 fn block_zone(k: usize, i: i64, j: i64) -> u32 {
     let (x0, y0, w, h) = interior(i, j);
+    // (the lagoon's islands: villas with their pools and docks round the shores)
+    {
+        let (cx, cy) = to_world(x0 + w * 0.5, y0 + h * 0.5);
+        if ISLAND_PARKS.iter().any(|&(ax, ay, bx, by)| (ax..bx).contains(&cx) && (ay..by).contains(&cy)) {
+            return 0;
+        }
+    }
     let z = zone(density(k, x0 + w * 0.5, y0 + h * 0.5) + (bu(i, j, 1) - 0.5) * 0.12);
     // shops and walk-ups along the arterials, between the house blocks
     if z == 0 && (art_x(i) || art_x(i + 1) || art_y(j) || art_y(j + 1)) && bu(i, j, 6) < 0.6 {
@@ -669,10 +695,14 @@ const CHANNELS: &[Channel] = &[
     // where the river meets the city's inner bay: a lagoon, arms of water north and south of
     // the river joined at their ends, the land between them wooded islands (ISLAND_PARKS)
     // (curving, never straight: the arms meander, the ends bow)
-    Channel { a: (-4150.0, -190.0), b: (-2950.0, -230.0), half: 105.0, amp: 120.0, wave: 1000.0 },
-    Channel { a: (-4150.0, -1110.0), b: (-2950.0, -1080.0), half: 100.0, amp: 130.0, wave: 900.0 },
-    Channel { a: (-4150.0, -190.0), b: (-4150.0, -1110.0), half: 85.0, amp: 110.0, wave: 1500.0 },
-    Channel { a: (-2950.0, -230.0), b: (-2950.0, -1080.0), half: 85.0, amp: 100.0, wave: 1400.0 },
+    Channel { a: (-3300.0, -190.0), b: (-2350.0, -230.0), half: 100.0, amp: 110.0, wave: 900.0 },
+    Channel { a: (-3300.0, -1110.0), b: (-2350.0, -1080.0), half: 95.0, amp: 120.0, wave: 850.0 },
+    Channel { a: (-3300.0, -190.0), b: (-3300.0, -1110.0), half: 80.0, amp: 100.0, wave: 1500.0 },
+    Channel { a: (-2350.0, -230.0), b: (-2350.0, -1080.0), half: 80.0, amp: 90.0, wave: 1400.0 },
+    // little coves into the islands' shores
+    Channel { a: (-2700.0, -520.0), b: (-2685.0, -410.0), half: 22.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-3010.0, -230.0), b: (-2990.0, -345.0), half: 24.0, amp: 0.0, wave: 1000.0 },
+    Channel { a: (-2520.0, -260.0), b: (-2505.0, -360.0), half: 20.0, amp: 0.0, wave: 1000.0 },
     // a canal looping south off it round a peninsula
     Channel { a: (-2690.0, -720.0), b: (-2620.0, -1080.0), half: 28.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-2620.0, -1080.0), b: (-2900.0, -1260.0), half: 28.0, amp: 0.0, wave: 1000.0 },
@@ -835,10 +865,10 @@ const TOWER_SPOTS: &[(f64, f64, f64)] = &[
     (25.7935, -80.1600, 260.0),
 ];
 
-/// Wooded islands, nothing built on them (world plane rectangles: x0, y0, x1, y1): the land
-/// the lagoon's arms and the river leave north of the river (south of it the island is built,
-/// with its marina).
-const ISLAND_PARKS: &[(f64, f64, f64, f64)] = &[(-4100.0, -560.0, -3000.0, -150.0)];
+/// The lagoon's villa islands (world plane rectangles: x0, y0, x1, y1): the land its arms and
+/// the river leave north of the river, house blocks (globe.rchit cityGround the same); south
+/// of the river the island is built up, with its marina.
+const ISLAND_PARKS: &[(f64, f64, f64, f64)] = &[(-3250.0, -520.0, -2400.0, -150.0)];
 
 /// Is block (i, j) of zone z a surface car park round its buildings? (A third of the walk-up
 /// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
@@ -889,12 +919,6 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     let mut out = Vec::new();
     let (x0, y0, w, h) = interior(i, j);
     let z = block_zone(k, i, j);
-    {
-        let (cx, cy) = to_world(x0 + w * 0.5, y0 + h * 0.5);
-        if ISLAND_PARKS.iter().any(|&(ax, ay, bx, by)| (ax..bx).contains(&cx) && (ay..by).contains(&cy)) {
-            return out;
-        }
-    }
     // (the zones below the cores hold nothing that tall)
     let tallest = |cls: &[Class]| archs.iter().filter(|a| cls.contains(&a.class)).map(|a| a.height).fold(0.0f32, f32::max);
     let classes: &[Class] = match z {

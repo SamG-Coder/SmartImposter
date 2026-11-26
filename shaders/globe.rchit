@@ -405,12 +405,27 @@ float cBox(vec2 p, vec2 lo, vec2 hi, float fw) {
 // ---- the plan bends (globe/city.rs warp, to_plan): the grid is straight in the plan, curved in
 // the city's plane
 vec2 cWarp(vec2 q) {
+    // (globe/city.rs warp: the bends, and the turn round the river west of downtown, ROT)
+    vec2 d = q - vec2(-4700.0, -650.0);
+    float t = clamp((2800.0 - length(d)) / 1900.0, 0.0, 1.0);
+    float a = -0.24 * t * t * (3.0 - 2.0 * t);
+    float s = sin(a), co = cos(a);
     return vec2(50.0 * sin(q.y / 330.0 + 1.3) + 18.0 * sin(q.y / 140.0 + q.x / 500.0 + 0.4),
-                40.0 * sin(q.x / 380.0 + 2.1) + 15.0 * sin(q.x / 150.0 + q.y / 520.0 + 2.9));
+                40.0 * sin(q.x / 380.0 + 2.1) + 15.0 * sin(q.x / 150.0 + q.y / 520.0 + 2.9))
+         + vec2(d.x * co - d.y * s - d.x, d.x * s + d.y * co - d.y);
 }
+vec2 cToWorld(vec2 q) { return q + cWarp(q); }
 vec2 cToPlan(vec2 c) {
+    // (Newton's, globe/city.rs to_plan the same)
     vec2 q = c;
-    for (int k = 0; k < 6; ++k) q = c - cWarp(q);
+    for (int k = 0; k < 8; ++k) {
+        vec2 e = cToWorld(q) - c;
+        vec2 jx = (cToWorld(q + vec2(1.0, 0.0)) - cToWorld(q - vec2(1.0, 0.0))) * 0.5;
+        vec2 jy = (cToWorld(q + vec2(0.0, 1.0)) - cToWorld(q - vec2(0.0, 1.0))) * 0.5;
+        float det = jx.x * jy.y - jy.x * jx.y;
+        if (abs(det) < 1e-6) break;
+        q -= vec2(jy.y * e.x - jy.x * e.y, -jx.y * e.x + jx.x * e.y) / det;
+    }
     return q;
 }
 // the roads of their own (globe/city.rs WAYS; 0 avenue, 1 highway, 2 ramp), in the city's plane
@@ -563,6 +578,11 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     float dz = cDensity(bc) + (cBu(i, j, 1u) - 0.5) * 0.12;
     int zone = dz > 0.55 ? 3 : dz > 0.16 ? 2 : dz > 0.08 ? 1 : 0;
     if (zone == 0 && (cArtX(i) || cArtX(i + 1) || cArtY(j) || cArtY(j + 1)) && cBu(i, j, 6u) < 0.6) zone = 1;
+    // (the lagoon's villa islands, globe/city.rs ISLAND_PARKS)
+    {
+        vec2 bwc = cToWorld(bc);
+        if (bwc.x > -3250.0 && bwc.x < -2400.0 && bwc.y > -520.0 && bwc.y < -150.0) zone = 0;
+    }
     vec3 pave = vec3(0.15, 0.145, 0.135) * mix(0.82, 1.1, n1);
     vec2 tj = abs(fract(c / vec2(1.2, 0.6)) - 0.5);
     vec3 plaza = vec3(0.175, 0.165, 0.15) * mix(0.82, 1.1, n1) * mix(0.9, 1.06, n3) * mix(1.0, 0.9, (1.0 - smoothstep(0.44, 0.5, max(tj.x, tj.y))) * shown);
