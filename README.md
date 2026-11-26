@@ -942,8 +942,18 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
   malls, a big-box store, gas stations, L-shaped houses with garages. The street lines are moved
   by up to +-12 m each (blocks of different sizes), shops and walk-ups line the arterials between
   the house blocks, and the downtown cores are tight clusters.
-- **Still to do**: lights at night; the streets are one north-south grid (jittered), not the
-  real city's pattern: the city is generated, not mapped.
+- **Streets that bend, roads of their own.** The plan's grid is straight in the plan and curved
+  in the city: a smooth warp (slope < 0.3) maps one to the other, the same on the CPU and in the
+  ground shader, and buildings, cars and palms turn with their streets. An elevated six-lane
+  highway west of downtown, a spur and ramps (deck archetypes on columns every 20 m, pitched on
+  the ramps, with traffic) and three diagonal or curving avenues with planted medians are laid
+  out by hand in the city's plane; nothing is built on them.
+- **Density and detail.** Broad urban fields make the land round the cores walk-ups and
+  mid-rise; small balconies, water tanks, roof terraces and pools; marinas off some waterfronts;
+  three landmark towers (a stepped tower under a needle, a cylinder crowned by fins, a slab with
+  a sail) in the hearts of the cores. Coated glass reflects 25-35% at normal incidence.
+- **Still to do**: lights at night; streets that follow the coastlines; real interchanges. The
+  city is generated, not mapped.
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.

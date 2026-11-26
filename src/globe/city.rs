@@ -413,7 +413,7 @@ fn ground_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> f64 {
 
 fn water_world(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (la, lo) = to_lat_lon_world(k, x, y);
-    terrain.cover.class_group(la, lo) == Some(lc::WATER) && terrain.height(la, lo) < 2.0
+    sea_level_water(terrain, la, lo)
 }
 
 fn to_lat_lon_world(k: usize, x: f64, y: f64) -> (f64, f64) {
@@ -575,7 +575,8 @@ fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
         return false;
     }
     let (la, lo) = to_lat_lon(k, x, y);
-    !matches!(terrain.cover.class_group(la, lo), Some(lc::WATER) | Some(lc::WETLAND) | None)
+    // (a pond above sea level is land in a city: globe.rchit draws it so)
+    !matches!(terrain.cover.class_group(la, lo), Some(lc::WETLAND) | None) && !sea_level_water(terrain, la, lo)
 }
 
 /// The buildings of block (i, j) (land permitting). Only buildings at least `need` m tall are
@@ -1142,6 +1143,10 @@ fn marinas(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
             n += 1;
             t += 9.0;
             // the walkway's place and the fingers' far ends must be water
+            // (the block's own edge must be land: blocks out in the bay have no marinas)
+            if water_at(k, terrain, bx - nx * 3.0, by - ny * 3.0) || water_at(k, terrain, bx - nx * 15.0, by - ny * 15.0) {
+                continue;
+            }
             let wx = (bx + nx * 14.0, by + ny * 14.0);
             if !water_at(k, terrain, wx.0, wx.1) || !water_at(k, terrain, bx + nx * 28.0, by + ny * 28.0) || !water_at(k, terrain, bx + nx * 70.0, by + ny * 70.0) {
                 continue;
@@ -1179,7 +1184,18 @@ fn boat_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Option<&ArchRef>) {
 /// (globe.rchit: the land cover's ponds among the blocks are mostly mapping noise).
 fn water_at(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (la, lo) = to_lat_lon(k, x, y);
-    terrain.cover.class_group(la, lo) == Some(lc::WATER) && terrain.height(la, lo) < 2.0
+    sea_level_water(terrain, la, lo)
+}
+
+/// Mapped water whose surface is at sea level: some point within ~40 m is under 0.6 m (the
+/// heights over water are noisy; a pond is above that throughout, as globe.rchit decides by
+/// its water level).
+fn sea_level_water(terrain: &Terrain, la: f64, lo: f64) -> bool {
+    if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
+        return false;
+    }
+    let (dla, dlo) = (40.0 / 110_540.0, 40.0 / (111_320.0 * la.to_radians().cos()));
+    (-1..=1).any(|a| (-1..=1).any(|b| terrain.height(la + a as f64 * dla, lo + b as f64 * dlo) < 0.6))
 }
 
 /// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards
