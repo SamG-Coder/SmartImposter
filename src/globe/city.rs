@@ -1013,11 +1013,11 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         // few big lots, or many small ones; never the same grain block after block)
         2 => {
             let u = bu(i, j, 7);
-            if u < 0.06 {
+            if u < 0.05 {
                 (1, 1)
-            } else if u < 0.18 {
+            } else if u < 0.14 {
                 (2, 1)
-            } else if u < 0.45 {
+            } else if u < 0.36 {
                 (2, 2)
             } else {
                 (3, 2)
@@ -1184,7 +1184,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 py = cy + side * sy;
                 px = cx + (bu(i, j, 60 + lot) * 2.0 - 1.0) * sx * 0.3;
             }
-            // (the waterfront drive runs along the water within WATERFRONT m: nothing built on it)
+            // (the waterfront park runs along the water within WATERFRONT m: nothing built on it)
             if z >= 2 && near_water(k, terrain, px, py, hx.max(hy) * scale + WATERFRONT) {
                 continue;
             }
@@ -1850,7 +1850,7 @@ fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64,
 
 const BOAT_CELL: f64 = 130.0;
 
-/// Width of the waterfront drive with its promenade and sidewalk (globe.rchit cityGround).
+/// Width of the waterfront park along the water, kept free of buildings (globe.rchit cityGround).
 const WATERFRONT: f64 = 32.0;
 
 /// Is there sea-level water within `r` m of the plan point (eight directions and the point)?
@@ -2245,7 +2245,9 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 let cell = b * 16 + a;
                 // (a block with little or nothing built, a park, is planted thickest)
                 let open = placed.iter().map(|p| p.hx * p.hy * 4.0).sum::<f64>() < 0.12 * w * h;
-                if bu(i, j, 9000 + cell) > if open { 0.75 } else if z == 0 { 0.8 } else if z == 2 { 0.5 } else { 0.6 } {
+                // (built-up blocks keep their ground built: car parks, courts, palms; the canopy is
+                // the parks', the house blocks' and the islands')
+                if bu(i, j, 9000 + cell) > if open { 0.75 } else if z == 0 { 0.8 } else if z == 2 { 0.22 } else { 0.32 } {
                     continue;
                 }
                 let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);
@@ -2297,13 +2299,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         }
         let list = if broad && !sp.city_trees.is_empty() { &sp.city_trees } else { &sp.palms };
         let Some(d) = in_tile(k, x, y, id) else { continue };
-        // (the lots' trees keep off the waterfront drive, as the buildings do; the waterfront's
-        // own palms line its edge)
-        // (a grove's trees may stand on the lawn between the drive and the water too, the
-        // shore's own canopy, not on the drive itself)
-        if z >= 2 && !(8200..20_000).contains(&salt) && near_water(k, terrain, x, y, WATERFRONT) && !(salt >= 100_000 && near_water(k, terrain, x, y, 12.0)) {
-            continue;
-        }
+        // (trees stand in the waterfront park too: the shore's own canopy)
         let (lat, lon) = lat_lon(d);
         // (the groves grow on the open ground too, parks and lawns: only off the water)
         let grove = salt >= 100_000;

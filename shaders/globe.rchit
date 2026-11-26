@@ -670,32 +670,14 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));
     // (the streets run on through parks and wetland: no street, and no bridge, ends in a lawn)
     alb = mix(park, planned, max(smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)), streetW));
-    // the waterfront drive (globe/city.rs WATERFRONT): along the shore of the city's blocks
-    // other than houses, following the shoreline field: a paved promenade at the seawall, a
-    // planted verge, two lanes with a double yellow line and white edge lines, a sidewalk; the
-    // streets of the grid run into it
-    // (the drive's lanes lie well inland, D m out from the water, on the low-passed distance:
-    // a level set that far in is smooth, and the promenade and a planted verge take up the
-    // shore's wiggles; the grid's streets, and with them the bridges' approaches, run through
-    // the verge to the drive)
-    const float D = 16.0;
-    if (zone >= 2 && sd < D + 16.0 && sd > 0.0) {
-        vec3 prom = vec3(0.20, 0.19, 0.175) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
-        vec3 drive = vec3(0.075, 0.075, 0.078) * mix(0.82, 1.18, n1) * mix(0.9, 1.1, n3);
-        float yel = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.0))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 6.4)));
-        float wht = (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 0.5))) + (1.0 - smoothstep(0.07, 0.07 + fw, abs(sd - D - 11.9)));
-        drive = mix(drive, vec3(0.55, 0.42, 0.10), clamp(yel, 0.0, 1.0) * shown);
-        drive = mix(drive, vec3(0.6, 0.6, 0.58), clamp(wht, 0.0, 1.0) * shown);
-        vec3 wf = prom;
-        wf = mix(wf, lawnC, smoothstep(1.5, 1.5 + fw, sd));
-        wf = mix(wf, vec3(0.30, 0.29, 0.27), smoothstep(D - 0.3, D - 0.3 + fw, sd) * shown);
-        wf = mix(wf, drive, smoothstep(D, D + fw, sd));
-        wf = mix(wf, walk, smoothstep(D + 12.4, D + 12.4 + fw, sd));
-        float cover = 1.0 - smoothstep(D + 15.5, D + 15.5 + fw, sd);
-        cover *= 1.0 - roadW * (1.0 - smoothstep(D - 1.0, D, sd)); // the streets run through
-        // (only where the smoothed shore is a clean edge: where its level sets wander, round a
-        // point or past the field's reach, there is no drive, never a loop of asphalt)
-        cover *= smoothstep(0.55, 0.8, sdSlope);
+    // the waterfront (globe/city.rs WATERFRONT: nothing built within it): a narrow paved walk
+    // at the seawall and a lawn park under the shore's trees, the grid's streets running down
+    // to the water through it (no drive along it: a drive that follows the shore's every turn
+    // looped where the shore folds, and stopped short in the lawn where it was left out)
+    if (zone >= 2 && sd < 32.0 && sd > 0.0) {
+        vec3 prom = vec3(0.17, 0.165, 0.15) * mix(0.85, 1.08, n1) * mix(1.0, 0.88, (1.0 - smoothstep(0.44, 0.5, max(sj.x, sj.y))) * shown);
+        vec3 wf = mix(prom, park, smoothstep(1.2, 1.2 + fw, sd));
+        float cover = (1.0 - smoothstep(29.0, 32.0, sd)) * (1.0 - streetW);
         alb = mix(alb, wf, cover);
     }
     // inside the interchanges: landscaped ground (globe/city.rs CLEAR)
