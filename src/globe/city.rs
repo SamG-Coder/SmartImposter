@@ -65,8 +65,9 @@ const CITIES: &[City] = &[City {
     radius: 14_000.0,
     cores: &[
         Core { lat: 25.7745, lon: -80.1905, strength: 1.0, radius: 750.0 },   // downtown
-        Core { lat: 25.7640, lon: -80.1925, strength: 1.0, radius: 650.0 },   // Brickell
-        Core { lat: 25.7930, lon: -80.1875, strength: 0.75, radius: 700.0 },  // Edgewater
+        // (Brickell and Edgewater lower than downtown: the skyline peaks in its middle)
+        Core { lat: 25.7640, lon: -80.1925, strength: 0.7, radius: 600.0 },   // Brickell
+        Core { lat: 25.7930, lon: -80.1875, strength: 0.58, radius: 600.0 },  // Edgewater
         Core { lat: 25.7790, lon: -80.1310, strength: 0.6, radius: 600.0 },   // South Beach
         Core { lat: 25.8100, lon: -80.1240, strength: 0.65, radius: 900.0 },  // Mid-Beach
         Core { lat: 25.7520, lon: -80.2050, strength: 0.4, radius: 1200.0 },  // Coconut Grove side

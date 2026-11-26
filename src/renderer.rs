@@ -107,7 +107,7 @@ fn backlit(g: &Globals) -> f32 {
     let (fh, sh) = ((f - up * f.dot(up)).normalize_or_zero(), (s - up * s.dot(up)).normalize_or_zero());
     let ahead = ((fh.dot(sh) - 0.55) / 0.35).clamp(0.0, 1.0);
     let el = s.dot(up).asin().to_degrees();
-    let low = ((45.0 - el) / 20.0).clamp(0.0, 1.0) * (el / 5.0).clamp(0.0, 1.0);
+    let low = ((55.0 - el) / 20.0).clamp(0.0, 1.0) * (el / 5.0).clamp(0.0, 1.0);
     ahead * ahead * (3.0 - 2.0 * ahead) * low
 }
 
