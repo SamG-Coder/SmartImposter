@@ -39,6 +39,8 @@ pub enum Class {
     House,
     /// boats (moored at docks and out on the water) and docks: not for lots
     Boat,
+    /// boats under way, with their wakes
+    Underway,
     Dock,
     /// cars (parking lots, driveways, traffic) and bridge decks: not for lots
     Car,
@@ -750,6 +752,45 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let top = boat(&mut b, len, beam, kind, k as u8);
         push(b, format!("Building_Boat_{k}"), top, &mut meshes, &mut archs);
     }
+    // the same boats underway: a wake of foam behind them (scattered patches, so the water shows
+    // between them in the mesh and the impostor alike): the turbulent trail straight back from
+    // the stern, widening, and the two arms of the Kelvin wedge (19.5 degrees each side)
+    for (k, &(len, beam, kind)) in [(8.5f32, 2.8f32, 0u32), (13.0, 4.0, 1), (27.0, 6.4, 2)].iter().enumerate() {
+        let mut b = B::new();
+        let top = boat(&mut b, len, beam, kind, k as u8);
+        let mut r = Rng(0xA4E5 + k as u64);
+        let wake = len * 5.0;
+        let foam = m(POOL, 1);
+        let patch = |b: &mut B, x: f32, z: f32, s: f32, rng: &mut Rng| {
+            let a = rng.range(0.0, std::f32::consts::PI);
+            let (c, sn) = (a.cos() * s, a.sin() * s);
+            let y = 0.12;
+            b.quad([Vec3::new(x - c, y, z - sn), Vec3::new(x + sn, y, z - c), Vec3::new(x + c, y, z + sn), Vec3::new(x - sn, y, z + c)], foam);
+        };
+        let stern = -len * 0.5;
+        for _ in 0..(wake * 2.2) as usize {
+            // the trail: dense near the stern, fading and widening behind
+            let t = r.f().powf(1.6);
+            let x = stern - t * wake;
+            let half = beam * (0.45 + 1.6 * t);
+            let z = (r.f() * 2.0 - 1.0) * half;
+            if r.f() < 1.0 - 0.75 * t {
+                patch(&mut b, x, z, r.range(0.25, 0.9) * (1.0 + t), &mut r);
+            }
+        }
+        let tan = 19.5f32.to_radians().tan();
+        for side in [-1.0f32, 1.0] {
+            for _ in 0..(wake * 1.2) as usize {
+                let t = r.f();
+                let x = len * 0.35 - t * wake * 0.8;
+                let z = side * ((len * 0.35 - x) * tan + beam * 0.4) + (r.f() - 0.5) * (0.6 + 2.0 * t);
+                if r.f() < 1.0 - 0.8 * t {
+                    patch(&mut b, x, z, r.range(0.2, 0.6), &mut r);
+                }
+            }
+        }
+        push(b, format!("Building_Boat_Wake_{k}"), top, &mut meshes, &mut archs);
+    }
     {
         let mut b = B::new();
         b.bx(Vec3::new(0.0, 0.45, -1.4), Vec3::new(13.0, 0.7, 1.4), m(WOOD, 0), true);
@@ -889,7 +930,9 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("Boat") {
+    if name.contains("Boat_Wake") {
+        Class::Underway
+    } else if name.contains("Boat") {
         Class::Boat
     } else if name.contains("Dock") {
         Class::Dock

@@ -472,7 +472,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     float W = bw - hx0 - hx1, H = bh - hy0 - hy1;
     vec2 bc = vec2(lx0 + hx0 + 0.5 * W, ly0 + hy0 + 0.5 * H);
     float dz = cDensity(bc) + (cBu(i, j, 1u) - 0.5) * 0.12;
-    int zone = dz > 0.45 ? 3 : dz > 0.2 ? 2 : dz > 0.05 ? 1 : 0;
+    int zone = dz > 0.55 ? 3 : dz > 0.2 ? 2 : dz > 0.05 ? 1 : 0;
     if (zone == 0 && (cArtX(i) || cArtX(i + 1) || cArtY(j) || cArtY(j + 1)) && cBu(i, j, 6u) < 0.6) zone = 1;
     vec3 pave = vec3(0.15, 0.145, 0.135) * mix(0.82, 1.1, n1);
     vec2 tj = abs(fract(c / vec2(1.2, 0.6)) - 0.5);

@@ -143,6 +143,9 @@ void main() {
         albedo = vec3(0.075, 0.075, 0.078) * mix(0.85, 1.15, vnoise(po.xz * 0.3));
         float cl = (1.0 - smoothstep(0.1, 0.14, abs(po.z))) * step(fract(po.x / 9.0), pal == 0u ? 1.0 : 0.4) * detail;
         albedo = mix(albedo, pal == 0u ? vec3(0.55, 0.42, 0.10) : vec3(0.6), cl);
+    } else if (mt == 13u && pal == 1u) {
+        // a wake's foam: bright where it is fresh, a broken lace of it
+        albedo = vec3(0.78) * mix(0.55, 1.0, vnoise(po.xz * 1.7));
     } else if (mt == 13u) {
         // a rooftop pool's water
         albedo = vec3(0.10, 0.42, 0.48);

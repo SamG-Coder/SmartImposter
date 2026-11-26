@@ -55,11 +55,11 @@ const CITIES: &[City] = &[City {
     lon: -80.1700,
     radius: 14_000.0,
     cores: &[
-        Core { lat: 25.7745, lon: -80.1905, strength: 1.0, radius: 900.0 },   // downtown
-        Core { lat: 25.7640, lon: -80.1925, strength: 1.0, radius: 800.0 },   // Brickell
-        Core { lat: 25.7930, lon: -80.1875, strength: 0.75, radius: 900.0 },  // Edgewater
-        Core { lat: 25.7790, lon: -80.1310, strength: 0.6, radius: 700.0 },   // South Beach
-        Core { lat: 25.8100, lon: -80.1240, strength: 0.65, radius: 1200.0 }, // Mid-Beach
+        Core { lat: 25.7745, lon: -80.1905, strength: 1.0, radius: 750.0 },   // downtown
+        Core { lat: 25.7640, lon: -80.1925, strength: 1.0, radius: 650.0 },   // Brickell
+        Core { lat: 25.7930, lon: -80.1875, strength: 0.75, radius: 700.0 },  // Edgewater
+        Core { lat: 25.7790, lon: -80.1310, strength: 0.6, radius: 600.0 },   // South Beach
+        Core { lat: 25.8100, lon: -80.1240, strength: 0.65, radius: 900.0 },  // Mid-Beach
         Core { lat: 25.7520, lon: -80.2050, strength: 0.4, radius: 1200.0 },  // Coconut Grove side
     ],
 }];
@@ -138,7 +138,7 @@ fn bu(i: i64, j: i64, salt: u32) -> f64 {
 
 /// Block zones: 0 houses, 1 shops and walk-ups, 2 office and apartment blocks, 3 towers.
 fn zone(dens: f64) -> u32 {
-    if dens > 0.45 {
+    if dens > 0.55 {
         3
     } else if dens > 0.2 {
         2
@@ -795,7 +795,7 @@ fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64,
     push_rec(tile, rows, super::forest::rec_data(r.variant, (1 + seed % 8190) << 8), &sp.infos[r.variant]);
 }
 
-const BOAT_CELL: f64 = 170.0;
+const BOAT_CELL: f64 = 130.0;
 
 /// The boat archetypes (runabout, cruiser, yacht) and the dock, in that order.
 fn boat_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Option<&ArchRef>) {
@@ -824,7 +824,8 @@ fn put_boat(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, yaw: f64, seed:
 #[allow(clippy::too_many_arguments)]
 fn open_water_boat(k: usize, terrain: &Terrain, sp: &Species, a: i64, b: i64, lvl: u8, id: TileId, tile: &mut TreeTile) {
     let (boats, _) = boat_kinds(&sp.buildings);
-    if boats.len() < 3 || bu(a, b, 9000) > 0.45 {
+    let under: Vec<&ArchRef> = sp.buildings.iter().filter(|a| a.class == Class::Underway).collect();
+    if boats.len() < 3 || bu(a, b, 9000) > 0.5 {
         return;
     }
     let kind = if bu(a, b, 9001) < 0.5 { 0 } else if bu(a, b, 9001) < 0.85 { 1 } else { 2 };
@@ -835,7 +836,8 @@ fn open_water_boat(k: usize, terrain: &Terrain, sp: &Species, a: i64, b: i64, lv
     }
     let (x, y) = ((a as f64 + 0.15 + 0.7 * bu(a, b, 9002)) * BOAT_CELL, (b as f64 + 0.15 + 0.7 * bu(a, b, 9003)) * BOAT_CELL);
     let yaw = bu(a, b, 9004) * std::f64::consts::TAU;
-    let r = boats[kind];
+    // most are under way, with their wake
+    let r = if under.len() == 3 && bu(a, b, 9006) < 0.75 { under[kind] } else { boats[kind] };
     let half = r.size[0] as f64 * 0.5 + 25.0;
     let (c, s) = (yaw.cos(), yaw.sin());
     let clear = [(0.0, 0.0), (half, 0.0), (-half, 0.0), (0.0, 20.0), (0.0, -20.0)]
