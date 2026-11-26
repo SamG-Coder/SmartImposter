@@ -695,10 +695,10 @@ const CHANNELS: &[Channel] = &[
     // where the river meets the city's inner bay: a lagoon, arms of water north and south of
     // the river joined at their ends, the land between them wooded islands (ISLAND_PARKS)
     // (curving, never straight: the arms meander, the ends bow)
-    Channel { a: (-3300.0, -190.0), b: (-2350.0, -230.0), half: 100.0, amp: 110.0, wave: 900.0 },
-    Channel { a: (-3300.0, -1110.0), b: (-2350.0, -1080.0), half: 95.0, amp: 120.0, wave: 850.0 },
-    Channel { a: (-3300.0, -190.0), b: (-3300.0, -1110.0), half: 80.0, amp: 100.0, wave: 1500.0 },
-    Channel { a: (-2350.0, -230.0), b: (-2350.0, -1080.0), half: 80.0, amp: 90.0, wave: 1400.0 },
+    Channel { a: (-3300.0, -140.0), b: (-2350.0, -180.0), half: 150.0, amp: 110.0, wave: 900.0 },
+    Channel { a: (-3300.0, -1160.0), b: (-2350.0, -1130.0), half: 145.0, amp: 120.0, wave: 850.0 },
+    Channel { a: (-3300.0, -140.0), b: (-3300.0, -1160.0), half: 110.0, amp: 100.0, wave: 1500.0 },
+    Channel { a: (-2350.0, -180.0), b: (-2350.0, -1130.0), half: 105.0, amp: 90.0, wave: 1400.0 },
     // little coves into the islands' shores
     Channel { a: (-2700.0, -520.0), b: (-2685.0, -410.0), half: 22.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-3010.0, -230.0), b: (-2990.0, -345.0), half: 24.0, amp: 0.0, wave: 1000.0 },
@@ -921,7 +921,14 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     let z = block_zone(k, i, j);
     // (the zones below the cores hold nothing that tall)
     let tallest = |cls: &[Class]| archs.iter().filter(|a| cls.contains(&a.class)).map(|a| a.height).fold(0.0f32, f32::max);
+    // (by the rivers and canals the mid-rise city is lower and coarser: stucco blocks of four to
+    // eight storeys, big low buildings with their car parks, the towers apart)
+    let riverside = z == 2 && {
+        let (cx, cy) = to_world(x0 + w * 0.5, y0 + h * 0.5);
+        channel_dist(cx, cy) < 400.0
+    };
     let classes: &[Class] = match z {
+        2 if riverside => &[Class::MidRise, Class::LowRise, Class::MidRise, Class::LowRise, Class::MidRise],
         3 => &[Class::Tower, Class::Tower, Class::Tower, Class::MidRise],
         // (a tower in the mid-rise zone only next to a core)
         2 if density_at_block(k, i, j) > 0.38 => &[Class::MidRise, Class::MidRise, Class::Tower, Class::LowRise],
@@ -1159,6 +1166,9 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
             let mut fits: Vec<(usize, u32)> = Vec::new();
             for (a, r) in archs.iter().enumerate() {
                 if r.class != class {
+                    continue;
+                }
+                if riverside && class == Class::MidRise && r.height > 30.0 && archs.iter().any(|o| o.class == class && o.height <= 30.0 && o.size[0] as f64 <= lw - 4.0 && o.size[1] as f64 <= lh - 4.0) {
                     continue;
                 }
                 // (no supertowers: the skyline is a band of towers of 25-60 storeys)
