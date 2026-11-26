@@ -1185,6 +1185,10 @@ thread_local! {
     /// crossing and by every street of a tile)
     static WET: std::cell::RefCell<std::collections::HashMap<(usize, i64, i64), bool>> = Default::default();
     static CROSS: std::cell::RefCell<std::collections::HashMap<(usize, bool, i64, i64), Option<(f64, f64)>>> = Default::default();
+    /// `crossing_at`'s banks: per line and 5 m grid point along it, and direction, the bank
+    /// (its place along the line) the walk from there finds (true, every point of a crossing
+    /// walks to the same two), or how far on it is known there is none (false)
+    static BANK: std::cell::RefCell<std::collections::HashMap<(usize, bool, i64, i64, bool), (bool, f64)>> = Default::default();
 }
 
 /// Is the plan point on mapped water whose lower quartile of heights over ~200 m is the sea's?
@@ -1273,9 +1277,45 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
     // sides of the street at its middle (a street running along a shore just off it does not)
     let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 6000.0 } else if arterial { 250.0 } else { 70.0 };
     let pt = |s: f64| if along_x { (x + s, y) } else { (x, y + s) };
+    // (the walk steps on a 5 m grid fixed along the line, so every point of one crossing finds
+    // the same two banks: the whole bridge is laid from them, streets)
+    let g0 = if along_x { x } else { y };
     let bank = |dir: f64| -> Option<f64> {
-        let mut s = 0.0;
-        while s <= reach {
+        let first = if dir > 0.0 { (g0 / 5.0).ceil() * 5.0 } else { (g0 / 5.0).floor() * 5.0 };
+        let mut s = (first - g0).abs();
+        // (memoised: the grid points walked over, and where they lead)
+        let key = |s: f64| (k, along_x, line, ((g0 + dir * s) / 5.0).round() as i64, dir > 0.0);
+        let mut seen: Vec<(usize, bool, i64, i64, bool)> = Vec::new();
+        let keep = |seen: &[(usize, bool, i64, i64, bool)], v: (bool, f64)| {
+            BANK.with(|c| {
+                let mut c = c.borrow_mut();
+                if c.len() > 1 << 21 {
+                    c.clear();
+                }
+                for kk in seen {
+                    c.insert(*kk, v);
+                }
+            });
+        };
+        // (each way as far as the whole crossing may be long: then every point of it finds
+        // the same banks, wherever it stands)
+        while s <= 2.0 * reach {
+            match BANK.with(|c| c.borrow().get(&key(s)).copied()) {
+                Some((true, g)) => {
+                    keep(&seen, (true, g));
+                    return Some((g - g0).abs());
+                }
+                Some((false, g)) => {
+                    // (no bank before g: on from there)
+                    let to = (g - g0).abs();
+                    if to > s {
+                        s = to;
+                        continue;
+                    }
+                }
+                None => {}
+            }
+            seen.push(key(s));
             // (60 m of land, 250 m on the causeways: a thinner strip, the real causeway's road
             // and verges in the land cover, is bridged over: the terrain draws it as water)
             let need = if reach > 1000.0 { 26 } else { 7 };
@@ -1284,13 +1324,19 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
                 !wet(px, py)
             });
             if solid {
+                keep(&seen, (true, g0 + dir * s));
                 return Some(s);
             }
-            s += 10.0;
+            s += 5.0;
         }
+        // (none within reach: the points passed know there is none before here)
+        keep(&seen, (false, g0 + dir * s));
         None
     };
     let (Some(a), Some(b)) = (bank(-1.0), bank(1.0)) else { return None };
+    if a + b > 2.0 * reach {
+        return None;
+    }
     // (the water is followed by the land cover alone, point by point (busy shores, boats and
     // marinas raise the surface model there); whether it is the sea or a pond above it, which
     // the terrain draws as land in a city, is asked once, at the crossing's middle)
@@ -1303,6 +1349,23 @@ fn crossing_at(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arter
     // (a crossing shorter than a deck and a half is a sliver of the land cover's edge, not a
     // canal: a lone slab)
     if a + b < 25.0 {
+        return None;
+    }
+    // (both banks must be ground the terrain draws: where the land cover's land is under the
+    // sea in the elevation data, a causeway's line or a mudflat, the terrain draws water, and a
+    // bridge landing there would end in the bay)
+    let landed = |s0: f64, dir: f64| {
+        [5.0, 15.0, 25.0]
+            .iter()
+            .filter(|&&d| {
+                let (px, py) = pt(s0 + dir * d);
+                let (la, lo) = to_lat_lon(k, px, py);
+                terrain.height(la, lo) > 0.3
+            })
+            .count()
+            >= 2
+    };
+    if !landed(-a, -1.0) || !landed(b, 1.0) {
         return None;
     }
     let (mx, my) = pt((b - a) * 0.5);
@@ -1343,35 +1406,53 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
         }
         let at = |s: f64, off: f64| if along_x { (start + s, fixed + off) } else { (fixed + off, start + s) };
         let yaw0 = if along_x { 0.0 } else { std::f64::consts::FRAC_PI_2 };
-        // decks every 20 m where the street is over water
-        let mut s = 10.0;
-        let mut n = 0u32;
-        while s < len {
+        // the bridges: each crossing found along this stretch of the street (a little past its
+        // ends too: a bridge's abutment may reach into it), laid whole from bank to bank and
+        // 10 m on to the land each side, in even pieces (21 m long, at most 20 m apart); this
+        // block lays the pieces whose middles are on its stretch, its neighbour the rest. The
+        // crossing is decided at its own middle, the same for every block it passes
+        let mut spans: Vec<(f64, f64)> = Vec::new();
+        let mut s = -30.0;
+        while s < len + 30.0 {
             let (x, y) = at(s, 0.0);
-            // (a deck stands only if its neighbours along the street, where they are over the
-            // water too, are decks as well: never a lone piece where the decision flickers)
-            let here = crossing(k, terrain, x, y, along_x, a, line);
-            let whole = here.is_some()
-                && [-20.0, 20.0].iter().all(|d| {
-                    let (nx, ny) = at(s + d, 0.0);
-                    let (la, lo) = to_lat_lon(k, nx, ny);
-                    terrain.cover.class_group(la, lo) != Some(lc::WATER) || crossing(k, terrain, nx, ny, along_x, a, line).is_some()
-                });
-            if let (true, Some((ca, cb))) = (whole, here) {
-                // (the arch's slope along increasing s: a counts back from the near bank)
-                let (h, dh) = arch(ca, cb);
-                let (wx, wy) = to_world(x, y);
-                // (heading from the street's own tangent in the city's plane, so the pieces
-                // follow its curve end to end)
-                let tang = |s: f64| {
-                    let (p0, p1) = (at(s - 2.0, 0.0), at(s + 2.0, 0.0));
-                    let (a0, a1) = (to_world(p0.0, p0.1), to_world(p1.0, p1.1));
-                    (a1.1 - a0.1).atan2(a1.0 - a0.0)
-                };
-                put_world(k, sp, decks[if a { 0 } else { 1 }], wx, wy, h, tang(s), dh.atan(), bh(i, j, 6000 + n + along_x as u32 * 50), id, tile);
+            if let Some((ca, cb)) = crossing(k, terrain, x, y, along_x, a, line) {
+                let (lo, hi) = (s - ca, s + cb);
+                if !spans.iter().any(|&(l, _)| (l - lo).abs() < 1.0) {
+                    let mid = (lo + hi) * 0.5;
+                    let (mx, my) = at(mid, 0.0);
+                    let same = crossing(k, terrain, mx, my, along_x, a, line).is_some_and(|(ma, mb)| ((mid - ma) - lo).abs() < 1.0 && ((mid + mb) - hi).abs() < 1.0);
+                    if same {
+                        spans.push((lo, hi));
+                    }
+                }
+                s = s.max(hi);
             }
-            s += 20.0;
-            n += 1;
+            s += 10.0;
+        }
+        // (heading from the street's own tangent in the city's plane, so the pieces follow its
+        // curve end to end)
+        let tang = |s: f64| {
+            let (p0, p1) = (at(s - 2.0, 0.0), at(s + 2.0, 0.0));
+            let (a0, a1) = (to_world(p0.0, p0.1), to_world(p1.0, p1.1));
+            (a1.1 - a0.1).atan2(a1.0 - a0.0)
+        };
+        for (lo, hi) in spans {
+            let (l0, l1) = (lo - 10.0, hi + 10.0);
+            let n = ((l1 - l0) / 20.0).ceil().max(1.0) as u32;
+            let step = (l1 - l0) / n as f64;
+            for m in 0..n {
+                let c = l0 + (m as f64 + 0.5) * step;
+                if !(0.0..len).contains(&c) {
+                    continue;
+                }
+                // (the arch over the water, level with it past the banks: the deck's ends run
+                // into the rising ground)
+                let (h, dh) = arch((c - lo).clamp(0.0, hi - lo), (hi - c).clamp(0.0, hi - lo));
+                let (x, y) = at(c, 0.0);
+                let (wx, wy) = to_world(x, y);
+                let seed = bh(line, (start + c).round() as i64, 6000 + along_x as u32 * 50);
+                put_world(k, sp, decks[if a { 0 } else { 1 }], wx, wy, h, tang(c), dh.atan(), seed, id, tile);
+            }
         }
         // street lights along both sidewalks, every ~30 m on alternate sides, and traffic
         // signals at the street's crossings with arterials (on land only: bridges have lamps)
