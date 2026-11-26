@@ -15,6 +15,7 @@
 #define FLAG_LAWN 8192u   // a blade of the lawn (lawn.glsl): an impostor hit on the ground
 #define MAT_BUILDING 5u
 #define FLAG_BUILDING 32768u // a building (city.rs, tri.rchit buildingHit): payload trans.z = how much is glass
+#define FLAG_SEAWALL 65536u  // globe water held by a city's seawall (globe.rchit): no shore foam
 #define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64

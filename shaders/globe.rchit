@@ -393,6 +393,14 @@ float cBox(vec2 p, vec2 lo, vec2 hi, float fw) {
     return a.x * a.y;
 }
 
+// Is p inside the city's plan?
+bool cityNear(vec3 p) {
+    if (gg.cityP.z <= 0.0) return false;
+    vec3 v = p - gg.cityO.xyz;
+    vec2 c = vec2(dot(v, gg.cityE.xyz), dot(v, gg.cityN.xyz));
+    return dot(c, c) < gg.cityP.z * gg.cityP.z;
+}
+
 float cityGround(vec3 p, float footprint, float built, float waterF, float wetF, out vec3 alb) {
     alb = vec3(0.0);
     if (gg.cityP.z <= 0.0) return 0.0;
@@ -515,7 +523,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     alb = mix(lot, mix(walk, asphalt, roadW), streetW);
     // the city keeps off water and wetland; it fades in with the built-up land and out at its rim
     float urban = smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z));
-    urban *= (1.0 - smoothstep(0.02, 0.2, waterF)) * (1.0 - smoothstep(0.1, 0.4, wetF));
+    urban *= (1.0 - smoothstep(0.35, 0.7, waterF)) * (1.0 - smoothstep(0.1, 0.4, wetF));
     return urban;
 }
 
@@ -601,6 +609,10 @@ void main() {
         depth = lake ? min(max(d, 0.0) * 0.6, 18.0) : max(min(max(d, 0.0) * 0.4, 12.0), floorE * smoothstep(15.0, 30.0, d));
         depth = max(max(depth, -above), 0.02); // (the shallows fade to the shore that is seen)
     }
+    // in a city the water is held by seawalls (all but sand beaches and mangroves): deep right
+    // up to the wall
+    bool seawall = water && cityNear(p) && B.y < 0.3 && C.x < 0.3;
+    if (seawall) depth = max(depth, 3.5);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
     float band = max(2.5 * (0.4 + 1.2 * nW0), footprint * 1.5);
@@ -612,16 +624,26 @@ void main() {
         n = up;
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
     } else if (cover) {
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
         vec3 cityAlb;
-        float urban = cityGround(p, footprint, B.x, B.w, C.x, cityAlb) * (1.0 - shore);
+        float urban = cityGround(p, footprint, B.x, B.w, C.x, cityAlb);
+        // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
+        // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
+        // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.
+        float wall = cityNear(p) ? (1.0 - smoothstep(0.2, 0.45, B.y)) * (1.0 - smoothstep(0.2, 0.45, C.x)) : 0.0;
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore * (1.0 - wall), biome, seaSide, ao);
+        urban *= 1.0 - shore * (1.0 - wall);
         if (urban > 0.0) {
             alb = mix(alb, cityAlb, urban);
             n = normalize(mix(n, up, urban));
             ao = mix(ao, 1.0, urban);
         }
+        if (wall > 0.0) {
+            vec3 cap = vec3(0.36, 0.35, 0.33) * mix(0.85, 1.08, nW0);
+            alb = mix(alb, cap, smoothstep(1.5 + footprint, 1.3, sd) * wall);
+            alb = mix(alb, vec3(0.05, 0.055, 0.05), smoothstep(0.3 + footprint, 0.05, sd) * wall);
+        }
         // wet: right at the mapped water, and just above the water level along the contour
-        float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd);
+        float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd) * (1.0 - wall);
         alb *= mix(1.0, 0.55, damp);
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
@@ -653,7 +675,7 @@ void main() {
     pl.t = t;
     pl.n = n;
     pl.ng = ng;
-    pl.flags = MAT_TERRAIN | (water ? FLAG_WATER : 0u) | (water && !lake ? FLAG_SEA : 0u);
+    pl.flags = MAT_TERRAIN | (water ? FLAG_WATER : 0u) | (water && !lake ? FLAG_SEA : 0u) | (seawall ? FLAG_SEAWALL : 0u);
     pl.ao = ao;
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;

@@ -508,6 +508,9 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     street_palms(k, terrain, sp, i, j, id, tile);
                     lot_trees(k, terrain, sp, i, j, id, tile, &placed);
                 }
+                if lvl == 0 {
+                    docks(k, terrain, sp, i, j, id, tile, &placed);
+                }
                 for p in placed {
                     let Some(d) = in_tile(k, p.x, p.y, id) else { continue };
                     if tile.recs.len() >= MAX_PER_TILE {
@@ -520,6 +523,113 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     // thinning level: impostor.rint never thins buildings)
                     let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.4, p.quarter as f64 * std::f64::consts::FRAC_PI_2, p.scale);
                     push_rec(tile, rows, r.variant as u32 | seed << 8, &infos[r.variant]);
+                }
+            }
+        }
+        // boats out on the water: one cell of BOAT_CELL m at a time, a boat in some
+        if lvl <= 1 {
+            for b in (yl / BOAT_CELL).floor() as i64..=(yh / BOAT_CELL).floor() as i64 {
+                for a in (xl / BOAT_CELL).floor() as i64..=(xh / BOAT_CELL).floor() as i64 {
+                    open_water_boat(k, terrain, sp, a, b, lvl, id, tile);
+                }
+            }
+        }
+    }
+}
+
+const BOAT_CELL: f64 = 170.0;
+
+/// The boat archetypes (runabout, cruiser, yacht) and the dock, in that order.
+fn boat_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Option<&ArchRef>) {
+    (archs.iter().filter(|a| a.class == Class::Boat).collect(), archs.iter().find(|a| a.class == Class::Dock))
+}
+
+fn water_at(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
+    let (la, lo) = to_lat_lon(k, x, y);
+    terrain.cover.class_group(la, lo) == Some(lc::WATER)
+}
+
+/// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards
+/// north), floating at sea level, if its foot is in tile `id`.
+#[allow(clippy::too_many_arguments)]
+fn put_boat(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, yaw: f64, seed: u32, id: TileId, tile: &mut TreeTile) {
+    let Some(d) = in_tile(k, x, y, id) else { return };
+    if tile.recs.len() >= MAX_PER_TILE {
+        return;
+    }
+    let rows = frame_rows(d, tile.center, 0.0, yaw, 1.0);
+    push_rec(tile, rows, r.variant as u32 | (1 + seed % 8190) << 8, &sp.infos[r.variant]);
+}
+
+/// A boat on open water in cell (a, b), clear of the shore: runabouts and cruisers near
+/// (finest tiles), the yachts also a level out.
+#[allow(clippy::too_many_arguments)]
+fn open_water_boat(k: usize, terrain: &Terrain, sp: &Species, a: i64, b: i64, lvl: u8, id: TileId, tile: &mut TreeTile) {
+    let (boats, _) = boat_kinds(&sp.buildings);
+    if boats.len() < 3 || bu(a, b, 9000) > 0.45 {
+        return;
+    }
+    let kind = if bu(a, b, 9001) < 0.5 { 0 } else if bu(a, b, 9001) < 0.85 { 1 } else { 2 };
+    // (each tile level covers its own band of distance: the yachts are in the next level's tiles
+    // too, so they are still seen beyond the finest tiles' 6 km)
+    if lvl == 1 && kind != 2 {
+        return;
+    }
+    let (x, y) = ((a as f64 + 0.15 + 0.7 * bu(a, b, 9002)) * BOAT_CELL, (b as f64 + 0.15 + 0.7 * bu(a, b, 9003)) * BOAT_CELL);
+    let yaw = bu(a, b, 9004) * std::f64::consts::TAU;
+    let r = boats[kind];
+    let half = r.size[0] as f64 * 0.5 + 25.0;
+    let (c, s) = (yaw.cos(), yaw.sin());
+    let clear = [(0.0, 0.0), (half, 0.0), (-half, 0.0), (0.0, 20.0), (0.0, -20.0)]
+        .iter()
+        .all(|&(u, v)| water_at(k, terrain, x + u * c - v * s, y + u * s + v * c));
+    if clear {
+        put_boat(k, sp, r, x, y, yaw, bh(a, b, 9005), id, tile);
+    }
+}
+
+/// Docks behind the waterfront houses of block (i, j): where the land beyond a house lot's back
+/// line is water, a timber dock runs out from the lot, a boat moored alongside most of them.
+#[allow(clippy::too_many_arguments)]
+fn docks(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, placed: &[Placed]) {
+    let (boats, dock) = boat_kinds(&sp.buildings);
+    let Some(dock) = dock else { return };
+    if block_zone(k, i, j) != 0 || placed.is_empty() {
+        return;
+    }
+    let (x0, y0, w, h) = interior(i, j);
+    let n = (w / HOUSE_LOT).floor().max(1.0) as usize;
+    let lw = w / n as f64;
+    for row in 0..2 {
+        for l in 0..n {
+            let lot = (row * n + l) as u32;
+            let u = l as f64 * lw + lw * (0.3 + 0.4 * bu(i, j, 9100 + lot));
+            // the lot's back line, and outwards (away from its street)
+            let (yb, out) = if row == 0 { (y0 + h * 0.5, 1.0) } else { (y0 + h * 0.5, -1.0) };
+            let x = x0 + u;
+            // a house on this lot, land at the lot, water beyond the back line
+            let has_house = placed.iter().any(|p| (p.x - (x0 + l as f64 * lw + lw * 0.5)).abs() < lw * 0.5 && (p.y - yb).abs() < h * 0.5 && (p.y - yb) * out < 0.0);
+            if !has_house || !water_at(k, terrain, x, yb + out * 6.0) || !water_at(k, terrain, x, yb + out * 14.0) {
+                continue;
+            }
+            // the dock starts at the shore: walk back from the water to the first land
+            let mut s = 6.0;
+            while s > -10.0 && water_at(k, terrain, x, yb + out * s) {
+                s -= 2.0;
+            }
+            let ys = yb + out * (s + 1.0);
+            let yaw = if out > 0.0 { std::f64::consts::FRAC_PI_2 } else { -std::f64::consts::FRAC_PI_2 };
+            put_boat(k, sp, dock, x, ys, yaw, bh(i, j, 9200 + lot), id, tile);
+            if boats.len() >= 2 && bu(i, j, 9300 + lot) < 0.75 {
+                let kind = if bu(i, j, 9400 + lot) < 0.55 { 0 } else { 1 };
+                let r = boats[kind];
+                let side = if bu(i, j, 9500 + lot) < 0.5 { 1.0 } else { -1.0 };
+                let bx = x + side * (1.4 + r.size[1] as f64 * 0.5 + 0.4);
+                let by = ys + out * (7.0 + r.size[0] as f64 * 0.1);
+                if water_at(k, terrain, bx, by + out * r.size[0] as f64 * 0.5) {
+                    // bow out or in
+                    let flip = if bu(i, j, 9600 + lot) < 0.5 { 0.0 } else { std::f64::consts::PI };
+                    put_boat(k, sp, r, bx, by, yaw + flip, bh(i, j, 9700 + lot), id, tile);
                 }
             }
         }

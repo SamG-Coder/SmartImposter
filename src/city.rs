@@ -24,6 +24,9 @@ pub const RAIL: u8 = 7;
 pub const GARAGE: u8 = 8;
 pub const DARK: u8 = 9;
 pub const SPANDREL: u8 = 10;
+pub const WOOD: u8 = 11;
+pub const PAINT: u8 = 12;
+pub const POOL: u8 = 13;
 
 /// What an archetype is: the city plan (globe/city.rs) picks by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,6 +35,9 @@ pub enum Class {
     MidRise,
     LowRise,
     House,
+    /// boats (moored at docks and out on the water) and docks: not for lots
+    Boat,
+    Dock,
 }
 
 pub struct Arch {
@@ -578,7 +584,67 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         volume(&mut b, &poly, 0.0, h, 0.0, 3.1, Fac::Garage, &pal, true, &mut rng);
         push(b, format!("Building_Garage_{k}"), h + 4.0, &mut meshes, &mut archs);
     }
+    // boats (origin at the waterline, bow towards +x): a centre-console runabout, a cabin
+    // cruiser, a motor yacht; and a timber dock (from the shore at x = 0 out along +x)
+    for (k, &(len, beam, kind)) in [(8.5f32, 2.8f32, 0u32), (13.0, 4.0, 1), (27.0, 6.4, 2)].iter().enumerate() {
+        let mut b = B::new();
+        let top = boat(&mut b, len, beam, kind, k as u8);
+        push(b, format!("Building_Boat_{k}"), top, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        b.bx(Vec3::new(0.0, 0.45, -1.4), Vec3::new(13.0, 0.7, 1.4), m(WOOD, 0), true);
+        for s in 0..5 {
+            let x = 0.6 + s as f32 * 3.0;
+            for z in [-1.25f32, 1.25] {
+                b.bx(Vec3::new(x - 0.13, -1.5, z - 0.13), Vec3::new(x + 0.13, 1.1, z + 0.13), m(WOOD, 1), false);
+            }
+        }
+        push(b, "Building_Dock".into(), 1.2, &mut meshes, &mut archs);
+    }
     (meshes, archs)
+}
+
+/// A boat: hull (white gelcoat, a painted boot stripe, a teak deck), and by `kind` a console
+/// with a T-top (0), a cabin with a windscreen (1), or two decks of a motor yacht with dark
+/// glazing and a flybridge (2). Returns its height above the waterline.
+fn boat(b: &mut B, len: f32, beam: f32, kind: u32, pal: u8) -> f32 {
+    let (draft, fb) = (0.25 * beam.sqrt(), 0.32 * beam.sqrt());
+    let hull = ccw(vec![Vec2::new(-len * 0.5, -beam * 0.5), Vec2::new(len * 0.2, -beam * 0.5), Vec2::new(len * 0.5, 0.0), Vec2::new(len * 0.2, beam * 0.5), Vec2::new(-len * 0.5, beam * 0.5)]);
+    b.prism(&hull, -draft, fb, m(PAINT, 4), m(WOOD, 0), true);
+    // gunwale and boot stripe
+    for k in 0..hull.len() {
+        let (a, c) = (hull[k], hull[(k + 1) % hull.len()]);
+        b.strip(a, c, fb - 0.3, fb - 0.12, 0.0, 0.03, m(PAINT, pal % 3));
+        b.strip(a, c, fb, fb + 0.08, -0.08, 0.0, m(PAINT, 4));
+    }
+    let v = |x0: f32, x1: f32, z: f32, y0: f32, y1: f32, mat: u8, b: &mut B| b.bx(Vec3::new(x0, y0, -z), Vec3::new(x1, y1, z), mat, false);
+    match kind {
+        0 => {
+            v(-0.6, 0.5, 0.5, fb, fb + 1.1, m(PAINT, 4), b);
+            v(-0.45, 0.45, 0.48, fb + 1.1, fb + 1.4, m(GLASS, 6), b);
+            v(-1.2, 0.6, 0.9, fb + 2.1, fb + 2.2, m(PAINT, 4), b);
+            for (x, z) in [(-1.1f32, 0.8f32), (-1.1, -0.8), (0.5, 0.8), (0.5, -0.8)] {
+                b.bx(Vec3::new(x - 0.03, fb + 1.1, z - 0.03), Vec3::new(x + 0.03, fb + 2.1, z + 0.03), m(FRAME, 1), false);
+            }
+            fb + 2.2
+        }
+        1 => {
+            v(-len * 0.3, len * 0.12, beam * 0.36, fb, fb + 1.0, m(PAINT, 4), b);
+            v(-len * 0.28, len * 0.1, beam * 0.37, fb + 1.0, fb + 1.55, m(GLASS, 6), b);
+            v(-len * 0.3, len * 0.12, beam * 0.36, fb + 1.55, fb + 1.7, m(PAINT, 4), b);
+            fb + 1.7
+        }
+        _ => {
+            v(-len * 0.36, len * 0.22, beam * 0.42, fb, fb + 0.9, m(PAINT, 4), b);
+            v(-len * 0.35, len * 0.21, beam * 0.43, fb + 0.9, fb + 1.9, m(GLASS, 6), b);
+            v(-len * 0.38, len * 0.18, beam * 0.44, fb + 1.9, fb + 2.15, m(PAINT, 4), b);
+            v(-len * 0.24, len * 0.08, beam * 0.36, fb + 2.15, fb + 3.0, m(GLASS, 6), b);
+            v(-len * 0.26, len * 0.06, beam * 0.38, fb + 3.0, fb + 3.2, m(PAINT, 4), b);
+            v(-len * 0.12, len * 0.02, beam * 0.3, fb + 3.2, fb + 4.1, m(FRAME, 1), b);
+            fb + 4.1
+        }
+    }
 }
 
 /// The archetypes as a species pack: one mesh and one variant (one part, at its origin) each.
@@ -597,7 +663,11 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("Tower") || name.contains("Residential") {
+    if name.contains("Boat") {
+        Class::Boat
+    } else if name.contains("Dock") {
+        Class::Dock
+    } else if name.contains("Tower") || name.contains("Residential") {
         Class::Tower
     } else if name.contains("Office") || name.contains("Apartments") {
         Class::MidRise

@@ -410,6 +410,10 @@ void main() {
             if (seaFFT) {
                 // the waves feel the bottom near the shore: long ones die out first
                 float dep = max(wfloor, wd);
+                // in a city the bay and the canals are sheltered and shallow: the waves feel the
+                // real floor (ETOPO), not the shelf the shore field draws, so the swell dies out
+                // and only the wind's ripples remain; the open sea outside keeps its waves
+                if (g.city.x > 0.5) dep = min(dep, max(wfloor, 0.5) * 1.4 + 0.5);
                 oAmp = vec4(smoothstep(0.0, 25.0, dep), smoothstep(0.0, 8.0, dep), smoothstep(0.0, 2.0, dep), smoothstep(0.0, 0.4, dep));
                 // Real wave geometry: march the ray through the slab the waves fill (+-A around
                 // the mean level) against the height field, first crossing refined by bisection.
@@ -714,7 +718,7 @@ void main() {
                 float swash = 0.5 + 0.35 * sin(tm * 0.9 + vnoise(q * 0.12) * 6.2831853);
                 float band = smoothstep(-swash - 0.8, -swash * 0.4, sdW) * (1.0 - smoothstep(-0.1, 0.15, sdW));
                 float brk = smoothstep(0.42, 0.78, vnoise(q * 1.6 + vec2(0.3, 0.5) * tm) * 0.6 + vnoise(q * 5.5 - vec2(0.2, 0.4) * tm) * 0.4);
-                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf);
+                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf) * ((pl.flags & FLAG_SEAWALL) != 0u ? 0.0 : 1.0);
                 // whitecaps (FFT sea): a breaking crest is a lace of bubbles and streaks, not a
                 // solid patch; finer near the camera, an even mix further out (mips)
                 // fresh foam on the breaking crest is dense and bright; older foam trails behind

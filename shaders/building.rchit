@@ -101,6 +101,20 @@ void main() {
         glass = 0.1;
     } else if (mt == 8u) {
         albedo = B_WALL[min(pal, 8u)] * 0.9 * grime;
+    } else if (mt == 11u) {
+        // timber: decking planks (teak on boats, weathered grey-brown on docks), piles darker
+        vec3 wc = pal == 0u ? vec3(0.34, 0.24, 0.15) : vec3(0.16, 0.13, 0.10);
+        float plank = smoothstep(0.0, 0.08, min(fract(po.z / 0.16), 1.0 - fract(po.z / 0.16)));
+        albedo = wc * mix(0.82, 1.1, vnoise(vec2(po.x * 0.4, floor(po.z / 0.16)) * 3.1)) * mix(1.0, mix(0.7, 1.0, plank), detail);
+    } else if (mt == 12u) {
+        // gelcoat and paint: glossy
+        const vec3 PAINTC[5] = vec3[5](vec3(0.03, 0.05, 0.13), vec3(0.36, 0.05, 0.04), vec3(0.04, 0.22, 0.24), vec3(0.02, 0.02, 0.025), vec3(0.86, 0.86, 0.84));
+        albedo = PAINTC[min(pal, 4u)];
+        glass = 0.3;
+    } else if (mt == 13u) {
+        // a rooftop pool's water
+        albedo = vec3(0.10, 0.42, 0.48);
+        glass = 0.6;
     } else {
         albedo = vec3(0.025, 0.026, 0.028);
     }
