@@ -33,6 +33,8 @@ pub struct ArchRef {
     pub slim: bool,
     /// an office block (glass, ribbon windows): downtown's, rare elsewhere
     pub office: bool,
+    /// an apartment block of its own shape (slab, L, rounded ends, stepped)
+    pub shaped: bool,
 }
 
 struct Core {
@@ -1148,6 +1150,10 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 let fits = if fresh.is_empty() { fits.clone() } else { fresh };
                 let big: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| (archs[a].size[0] * archs[a].size[1]) as f64 >= 0.4 * room).collect();
                 let from = if big.is_empty() { &fits } else { &big };
+                // (two lots in three take one of the shaped blocks where one fits: the boxes
+                // are the minority)
+                let shaped: Vec<(usize, u32)> = fits.iter().copied().filter(|&(a, _)| archs[a].shaped).collect();
+                let from = if !shaped.is_empty() && bu(i, j, 7800 + lot) < 0.67 { &shaped } else { from };
                 from[(bh(i, j, 12 + lot) as usize) % from.len()]
             };
             let r = &archs[pick.0];

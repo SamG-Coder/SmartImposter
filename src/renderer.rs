@@ -1564,6 +1564,7 @@ impl Renderer {
                             residential: t.name.contains("Residential"),
                             slim: t.name.contains("Residential_Slim"),
                             office: t.name.contains("Office"),
+                            shaped: t.name.contains("Apartments_Mix"),
                         });
                     }
                 }
