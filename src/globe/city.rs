@@ -657,32 +657,51 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
                 if fits.is_empty() {
                     continue;
                 }
-                let (a, q) = fits[(bh(i, j, 10 + lot) as usize) % fits.len()];
-                let r = &archs[a];
-                if r.height < need {
-                    continue;
-                }
-                let quarter = q + if bu(i, j, 20 + lot) < 0.5 { 2 } else { 0 };
-                let scale = 0.94 + 0.08 * bu(i, j, 40 + lot);
-                let (ax, az) = if quarter % 2 == 0 { (r.size[0] as f64, r.size[1] as f64) } else { (r.size[1] as f64, r.size[0] as f64) };
-                let (hx, hy) = (ax * 0.5 * scale, az * 0.5 * scale);
-                // along the street: centred in what the driveway leaves; back from the street
-                let u = if drive_right { 1.5 + (lw - 6.0) * 0.5 } else { 4.5 + (lw - 6.0) * 0.5 };
-                let v = FRONT_YARD + hy + 0.5;
-                let px = x0 + l as f64 * lw + u;
-                let py = if row == 0 { y0 + v } else { y0 + h - v };
-                if built_at(px, py) < 0.25 {
-                    continue;
-                }
-                let (ex, ey) = (hx + 1.0, hy + 1.0);
-                if !(buildable(k, terrain, px, py) && buildable(k, terrain, px - ex, py - ey) && buildable(k, terrain, px + ex, py + ey) && buildable(k, terrain, px + ex, py - ey) && buildable(k, terrain, px - ex, py + ey)) {
-                    continue;
+                // the lot's house, or where it does not fit (a back corner over the water on a
+                // narrow island, a road), a smaller one, and nearer the street
+                let first = (bh(i, j, 10 + lot) as usize) % fits.len();
+                let mut order: Vec<(usize, u32)> = vec![fits[first]];
+                let mut rest: Vec<(usize, u32)> = fits.iter().copied().filter(|f| *f != fits[first]).collect();
+                rest.sort_by(|x, y| {
+                    let d = |f: &(usize, u32)| if f.1 == 0 { archs[f.0].size[1] } else { archs[f.0].size[0] };
+                    d(x).total_cmp(&d(y))
+                });
+                order.extend(rest);
+                let mut found = None;
+                'try_house: for &(a, q) in &order {
+                    let r = &archs[a];
+                    if r.height < need {
+                        continue;
+                    }
+                    let quarter = q + if bu(i, j, 20 + lot) < 0.5 { 2 } else { 0 };
+                    let scale = 0.94 + 0.08 * bu(i, j, 40 + lot);
+                    let (ax, az) = if quarter % 2 == 0 { (r.size[0] as f64, r.size[1] as f64) } else { (r.size[1] as f64, r.size[0] as f64) };
+                    let (hx, hy) = (ax * 0.5 * scale, az * 0.5 * scale);
+                    // along the street: centred in what the driveway leaves; back from the street
+                    let u = if drive_right { 1.5 + (lw - 6.0) * 0.5 } else { 4.5 + (lw - 6.0) * 0.5 };
+                    for front in [FRONT_YARD, 3.0] {
+                        let v = front + hy + 0.5;
+                        let px = x0 + l as f64 * lw + u;
+                        let py = if row == 0 { y0 + v } else { y0 + h - v };
+                        // (mapped water raised above the sea is the islands' land: built enough)
+                        if built_at(px, py) < 0.15 && (buildable(k, terrain, px, py) || !house_ground(k, terrain, px, py)) {
+                            continue;
+                        }
+                        let (ex, ey) = (hx + 1.0, hy + 1.0);
+                        let ok = |x: f64, y: f64| house_ground(k, terrain, x, y);
+                        if !(ok(px, py) && ok(px - ex, py - ey) && ok(px + ex, py + ey) && ok(px + ex, py - ey) && ok(px - ex, py + ey)) {
+                            continue;
+                        }
+                        let (wx, wy) = to_world(px, py);
+                        if on_way(wx, wy, hx.max(hy) + 3.0) {
+                            continue;
+                        }
+                        found = Some((a, px, py, quarter, scale, hx, hy));
+                        break 'try_house;
+                    }
                 }
                 let _ = depth;
-                let (wx, wy) = to_world(px, py);
-                if on_way(wx, wy, hx.max(hy) + 3.0) {
-                    continue;
-                }
+                let Some((a, px, py, quarter, scale, hx, hy)) = found else { continue };
                 out.push(Placed { arch: a, x: px, y: py, quarter, scale, hx, hy });
                 // its pool in the back yard (half the houses), only with the house
                 if bu(i, j, 600 + lot) < 0.5 {
@@ -982,11 +1001,34 @@ fn car_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Vec<&ArchRef>) {
 /// river: land within 160 m both ways along the street) always; long ones (across the bay, to
 /// 1.6 km) only on every other arterial, as causeways.
 fn crossing(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> Option<(f64, f64)> {
-    if !water_at(k, terrain, x, y) {
+    // (crossings are decided on the land cover's water alone: the 30 m data is a surface
+    // model, the real bridges and causeways are in it as raised ground, which would cut ours in
+    // two)
+    // ponds above sea level are not crossed: the lower quartile of the water's heights over
+    // ~200 m round about must be the sea's (a causeway is a thin line in that window)
+    let wet = |x: f64, y: f64| {
+        let (la, lo) = to_lat_lon(k, x, y);
+        if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
+            return false;
+        }
+        let (dla, dlo) = (30.0 / 110_540.0, 30.0 / (111_320.0 * la.to_radians().cos()));
+        let mut h: Vec<f32> = Vec::with_capacity(49);
+        for a in -3..=3 {
+            for b in -3..=3 {
+                let (pa, po) = (la + a as f64 * dla, lo + b as f64 * dlo);
+                if terrain.cover.class_group(pa, po) == Some(lc::WATER) {
+                    h.push(terrain.height(pa, po));
+                }
+            }
+        }
+        h.sort_by(|a, b| a.total_cmp(b));
+        h[h.len() / 4] < 0.6
+    };
+    if !wet(x, y) {
         return None;
     }
     // decided for the whole crossing, the same at every point of it: walk out both ways to the
-    // first bank (30 m of solid land), within reach (canals for the side streets, rivers for
+    // first bank (60 m of solid land), within reach (canals for the side streets, rivers for
     // the arterials, the bay only on the causeways); then the crossing must have water both
     // sides of the street at its middle (a street running along a shore just off it does not)
     let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 1600.0 } else if arterial { 250.0 } else { 70.0 };
@@ -994,9 +1036,11 @@ fn crossing(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial
     let bank = |dir: f64| -> Option<f64> {
         let mut s = 0.0;
         while s <= reach {
-            let solid = (0..4).all(|n| {
+            // (60 m of land: a thinner strip, the real causeway's road in the land cover, is
+            // bridged over: the terrain draws it as water from any distance)
+            let solid = (0..7).all(|n| {
                 let (px, py) = pt(dir * (s + 10.0 * n as f64));
-                !water_at(k, terrain, px, py)
+                !wet(px, py)
             });
             if solid {
                 return Some(s);
@@ -1008,7 +1052,7 @@ fn crossing(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial
     let (Some(a), Some(b)) = (bank(-1.0), bank(1.0)) else { return None };
     let (mx, my) = pt((b - a) * 0.5);
     let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
-    (water_at(k, terrain, mx + px, my + py) && water_at(k, terrain, mx - px, my - py)).then_some((a, b))
+    (wet(mx + px, my + py) && wet(mx - px, my - py)).then_some((a, b))
 }
 
 /// A crossing's arch at a point (a back to its bank, b on to the other): the deck's height
@@ -1112,9 +1156,10 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
                     let forward = if along_x { off < 0.0 } else { off > 0.0 };
                     let yaw = yaw0 + if forward { 0.0 } else { std::f64::consts::PI };
                     let kind = if a && bu(i, j, salt + 500) < 0.04 { 5 } else { (bh(i, j, salt + 600) % 5) as usize };
-                    if !water_at(k, terrain, x, y) {
+                    let over = crossing(k, terrain, x, y, along_x, a, line);
+                    if over.is_none() && !water_at(k, terrain, x, y) {
                         put_at(k, sp, kinds[kind], x, y, ground(k, terrain, x, y), yaw, bh(i, j, salt + 700), id, tile);
-                    } else if let Some((ca, cb)) = crossing(k, terrain, x, y, along_x, a, line) {
+                    } else if let Some((ca, cb)) = over {
                         let (h, dh) = arch(ca, cb);
                         let pitch = if forward { dh.atan() } else { -dh.atan() };
                         let (wx, wy) = to_world(x, y);
@@ -1320,8 +1365,36 @@ fn sea_level_water(terrain: &Terrain, la: f64, lo: f64) -> bool {
     }
     h.sort_by(|a, b| a.total_cmp(b));
     // drawn as water only where the ground is under that level (tiles.rs: the drawn water is
-    // mapped water whose ground lies below its level; a pond above sea level is land in a city)
+    // mapped water whose ground lies below its level, and the 30 m data puts the sea at 0 m
+    // exactly; a pond above sea level is land in a city)
     h[h.len() / 4] < 1.0 && terrain.height(la, lo) < 0.6
+}
+
+/// May a house stand here? As `buildable`, but mapped water counts as land wherever most of
+/// it round about is raised above 0.1 m: the narrow islands' backs, which the terrain draws as
+/// land (the sea is at exactly 0 m in the 30 m data), and which the strict test leaves empty.
+fn house_ground(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
+    if buildable(k, terrain, x, y) {
+        return true;
+    }
+    let (wx, wy) = to_world(x, y);
+    if on_way(wx, wy, 1.0) {
+        return false;
+    }
+    let (la, lo) = to_lat_lon(k, x, y);
+    if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
+        return false;
+    }
+    let (dla, dlo) = (12.0 / 110_540.0, 12.0 / (111_320.0 * la.to_radians().cos()));
+    let mut raised = 0;
+    for a in -2..=2 {
+        for b in -2..=2 {
+            if terrain.height(la + a as f64 * dla, lo + b as f64 * dlo) >= 0.1 {
+                raised += 1;
+            }
+        }
+    }
+    raised >= 13
 }
 
 /// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards
