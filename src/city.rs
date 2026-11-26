@@ -858,11 +858,13 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let mut r = Rng(0xA4E5 + k as u64);
         let wake = len * 5.0;
         let foam = m(POOL, 1);
+        // (each a streak drawn out along the boat's track, 4-6 x as long as wide, tapered:
+        // diamond-shaped, so the trail reads as foam lines, not as scattered tiles)
         let patch = |b: &mut B, x: f32, z: f32, s: f32, rng: &mut Rng| {
-            let a = rng.range(0.0, std::f32::consts::PI);
-            let (c, sn) = (a.cos() * s, a.sin() * s);
+            let l = s * rng.range(2.0, 3.0);
+            let w = s * 0.45;
             let y = 0.12;
-            b.quad([Vec3::new(x - c, y, z - sn), Vec3::new(x + sn, y, z - c), Vec3::new(x + c, y, z + sn), Vec3::new(x - sn, y, z + c)], foam);
+            b.quad([Vec3::new(x - l, y, z), Vec3::new(x, y, z - w), Vec3::new(x + l, y, z), Vec3::new(x, y, z + w)], foam);
         };
         let stern = -len * 0.5;
         for _ in 0..(wake * 2.2) as usize {
@@ -938,13 +940,14 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     // elevated road decks, 20 m along (+x), deck top at 10 m: the highway (six lanes, a median
     // barrier, two columns on a crossbeam) and a ramp (one lane, one column); the columns run
     // 14 m below the deck's foot, so a deck sunk for a ramp's climb still stands on them
-    for (k, &width) in [30.0f32, 11.0].iter().enumerate() {
+    // (the third: a ramp piece of 6 m, laid every 5 m round the loops' curves)
+    for (k, &(width, hl)) in [(30.0f32, 10.05f32), (11.0, 10.05), (11.0, 3.1)].iter().enumerate() {
         let mut b = B::new();
         let hw = width * 0.5;
-        b.bx(Vec3::new(-10.05, 8.6, -hw), Vec3::new(10.05, 10.0, hw), m(SLAB, 0), true);
-        b.quad([Vec3::new(-10.0, 10.02, -hw + 0.5), Vec3::new(10.0, 10.02, -hw + 0.5), Vec3::new(10.0, 10.02, hw - 0.5), Vec3::new(-10.0, 10.02, hw - 0.5)], m(ASPHALT, 2 + k as u8));
+        b.bx(Vec3::new(-hl, 8.6, -hw), Vec3::new(hl, 10.0, hw), m(SLAB, 0), true);
+        b.quad([Vec3::new(-hl, 10.02, -hw + 0.5), Vec3::new(hl, 10.02, -hw + 0.5), Vec3::new(hl, 10.02, hw - 0.5), Vec3::new(-hl, 10.02, hw - 0.5)], m(ASPHALT, 2 + k.min(1) as u8));
         for z in [-hw, hw - 0.45] {
-            b.bx(Vec3::new(-10.05, 10.0, z), Vec3::new(10.05, 11.0, z + 0.45), m(SLAB, 0), false);
+            b.bx(Vec3::new(-hl, 10.0, z), Vec3::new(hl, 11.0, z + 0.45), m(SLAB, 0), false);
         }
         if k == 0 {
             b.bx(Vec3::new(-10.05, 10.0, -0.3), Vec3::new(10.05, 10.85, 0.3), m(SLAB, 0), false);
@@ -952,8 +955,10 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
             for z in [-7.0f32, 7.0] {
                 b.bx(Vec3::new(-0.9, -14.0, z - 0.9), Vec3::new(0.9, 7.4, z + 0.9), m(SLAB, 0), false);
             }
-        } else {
+        } else if k == 1 {
             b.bx(Vec3::new(-0.8, -14.0, -0.8), Vec3::new(0.8, 8.6, 0.8), m(SLAB, 0), false);
+        } else {
+            b.bx(Vec3::new(-0.6, -14.0, -0.6), Vec3::new(0.6, 8.6, 0.6), m(SLAB, 0), false);
         }
         push(b, format!("Building_Highway_{k}"), 11.0, &mut meshes, &mut archs);
     }
