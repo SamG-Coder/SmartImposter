@@ -21,7 +21,7 @@ pub const NEAR: f64 = 6_000.0;
 pub const SPLIT: f64 = 8.0;
 /// Most trees in one tile (~3000 candidates), and plant records on the GPU in all (the instance
 /// custom index addressing them has 24 bits).
-pub const MAX_PER_TILE: usize = 4_096;
+pub const MAX_PER_TILE: usize = 8_192;
 pub const CAPACITY: u32 = 16_000_000;
 /// Candidate spacing (m) on the finest tiles: a closed stand reaches ~300 trees / ha.
 const SPACING: f64 = 5.5;
@@ -292,7 +292,7 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                         rec[ri * 4 + ci] = (*v as f32).to_bits();
                     }
                 }
-                rec[12] = vid as u32 | seed << 8 | dry << 21;
+                rec[12] = rec_data(vid, seed << 8 | dry << 21);
                 let (bmin, bmax) = (info.bmin, info.bmax);
                 let mut lo = [f32::MAX; 3];
                 let mut hi = [f32::MIN; 3];
@@ -317,6 +317,17 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
         }
     }
     tile
+}
+
+/// A plant record's last word: the variant (low 8 bits, the ninth at bit 28: rt.glsl
+/// plantVariant) and `rest` (seed << 8, dryness << 21, thinning << 25).
+pub fn rec_data(vid: usize, rest: u32) -> u32 {
+    (vid as u32 & 0xFF) | ((vid as u32 >> 8) & 1) << 28 | rest
+}
+
+/// The variant of a plant record's last word.
+pub fn rec_variant(d: u32) -> usize {
+    ((d & 0xFF) | ((d >> 20) & 0x100)) as usize
 }
 
 /// Words per plant record (rt.glsl PlantRec: 3x4 rows, variant | seed << 8; 52 bytes).
@@ -599,7 +610,7 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             }
             // levels coarser than the finest (impostor.rint thins the trees on with distance)
             let k = (TREE_LEVEL - id.level).min(7) as u32;
-            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21 | k << 25;
+            rec[12] = rec_data(vid, seed << 8 | dryness(biome) << 21 | k << 25);
             // tile-local bounds of the transformed box
             let (bmin, bmax) = (info.bmin, info.bmax);
             let mut lo = [f32::MAX; 3];

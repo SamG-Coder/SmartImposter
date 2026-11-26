@@ -58,6 +58,6 @@ void main() {
     if (g.lodParams.z < -0.5) return; // impostor bake: no LOD dissolve
     InstInfo ii = insts[gl_InstanceID];
     if ((ii.flags & 1u) == 0u) return; // plain mesh instance (alpha-tested only)
-    float f = meshFade(g, distance(g.camPos.xyz, ii.center) / imps[instVariant(ii.data)].lodScale);
+    float f = meshFade(g, distance(g.camPos.xyz, ii.center) / imps[instVariant(ii.data, ii.flags)].lodScale);
     if (lodRand(g, ii.data & 0xFFFFFFu, 1u) >= f) ignoreIntersectionEXT;
 }

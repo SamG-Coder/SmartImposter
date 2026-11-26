@@ -33,6 +33,15 @@ vec3 buildingTint(uint seed) {
     return T[pcg(seed * 747796405u) & 7u];
 }
 
+// A car's paint by its seed (keep in step with impostor.rchit): mostly white, black, silver and
+// grey, some red, blue, dark blue, beige; seed 0 (the bake) white.
+vec3 carPaint(uint seed) {
+    if (seed == 0u) return vec3(1.0);
+    const vec3 C[12] = vec3[12](vec3(1.0), vec3(1.0), vec3(0.06), vec3(0.06), vec3(0.62), vec3(0.62), vec3(0.32), vec3(0.65, 0.06, 0.05),
+                                vec3(0.08, 0.16, 0.45), vec3(0.05, 0.07, 0.18), vec3(0.75, 0.66, 0.52), vec3(0.15));
+    return C[pcg(seed * 2891336453u) % 12u];
+}
+
 float bHash(vec2 c, uint k) { return float(pcg(uint(int(c.x) + 4096) * 7919u ^ uint(int(c.y) + 4096) * 104729u ^ k) & 0xFFFFu) / 65535.0; }
 
 void main() {
@@ -124,6 +133,16 @@ void main() {
         const vec3 PAINTC[5] = vec3[5](vec3(0.03, 0.05, 0.13), vec3(0.36, 0.05, 0.04), vec3(0.04, 0.22, 0.24), vec3(0.02, 0.02, 0.025), vec3(0.86, 0.86, 0.84));
         albedo = PAINTC[min(pal, 4u)];
         glass = 0.3;
+    } else if (mt == 14u) {
+        // car paint: each car's own colour (its record's seed; white in the bake, the impostor
+        // applies the same colour: impostor.rchit carPaint), glossy
+        albedo = vec3(0.85) * carPaint(instSeed(gl_InstanceCustomIndexEXT));
+        glass = 0.35;
+    } else if (mt == 15u) {
+        // a bridge's roadway: asphalt with its centre line
+        albedo = vec3(0.075, 0.075, 0.078) * mix(0.85, 1.15, vnoise(po.xz * 0.3));
+        float cl = (1.0 - smoothstep(0.1, 0.14, abs(po.z))) * step(fract(po.x / 9.0), pal == 0u ? 1.0 : 0.4) * detail;
+        albedo = mix(albedo, pal == 0u ? vec3(0.55, 0.42, 0.10) : vec3(0.6), cl);
     } else if (mt == 13u) {
         // a rooftop pool's water
         albedo = vec3(0.10, 0.42, 0.48);

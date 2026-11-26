@@ -36,6 +36,12 @@ void main() {
         const vec3 T[8] = vec3[8](vec3(1.0), vec3(1.0, 0.95, 0.86), vec3(1.0, 0.9, 0.88), vec3(0.92, 0.96, 1.0),
                                   vec3(0.94, 1.0, 0.93), vec3(1.0, 0.97, 0.88), vec3(0.86, 0.86, 0.85), vec3(1.0, 0.98, 0.95));
         vec3 tint = bs == 0u ? vec3(1.0) : T[pcg(bs * 747796405u) & 7u];
+        if (imps[vid].bmax.w > 0.5) {
+            // a car: its paint (building.rchit carPaint)
+            const vec3 C[12] = vec3[12](vec3(1.0), vec3(1.0), vec3(0.06), vec3(0.06), vec3(0.62), vec3(0.62), vec3(0.32), vec3(0.65, 0.06, 0.05),
+                                        vec3(0.08, 0.16, 0.45), vec3(0.05, 0.07, 0.18), vec3(0.75, 0.66, 0.52), vec3(0.15));
+            tint = bs == 0u ? vec3(1.0) : C[pcg(bs * 2891336453u) % 12u];
+        }
         pl.albedo = alb * mix(vec3(1.0), tint, 1.0 - glassB);
         pl.t = gl_HitTEXT;
         pl.n = n;

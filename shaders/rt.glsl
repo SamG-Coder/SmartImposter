@@ -41,7 +41,7 @@ uint instSeed(uint ci) { return ci >> 11; }
 struct PlantRec { vec4 r0; vec4 r1; vec4 r2; uint data; };
 mat3 plantMatrix(PlantRec p) { return transpose(mat3(p.r0.xyz, p.r1.xyz, p.r2.xyz)); }
 vec3 plantOrigin(PlantRec p) { return vec3(p.r0.w, p.r1.w, p.r2.w); }
-uint plantVariant(PlantRec p) { return p.data & 0xFFu; }
+uint plantVariant(PlantRec p) { return (p.data & 0xFFu) | ((p.data >> 20u) & 0x100u); } // (the ninth bit at 28: forest.rs rec_data)
 uint plantSeed(PlantRec p) { return (p.data >> 8) & 0x1FFFu; }
 // How dry the plant's biome is, 0..1 (forest.rs dryness): dusty, sun-bleached foliage.
 float plantDry(PlantRec p) { return float((p.data >> 21) & 15u) / 15.0; }
@@ -87,7 +87,7 @@ struct InstInfo {
     uint data;    // tree index (24 bits) | variant (bits 24..31)
     uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness; from bit 5: which part of the plant
 };
-uint instVariant(uint data) { return data >> 24; }
+uint instVariant(uint data, uint flags) { return (data >> 24) | ((flags >> 23) & 0x100u); } // (the ninth bit: flags bit 31)
 
 // Cross-fade weights. Inside a band, every ray picks one representation per tree with this
 // probability, using the same random number in the mesh any-hit and the impostor intersection

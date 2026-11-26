@@ -27,6 +27,8 @@ pub const SPANDREL: u8 = 10;
 pub const WOOD: u8 = 11;
 pub const PAINT: u8 = 12;
 pub const POOL: u8 = 13;
+pub const CARPAINT: u8 = 14;
+pub const ASPHALT: u8 = 15;
 
 /// What an archetype is: the city plan (globe/city.rs) picks by it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -38,6 +40,9 @@ pub enum Class {
     /// boats (moored at docks and out on the water) and docks: not for lots
     Boat,
     Dock,
+    /// cars (parking lots, driveways, traffic) and bridge decks: not for lots
+    Car,
+    Bridge,
 }
 
 pub struct Arch {
@@ -614,12 +619,79 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         }
         push(b, "Building_Dock".into(), 1.2, &mut meshes, &mut archs);
     }
+    // cars (origin on the ground, front towards +x; painted white, the paint's colour is each
+    // car's own: building.rchit / impostor.rchit by its record's seed)
+    for (k, &(len, wid, hgt, kind)) in [(4.0f32, 1.75f32, 1.45f32, 0u32), (4.75, 1.82, 1.45, 0), (4.85, 1.95, 1.75, 1), (5.6, 2.0, 1.85, 2), (5.2, 2.0, 2.15, 3), (12.0, 2.55, 3.1, 4)].iter().enumerate() {
+        let mut b = B::new();
+        car(&mut b, len, wid, hgt, kind);
+        push(b, format!("Building_Car_{k}"), hgt, &mut meshes, &mut archs);
+    }
+    // bridge decks, 20 m along the street (+x): an arterial's 22 m and a side street's 14 m,
+    // deck on two piers, parapets, the roadway asphalt
+    for (k, &width) in [22.0f32, 14.0].iter().enumerate() {
+        let mut b = B::new();
+        let hw = width * 0.5;
+        b.bx(Vec3::new(-10.0, 1.7, -hw), Vec3::new(10.0, 2.9, hw), m(SLAB, 0), true);
+        b.quad([Vec3::new(-10.0, 2.92, -hw + 0.6), Vec3::new(10.0, 2.92, -hw + 0.6), Vec3::new(10.0, 2.92, hw - 0.6), Vec3::new(-10.0, 2.92, hw - 0.6)], m(ASPHALT, k as u8));
+        for z in [-hw, hw - 0.5] {
+            b.bx(Vec3::new(-10.0, 2.9, z), Vec3::new(10.0, 3.9, z + 0.5), m(SLAB, 0), false);
+        }
+        b.bx(Vec3::new(-1.2, -3.0, -hw + 1.0), Vec3::new(1.2, 1.7, hw - 1.0), m(SLAB, 0), false);
+        push(b, format!("Building_Bridge_{k}"), 3.9, &mut meshes, &mut archs);
+    }
     (meshes, archs)
 }
 
 /// A boat: hull (white gelcoat, a painted boot stripe, a teak deck), and by `kind` a console
 /// with a T-top (0), a cabin with a windscreen (1), or two decks of a motor yacht with dark
 /// glazing and a flybridge (2). Returns its height above the waterline.
+/// A car: the body (a box with its ends rounded off), the glasshouse on it (pillars of paint,
+/// windows of dark glass), four wheels. kind: 0 car, 1 SUV, 2 pickup (an open bed), 3 van,
+/// 4 bus (glass all along).
+fn car(b: &mut B, len: f32, wid: f32, hgt: f32, kind: u32) {
+    let (hl, hw) = (len * 0.5, wid * 0.5);
+    let sill = 0.32;
+    let belt = if kind == 4 { 1.1 } else { hgt * 0.58 };
+    let body = ccw(vec![
+        Vec2::new(-hl, -hw + 0.12),
+        Vec2::new(-hl + 0.15, -hw),
+        Vec2::new(hl - 0.3, -hw),
+        Vec2::new(hl, -hw + 0.2),
+        Vec2::new(hl, hw - 0.2),
+        Vec2::new(hl - 0.3, hw),
+        Vec2::new(-hl + 0.15, hw),
+        Vec2::new(-hl, hw - 0.12),
+    ]);
+    b.prism(&body, sill, belt, m(CARPAINT, 0), m(CARPAINT, 0), true);
+    // the glasshouse: from the windscreen back to the rear window (a pickup's ends at its bed)
+    let (x0, x1) = match kind {
+        0 => (-hl * 0.55, hl * 0.25),
+        1 => (-hl * 0.8, hl * 0.35),
+        2 => (-hl * 0.1, hl * 0.4),
+        3 => (-hl * 0.95, hl * 0.55),
+        _ => (-hl * 0.97, hl * 0.97),
+    };
+    let top = hgt - 0.05;
+    let inset = if kind == 4 { 0.02 } else { 0.12 };
+    let g = ccw(vec![Vec2::new(x0, -hw + inset), Vec2::new(x1, -hw + inset), Vec2::new(x1, hw - inset), Vec2::new(x0, hw - inset)]);
+    b.prism(&g, belt, top, m(GLASS, 6), m(CARPAINT, 0), false);
+    // the roof's pillars (paint) at the ends of the glass
+    for x in [x0, x1] {
+        b.bx(Vec3::new(x - 0.06, belt, -hw + inset - 0.01), Vec3::new(x + 0.06, top, hw - inset + 0.01), m(CARPAINT, 0), false);
+    }
+    if kind == 2 {
+        // the bed: low walls round an open box
+        b.bx(Vec3::new(-hl, belt - 0.05, -hw), Vec3::new(x0 - 0.1, belt + 0.05, hw), m(DARK, 0), false);
+    }
+    // wheels
+    let r = if kind == 4 { 0.5 } else { 0.34 };
+    for &x in &[-hl * 0.68, hl * 0.62] {
+        for z in [-hw - 0.01, hw - 0.24] {
+            b.bx(Vec3::new(x - r, 0.0, z), Vec3::new(x + r, 2.0 * r, z + 0.25), m(DARK, 0), false);
+        }
+    }
+}
+
 fn boat(b: &mut B, len: f32, beam: f32, kind: u32, pal: u8) -> f32 {
     let (draft, fb) = (0.25 * beam.sqrt(), 0.32 * beam.sqrt());
     let hull = ccw(vec![Vec2::new(-len * 0.5, -beam * 0.5), Vec2::new(len * 0.2, -beam * 0.5), Vec2::new(len * 0.5, 0.0), Vec2::new(len * 0.2, beam * 0.5), Vec2::new(-len * 0.5, beam * 0.5)]);
@@ -679,6 +751,10 @@ pub fn class_of(name: &str) -> Class {
         Class::Boat
     } else if name.contains("Dock") {
         Class::Dock
+    } else if name.contains("Car_") {
+        Class::Car
+    } else if name.contains("Bridge") {
+        Class::Bridge
     } else if name.contains("Tower") || name.contains("Residential") {
         Class::Tower
     } else if name.contains("Office") || name.contains("Apartments") {

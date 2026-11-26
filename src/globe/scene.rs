@@ -1343,7 +1343,7 @@ impl GlobeScene {
                 continue;
             }
             for r in &t.recs {
-                let v = (r[12] & 0xFF) as usize;
+                let v = super::forest::rec_variant(r[12]);
                 let p = t.center + DVec3::new(f32::from_bits(r[3]) as f64, f32::from_bits(r[7]) as f64, f32::from_bits(r[11]) as f64);
                 let d = (p - cam).length() as f32;
                 if v < out.len() && d < out[v] {

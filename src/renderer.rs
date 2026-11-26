@@ -21,7 +21,7 @@ macro_rules! spv {
 }
 
 /// Atlas slots (one per plant variant) bound as sampler arrays. Must match shared.glsl.
-pub const MAX_VARIANTS: usize = 256; // PlantRec keeps the variant in 8 bits (rt.glsl plantVariant)
+pub const MAX_VARIANTS: usize = 512; // PlantRec keeps the variant in 9 bits (rt.glsl plantVariant, forest.rs rec_data)
 /// Texture sets (4 textures each) bound as a sampler array. Must match shared.glsl.
 pub const MAX_SPECIES: usize = 64;
 /// Ocean wave textures (globe/ocean.rs: A and B per cascade), binding 33.
@@ -122,6 +122,8 @@ struct InstInfo {
 
 const INST_HAS_MESH: u32 = 1;
 const INST_VARIANT_SHIFT: u32 = 24;
+/// InstInfo.flags: the variant's ninth bit (rt.glsl instVariant).
+const INST_VARIANT_HI: u32 = 31;
 /// InstInfo.flags: which part of its plant the instance is (from this bit up; tri.rchit's per-leaf
 /// colour variation).
 const INST_PART_SHIFT: u32 = 5;
@@ -1031,7 +1033,8 @@ impl Renderer {
                         _ => 0.0,
                     },
                 ],
-                bmax: [hi.x, hi.y, hi.z, 0.0],
+                // w: 1 = a car (impostor.rchit: its paint by the record's seed)
+                bmax: [hi.x, hi.y, hi.z, if t.name.starts_with("Building_Car_") { 1.0 } else { 0.0 }],
                 // mean transmission (x albedo in impostor.rchit); w = draw distance
                 trans: [0.33 * sp.trans_tint[0], 0.33 * sp.trans_tint[1], 0.33 * sp.trans_tint[2], vi.cull],
                 grid: imp.grid,
@@ -1659,7 +1662,7 @@ impl Renderer {
             } else {
                 c.keep += 1;
             }
-            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21);
+            let data = crate::globe::forest::rec_data(t.variant as usize, ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21));
             recs.push(PlantRecGpu::new(t.xform.matrix3.into(), t.xform.translation.into(), data));
             aabbs.push(plant_box(t, &pack.trees[t.variant as usize]));
         }
@@ -2955,7 +2958,7 @@ impl Renderer {
                 let (catalog, pack, blas, infos) = (&self.catalog, &self.pack, &self.blas, &self.imp_infos);
                 scene.near_trees(ecef, reach, |rec, tile_c, r| {
                     let f = |k: usize| f32::from_bits(r[k]);
-                    let v = (r[12] & 0xFF) as usize;
+                    let v = crate::globe::forest::rec_variant(r[12]);
                     let ls = catalog.variants[v].lod_scale;
                     let m = glam::Mat3::from_cols(glam::Vec3::new(f(0), f(4), f(8)), glam::Vec3::new(f(1), f(5), f(9)), glam::Vec3::new(f(2), f(6), f(10)));
                     // plant -> camera frame
@@ -2969,7 +2972,7 @@ impl Renderer {
                     states.insert(rec, state);
                     let seed = ((r[12] >> 8) & 0x1FFF) << 11;
                     let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT);
-                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1;
+                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1 | ((v as u32 >> 8) & 1) << INST_VARIANT_HI;
                     for (pi, p) in pack.trees[v].parts.iter().enumerate() {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };

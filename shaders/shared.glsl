@@ -17,7 +17,7 @@
 #define FLAG_BUILDING 32768u // a building (city.rs, tri.rchit buildingHit): payload trans.z = how much is glass
 #define FLAG_SEAWALL 65536u  // globe water held by a city's seawall (globe.rchit): no shore foam
 #define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
-#define MAX_VARIANTS 256 // atlas slots (one per plant variant)
+#define MAX_VARIANTS 512 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
 #define MAX_GROUND_TEX 81 // 3 per ground layer (26 layers); then the grass map (--lawn auto) and the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR

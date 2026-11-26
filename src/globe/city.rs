@@ -536,17 +536,10 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
         for j in (yl / BY).floor() as i64 - 1..=(yh / BY).floor() as i64 {
             for i in (xl / BX).floor() as i64 - 1..=(xh / BX).floor() as i64 {
                 let placed = block(k, archs, terrain, i, j, need);
-                if lvl == 0 && !sp.palms.is_empty() {
-                    street_palms(k, terrain, sp, i, j, id, tile);
-                    lot_trees(k, terrain, sp, i, j, id, tile, &placed);
-                }
-                if lvl == 0 {
-                    docks(k, terrain, sp, i, j, id, tile, &placed);
-                }
-                for p in placed {
+                for p in &placed {
                     let Some(d) = in_tile(k, p.x, p.y, id) else { continue };
                     if tile.recs.len() >= MAX_PER_TILE {
-                        return;
+                        break;
                     }
                     let (lat, lon) = lat_lon(d);
                     let r = &archs[p.arch];
@@ -554,7 +547,19 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
                     // (sunk a little: the ground under a footprint is never quite flat; no
                     // thinning level: impostor.rint never thins buildings)
                     let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.4, p.quarter as f64 * std::f64::consts::FRAC_PI_2, p.scale);
-                    push_rec(tile, rows, r.variant as u32 | seed << 8, &infos[r.variant]);
+                    push_rec(tile, rows, super::forest::rec_data(r.variant, seed << 8), &infos[r.variant]);
+                }
+                // (the buildings first: a tile full of cars must not lose a tower)
+                if lvl == 0 && !sp.palms.is_empty() {
+                    street_palms(k, terrain, sp, i, j, id, tile);
+                    lot_trees(k, terrain, sp, i, j, id, tile, &placed);
+                }
+                if lvl == 0 {
+                    docks(k, terrain, sp, i, j, id, tile, &placed);
+                    parked(k, terrain, sp, i, j, id, tile, &placed);
+                }
+                if lvl <= 2 {
+                    streets(k, terrain, sp, i, j, id, tile, lvl == 0);
                 }
             }
         }
@@ -567,6 +572,187 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
             }
         }
     }
+}
+
+
+/// The car archetypes (compact, sedan, SUV, pickup, van, bus) and the bridge decks (arterial,
+/// side street).
+fn car_kinds(archs: &[ArchRef]) -> (Vec<&ArchRef>, Vec<&ArchRef>) {
+    (archs.iter().filter(|a| a.class == Class::Car).collect(), archs.iter().filter(|a| a.class == Class::Bridge).collect())
+}
+
+/// Does the street through (x, y) cross water here on a bridge? Short crossings (canals, the
+/// river: land within 160 m both ways along the street) always; long ones (across the bay, to
+/// 1.6 km) only on every other arterial, as causeways.
+fn bridged(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial: bool, line: i64) -> bool {
+    if !water_at(k, terrain, x, y) {
+        return false;
+    }
+    // a crossing has water on both sides of the street (a street running along a shore just off
+    // it does not)
+    let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
+    if !water_at(k, terrain, x + px, y + py) || !water_at(k, terrain, x - px, y - py) {
+        return false;
+    }
+    let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 1600.0 } else { 160.0 };
+    let land = |dir: f64| {
+        let mut s = 20.0;
+        while s <= reach {
+            let (px, py) = if along_x { (x + dir * s, y) } else { (x, y + dir * s) };
+            if !water_at(k, terrain, px, py) {
+                return true;
+            }
+            s += 20.0;
+        }
+        false
+    };
+    land(1.0) && land(-1.0)
+}
+
+/// Bridge decks and traffic on the street lines of block (i, j) (as street_palms: the
+/// north-south street at x = i BX along this block's y span, the east-west one at y = j BY
+/// along its x span, crossings included). `cars`: also the traffic (finest tiles only).
+#[allow(clippy::too_many_arguments)]
+fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, cars: bool) {
+    let (kinds, decks) = car_kinds(&sp.buildings);
+    if decks.len() < 2 {
+        return;
+    }
+    for along_x in [false, true] {
+        let (line, a) = if along_x { (j, art_y(j)) } else { (i, art_x(i)) };
+        let (start, len) = if along_x { (i as f64 * BX, BX) } else { (j as f64 * BY, BY) };
+        let fixed = if along_x { j as f64 * BY } else { i as f64 * BX };
+        let at = |s: f64, off: f64| if along_x { (start + s, fixed + off) } else { (fixed + off, start + s) };
+        let yaw0 = if along_x { 0.0 } else { std::f64::consts::FRAC_PI_2 };
+        // decks every 20 m where the street is over water
+        let mut s = 10.0;
+        let mut n = 0u32;
+        while s < len {
+            let (x, y) = at(s, 0.0);
+            if bridged(k, terrain, x, y, along_x, a, line) {
+                put_at(k, sp, decks[if a { 0 } else { 1 }], x, y, 0.0, yaw0, bh(i, j, 6000 + n + along_x as u32 * 50), id, tile);
+            }
+            s += 20.0;
+            n += 1;
+        }
+        if !cars || kinds.len() < 6 {
+            continue;
+        }
+        // traffic, driving on the right: lanes at +-1.75 and +-5.25 m on an arterial, +-2 m on
+        // a side street; none in the crossings
+        let lanes: &[f64] = if a { &[-5.25, -1.75, 1.75, 5.25] } else { &[-2.0, 2.0] };
+        let road_x = |ii: i64| half_width(art_x(ii)) + 2.0;
+        let road_y = |jj: i64| half_width(art_y(jj)) + 2.0;
+        let (c0, c1) = if along_x { (road_x(i), len - road_x(i + 1)) } else { (road_y(j), len - road_y(j + 1)) };
+        for (li, &off) in lanes.iter().enumerate() {
+            let mut s = c0 + bu(i, j, 6500 + li as u32 + along_x as u32 * 10) * 20.0;
+            let mut n = 0u32;
+            while s < c1 {
+                let salt = 7000 + (li as u32) * 100 + n + along_x as u32 * 1000;
+                let busy = if a { 0.75 } else { 0.3 };
+                if bu(i, j, salt) < busy {
+                    let (x, y) = at(s, off);
+                    // northbound / eastbound on the right of the centre line
+                    let forward = if along_x { off < 0.0 } else { off > 0.0 };
+                    let yaw = yaw0 + if forward { 0.0 } else { std::f64::consts::PI };
+                    let kind = if a && bu(i, j, salt + 500) < 0.04 { 5 } else { (bh(i, j, salt + 600) % 5) as usize };
+                    let over = water_at(k, terrain, x, y);
+                    if !over || bridged(k, terrain, x, y, along_x, a, line) {
+                        let h = if over { 2.92 } else { ground(k, terrain, x, y) };
+                        put_at(k, sp, kinds[kind], x, y, h, yaw, bh(i, j, salt + 700), id, tile);
+                    }
+                }
+                s += if a { 16.0 + 30.0 * bu(i, j, salt + 800) } else { 25.0 + 50.0 * bu(i, j, salt + 800) };
+                n += 1;
+            }
+        }
+    }
+}
+
+fn ground(k: usize, terrain: &Terrain, x: f64, y: f64) -> f64 {
+    let (la, lo) = to_lat_lon(k, x, y);
+    terrain.height(la, lo).max(0.0) as f64
+}
+
+/// Parked cars: in the stalls of block (i, j)'s parking lots (the bays globe.rchit cityGround
+/// draws) and in the houses' driveways. Never under a building.
+#[allow(clippy::too_many_arguments)]
+fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId, tile: &mut TreeTile, placed: &[Placed]) {
+    let (kinds, _) = car_kinds(&sp.buildings);
+    if kinds.len() < 6 {
+        return;
+    }
+    let (x0, y0, w, h) = interior(i, j);
+    let z = block_zone(k, i, j);
+    let free = |x: f64, y: f64| !placed.iter().any(|p| (x - p.x).abs() < p.hx + 1.2 && (y - p.y).abs() < p.hy + 1.2);
+    let mut n = 0u32;
+    if z == 1 || (z == 2 && bu(i, j, 3) < 0.5) {
+        // stalls of 2.6 m either side of 7 m aisles, rows every 18 m (from 2 m in)
+        let mut row = 0;
+        loop {
+            let base = 2.0 + 18.0 * row as f64;
+            if base + 15.25 + 2.5 > h - 2.2 && base + 2.75 + 2.5 > h - 2.2 {
+                break;
+            }
+            for (dy, flip) in [(2.75, 0.0), (15.25, std::f64::consts::PI)] {
+                let by = base + dy;
+                if by < 4.6 || by > h - 4.6 {
+                    continue;
+                }
+                let stalls = ((w - 4.4) / 2.6).floor() as i64;
+                for st in 0..stalls {
+                    n += 1;
+                    if bu(i, j, 20_000 + n) > 0.62 {
+                        continue;
+                    }
+                    let bx = 2.2 + (st as f64 + 0.5) * 2.6 + (w - 4.4 - stalls as f64 * 2.6) * 0.5;
+                    let (x, y) = (x0 + bx, y0 + by);
+                    if !free(x, y) || !buildable(k, terrain, x, y) {
+                        continue;
+                    }
+                    let kind = (bh(i, j, 21_000 + n) % 5) as usize;
+                    let yaw = std::f64::consts::FRAC_PI_2 + flip + (bu(i, j, 22_000 + n) - 0.5) * 0.08;
+                    put_at(k, sp, kinds[kind], x, y, ground(k, terrain, x, y), yaw, bh(i, j, 23_000 + n), id, tile);
+                }
+            }
+            row += 1;
+        }
+    } else if z == 0 {
+        let nl = (w / HOUSE_LOT).floor().max(1.0) as usize;
+        let lw = w / nl as f64;
+        for r in 0..2 {
+            for l in 0..nl {
+                let lot = (r * nl + l) as u32;
+                let right = bu(i, j, 30 + lot) < 0.5;
+                let u = if right { lw - 3.0 } else { 3.0 };
+                for (c, v) in [(0u32, 3.4), (1, 9.0)] {
+                    if bu(i, j, 24_000 + lot * 2 + c) > if c == 0 { 0.65 } else { 0.3 } {
+                        continue;
+                    }
+                    let (x, y) = (x0 + l as f64 * lw + u, if r == 0 { y0 + v } else { y0 + h - v });
+                    if !free(x, y) || !buildable(k, terrain, x, y) {
+                        continue;
+                    }
+                    // nose in towards the house
+                    let yaw = if r == 0 { std::f64::consts::FRAC_PI_2 } else { -std::f64::consts::FRAC_PI_2 };
+                    let kind = (bh(i, j, 25_000 + lot * 2 + c) % 5) as usize;
+                    put_at(k, sp, kinds[kind], x, y, ground(k, terrain, x, y), yaw, bh(i, j, 26_000 + lot * 2 + c), id, tile);
+                }
+            }
+        }
+    }
+}
+
+/// Place archetype `r` at plane point (x, y), height h, facing `yaw`, if its foot is in tile
+/// `id`.
+#[allow(clippy::too_many_arguments)]
+fn put_at(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, h: f64, yaw: f64, seed: u32, id: TileId, tile: &mut TreeTile) {
+    let Some(d) = in_tile(k, x, y, id) else { return };
+    if tile.recs.len() >= MAX_PER_TILE {
+        return;
+    }
+    let rows = frame_rows(d, tile.center, h, yaw, 1.0);
+    push_rec(tile, rows, super::forest::rec_data(r.variant, (1 + seed % 8190) << 8), &sp.infos[r.variant]);
 }
 
 const BOAT_CELL: f64 = 170.0;
@@ -590,7 +776,7 @@ fn put_boat(k: usize, sp: &Species, r: &ArchRef, x: f64, y: f64, yaw: f64, seed:
         return;
     }
     let rows = frame_rows(d, tile.center, 0.0, yaw, 1.0);
-    push_rec(tile, rows, r.variant as u32 | (1 + seed % 8190) << 8, &sp.infos[r.variant]);
+    push_rec(tile, rows, super::forest::rec_data(r.variant, (1 + seed % 8190) << 8), &sp.infos[r.variant]);
 }
 
 /// A boat on open water in cell (a, b), clear of the shore: runabouts and cruisers near
@@ -713,7 +899,7 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
         }
         let vid = sp.palms[(bh(i, j, 2000 + n) as usize) % sp.palms.len()];
         let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, 3000 + n) * std::f64::consts::TAU, 0.85 + 0.35 * bu(i, j, 4000 + n));
-        push_rec(tile, rows, vid as u32 | (1 + bh(i, j, 5000 + n) % 8190) << 8, &sp.infos[vid]);
+        push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, 5000 + n) % 8190) << 8), &sp.infos[vid]);
     }
 }
 
@@ -792,7 +978,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         let vid = list[(bh(i, j, salt) as usize) % list.len()];
         let sc = if broad { 0.6 + 0.35 * bu(i, j, salt + 50_000) } else { 0.85 + 0.35 * bu(i, j, salt + 50_000) };
         let rows = frame_rows(d, tile.center, terrain.height(lat, lon).max(0.0) as f64 - 0.1, bu(i, j, salt + 60_000) * std::f64::consts::TAU, sc);
-        push_rec(tile, rows, vid as u32 | (1 + bh(i, j, salt + 70_000) % 8190) << 8, &sp.infos[vid]);
+        push_rec(tile, rows, super::forest::rec_data(vid, (1 + bh(i, j, salt + 70_000) % 8190) << 8), &sp.infos[vid]);
     }
 }
 
