@@ -747,9 +747,14 @@ pub fn canal_at(lat: f64, lon: f64) -> bool {
 pub fn ground_cap(lat: f64, lon: f64) -> Option<f32> {
     let (k, x, y) = city_at_world(lat, lon)?;
     // the rivers' and canals' beds, below the sea (their banks a few metres out)
+    // (sloped, not a step: the bed rises over its last 6 m to just under the water at the bank,
+    // the land comes down to it over 4 m; a step the terrain's mesh cut into a sawtooth)
     let cd = channel_dist(x, y);
     if cd < 0.0 {
-        return Some(-2.5);
+        return Some((-2.5 + 2.3 * (1.0 + cd / 6.0).clamp(0.0, 1.0)) as f32);
+    }
+    if cd < 4.0 {
+        return Some((-0.2 + 2.7 * cd / 4.0) as f32);
     }
     let r = (x * x + y * y).sqrt() / CITIES[k].radius;
     // fade back to the data over the last fifth of the radius
@@ -2238,7 +2243,9 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         for b in 0..cm {
             for a in 0..cn {
                 let cell = b * 16 + a;
-                if bu(i, j, 9000 + cell) > if z == 0 { 0.8 } else if z == 2 { 0.5 } else { 0.6 } {
+                // (a block with little or nothing built, a park, is planted thickest)
+                let open = placed.iter().map(|p| p.hx * p.hy * 4.0).sum::<f64>() < 0.12 * w * h;
+                if bu(i, j, 9000 + cell) > if open { 0.75 } else if z == 0 { 0.8 } else if z == 2 { 0.5 } else { 0.6 } {
                     continue;
                 }
                 let (gn, gm) = ((cw / 6.5).floor().max(1.0) as u32, (ch / 6.5).floor().max(1.0) as u32);

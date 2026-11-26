@@ -621,9 +621,9 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // along every shore of the city's lots: a paved promenade at the seawall and a lawn
     // strip, 10 m in all, before any lot (globe/city.rs keeps buildings and cars back)
     {
-        vec3 prom = vec3(0.20, 0.19, 0.175) * mix(0.85, 1.08, n1);
+        vec3 prom = vec3(0.15, 0.145, 0.135) * mix(0.85, 1.08, n1);
         float band = 1.0 - smoothstep(9.5, 10.0 + fw, sd);
-        lot = mix(lot, mix(prom, lawnC, smoothstep(1.2, 1.2 + fw, sd)), band * step(0.0, sd));
+        lot = mix(lot, mix(prom, lawnC, smoothstep(0.8, 0.8 + fw, sd)), band * step(0.0, sd));
     }
     // the canopy of the city's trees as the ground sees it from afar (where a crown is a pixel
     // or less): dark green clumps of ~20-60 m over the lots, as thick as the plan grows them
@@ -775,21 +775,29 @@ void main() {
     float sdSmooth = sd, sdSlope = 1.0;
     if (cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT)) {
         // (two rings, 30 m and 60 m: the drive's lines are level sets of this, smooth curves)
-        float acc = sd;
+        // (in opposite pairs, a pair left out where either of it falls off the tile: clamped
+        // to the edge they pulled the average one way, a step in the shore at every tile edge;
+        // the tiles either side of an edge leave out the same pairs there)
+        float acc = sd, wsum = 1.0, gw = 0.0;
         vec2 gs = vec2(0.0);
         for (int ring = 1; ring <= 2; ++ring) {
             float ru = 30.0 * float(ring) / max(cellM * float(FIELD), 1.0);
-            for (int k = 0; k < 12; ++k) {
+            for (int k = 0; k < 6; ++k) {
                 float a = float(k) * 0.5235988 + float(ring) * 0.26;
-                float sk = shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
-                acc += sk;
-                gs += sk * vec2(cos(a), sin(a));
+                vec2 o = vec2(cos(a), sin(a)) * ru;
+                vec2 q0 = tuv + o, q1 = tuv - o;
+                if (any(lessThan(min(q0, q1), vec2(0.0))) || any(greaterThan(max(q0, q1), vec2(1.0)))) continue;
+                float s0 = shoreDist(V, q0), s1 = shoreDist(V, q1);
+                acc += s0 + s1;
+                wsum += 2.0;
+                gs += (s0 - s1) * vec2(cos(a), sin(a));
+                gw += 3.0 * 30.0 * float(ring) * 2.0 / 6.0;
             }
         }
-        sdSmooth = acc / 25.0;
-        // (a linear field of slope G gives |gs| = 6 (30 + 60) G: the slope in m per m, 1 where
-        // the shore is a clean edge, less where it folds or the field runs out of reach)
-        sdSlope = length(gs) / 540.0;
+        sdSmooth = acc / wsum;
+        // (a linear field of slope G gives |gs| = (r N / 2) G per ring: the slope in m per m, 1
+        // where the shore is a clean edge, less where it folds or the field runs out of reach)
+        sdSlope = gw > 0.0 ? length(gs) / gw : 0.0;
     }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     bool inCity = cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT);
@@ -797,13 +805,17 @@ void main() {
         // a city's shore is built, a smooth line: the field averaged over rings of 10 and 20 m
         // (the 10 m land cover pixels showed through an 8 m ring as a scalloped sawtooth), no
         // noise
+        // (rings of 12 and 24 m, in opposite pairs left out together off the tile, as above)
         float acc = sd * 2.0, wsum = 2.0;
         for (int ring = 1; ring <= 2; ++ring) {
-            float ru = 10.0 * float(ring) / max(cellM * float(FIELD), 1.0);
-            for (int k = 0; k < 10; ++k) {
+            float ru = 12.0 * float(ring) / max(cellM * float(FIELD), 1.0);
+            for (int k = 0; k < 5; ++k) {
                 float a = float(k) * 0.6283185 + float(ring) * 0.31;
-                acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
-                wsum += 1.0;
+                vec2 o = vec2(cos(a), sin(a)) * ru;
+                vec2 q0 = tuv + o, q1 = tuv - o;
+                if (any(lessThan(min(q0, q1), vec2(0.0))) || any(greaterThan(max(q0, q1), vec2(1.0)))) continue;
+                acc += shoreDist(V, q0) + shoreDist(V, q1);
+                wsum += 2.0;
             }
         }
         sd = acc / wsum;
@@ -941,6 +953,17 @@ void main() {
         // wet: right at the mapped water, and just above the water level along the contour
         float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd) * (1.0 - wall);
         alb *= mix(1.0, 0.55, damp);
+        // a city's banks cut down to its canals' beds (city.rs ground_cap): the sloping face is a
+        // seawall's, weathered concrete going dark and wet towards the water, not bare pale ground
+        if (cityNear(p)) {
+            // (steep, or low: the face between the ground, ~1.5 m up, and the bed below the water;
+            // the vertex normals are smoothed over it, so its height tells it best)
+            float steep = max(1.0 - smoothstep(0.72, 0.93, dot(n, up)), 1.0 - smoothstep(0.4, 1.1, elev));
+            float bank = steep * (1.0 - smoothstep(6.0, 14.0, sd));
+            vec3 face = vec3(0.13, 0.125, 0.115) * mix(0.8, 1.1, nW0) * mix(0.45, 1.0, smoothstep(-1.5, 2.5, elev));
+            alb = mix(alb, face, bank);
+            ao = mix(ao, 0.7, bank);
+        }
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
     }
