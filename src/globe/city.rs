@@ -577,11 +577,122 @@ pub fn shader_city(cam: DVec3) -> Option<ShaderCity> {
     Some(ShaderCity { centre: f.centre, east: f.east, north: f.north, params: [BX as f32, BY as f32, c.radius as f32, c.cores.len().min(MAX_CORES) as f32], cores })
 }
 
+// ---- rivers and canals carved through the city's land (as Miami's own river and canals
+// wind through it): sinuous channels in the city's plane. The land cover reads them as water
+// (landcover.rs class_at asks canal_at), and the ground under them is cut below the sea
+// (ground_cap), so the terrain's shoreline field, seawalls, the plan's buildings, bridges,
+// docks and boats all follow from that one place.
+
+struct Channel {
+    /// from, to (city plane, m), half width (m), meander amplitude (m) and wavelength (m)
+    a: (f64, f64),
+    b: (f64, f64),
+    half: f64,
+    amp: f64,
+    wave: f64,
+}
+
+const CHANNELS: &[Channel] = &[
+    // two winding rivers from the bay west through the mainland
+    Channel { a: (-1650.0, 2350.0), b: (-7200.0, 3900.0), half: 55.0, amp: 170.0, wave: 1500.0 },
+    Channel { a: (-1900.0, -3300.0), b: (-7400.0, -2300.0), half: 45.0, amp: 150.0, wave: 1300.0 },
+    // canals branching off them, between the built-up islands they make
+    Channel { a: (-4300.0, 2950.0), b: (-4500.0, 7600.0), half: 24.0, amp: 70.0, wave: 900.0 },
+    Channel { a: (-5700.0, 3400.0), b: (-5600.0, 7400.0), half: 22.0, amp: 60.0, wave: 1000.0 },
+    Channel { a: (-2600.0, 2550.0), b: (-2400.0, 6800.0), half: 22.0, amp: 80.0, wave: 1100.0 },
+    Channel { a: (-4600.0, -2950.0), b: (-4900.0, -6800.0), half: 22.0, amp: 70.0, wave: 950.0 },
+    Channel { a: (-3900.0, 120.0), b: (-7000.0, 600.0), half: 30.0, amp: 120.0, wave: 1200.0 },
+    // Miami Beach's west side: residential canals behind the barrier island
+    Channel { a: (3350.0, 900.0), b: (3550.0, 6200.0), half: 25.0, amp: 60.0, wave: 1400.0 },
+    // and through the land at the west end of the beach, from the bay to the bay
+    Channel { a: (2350.0, 300.0), b: (3300.0, 1900.0), half: 32.0, amp: 110.0, wave: 1000.0 },
+    Channel { a: (2300.0, 1300.0), b: (3900.0, 600.0), half: 26.0, amp: 80.0, wave: 900.0 },
+];
+
+struct ChannelIndex {
+    /// segments (ax, ay, bx, by, half), and per 100 m cell of the plane the segments near it
+    segs: Vec<(f64, f64, f64, f64, f64)>,
+    cells: std::collections::HashMap<(i64, i64), Vec<u32>>,
+}
+
+const CH_CELL: f64 = 100.0;
+
+fn channels() -> &'static ChannelIndex {
+    static I: std::sync::OnceLock<ChannelIndex> = std::sync::OnceLock::new();
+    I.get_or_init(|| {
+        let mut segs = Vec::new();
+        for c in CHANNELS {
+            let (dx, dy) = (c.b.0 - c.a.0, c.b.1 - c.a.1);
+            let len = (dx * dx + dy * dy).sqrt();
+            let (tx, ty) = (dx / len, dy / len);
+            let (nx, ny) = (-ty, tx);
+            let n = (len / 12.0).ceil() as usize;
+            let at = |t: f64| {
+                let s = t * len;
+                // a meander of two waves, easing in from the mouth
+                let ease = (s / 300.0).min(1.0);
+                let off = ease * (c.amp * (std::f64::consts::TAU * s / c.wave).sin() + 0.35 * c.amp * (std::f64::consts::TAU * s / (c.wave * 0.43) + 1.3).sin());
+                (c.a.0 + tx * s + nx * off, c.a.1 + ty * s + ny * off)
+            };
+            let mut p = at(0.0);
+            for k in 1..=n {
+                let q = at(k as f64 / n as f64);
+                segs.push((p.0, p.1, q.0, q.1, c.half));
+                p = q;
+            }
+        }
+        let mut cells: std::collections::HashMap<(i64, i64), Vec<u32>> = std::collections::HashMap::new();
+        for (i, s) in segs.iter().enumerate() {
+            let r = s.4 + 10.0;
+            let (x0, x1) = (s.0.min(s.2) - r, s.0.max(s.2) + r);
+            let (y0, y1) = (s.1.min(s.3) - r, s.1.max(s.3) + r);
+            for cy in (y0 / CH_CELL).floor() as i64..=(y1 / CH_CELL).floor() as i64 {
+                for cx in (x0 / CH_CELL).floor() as i64..=(x1 / CH_CELL).floor() as i64 {
+                    cells.entry((cx, cy)).or_default().push(i as u32);
+                }
+            }
+        }
+        ChannelIndex { segs, cells }
+    })
+}
+
+/// Signed distance (m) from the city-plane point to the nearest channel's bank (< 0: in it).
+fn channel_dist(x: f64, y: f64) -> f64 {
+    let ix = channels();
+    let Some(list) = ix.cells.get(&((x / CH_CELL).floor() as i64, (y / CH_CELL).floor() as i64)) else { return f64::MAX };
+    let mut best = f64::MAX;
+    for &i in list {
+        let (ax, ay, bx, by, half) = ix.segs[i as usize];
+        let (dx, dy) = (bx - ax, by - ay);
+        let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        let d = ((x - ax - dx * t).powi(2) + (y - ay - dy * t).powi(2)).sqrt() - half;
+        best = best.min(d);
+    }
+    best
+}
+
+/// Is lat / lon in one of the cities' rivers or canals? (landcover.rs: the land cover's water)
+pub fn canal_at(lat: f64, lon: f64) -> bool {
+    // (a cheap box first: this is asked for every land cover sample on Earth)
+    if !(25.60..25.96).contains(&lat) || !(-80.36..-79.98).contains(&lon) {
+        return false;
+    }
+    match city_at_world(lat, lon) {
+        Some((_, x, y)) => channel_dist(x, y) < 0.0,
+        None => false,
+    }
+}
+
 /// Terrain heights in a city: the 30 m elevation is a surface model (it has the real city's
 /// buildings and trees in it, blurred); there the ground is the plain the city stands on, a few
 /// metres above the sea. Water and the sea floor stay as they are.
 pub fn ground_cap(lat: f64, lon: f64) -> Option<f32> {
     let (k, x, y) = city_at_world(lat, lon)?;
+    // the rivers' and canals' beds, below the sea (their banks a few metres out)
+    let cd = channel_dist(x, y);
+    if cd < 0.0 {
+        return Some(-2.5);
+    }
     let r = (x * x + y * y).sqrt() / CITIES[k].radius;
     // fade back to the data over the last fifth of the radius
     let t = ((r - 0.8) / 0.2).clamp(0.0, 1.0);

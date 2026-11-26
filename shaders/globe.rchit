@@ -792,7 +792,7 @@ void main() {
     bool seawall = water && cityNear(p) && (B.y < 0.6 || B.x > 0.08) && cityEdge(uvm) <= 1;
     if (seawall) depth = max(depth, 3.5);
     // (and everywhere in a city but its beaches: no bright shallow halo round every island)
-    if (water && cityNear(p) && cityEdge(uvm) != 3) depth = max(depth, 3.0);
+    if (water && cityNear(p) && cityEdge(uvm) != 3) depth = max(depth, 6.0);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
     float band = max(2.5 * (0.4 + 1.2 * nW0), footprint * 1.5);

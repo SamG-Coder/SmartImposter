@@ -237,6 +237,10 @@ impl LandCover {
         if !cell(key).is_some_and(|i| self.present[i]) {
             return 0;
         }
+        // a city's rivers and canals (globe/city.rs CHANNELS) are water
+        if super::city::canal_at(lat, lon) {
+            return 80;
+        }
         let level = level.min(LEVELS - 1);
         let w = N >> level;
         let y = (((key.0 as f64 + 3.0 - lat) * w as f64 / 3.0) as usize).min(w - 1);
