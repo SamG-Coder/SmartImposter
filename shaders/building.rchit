@@ -118,7 +118,11 @@ void main() {
     } else if (mt == 4u) {
         // flat roofs: membrane and gravel, stained
         float nr = vnoise(po.xz * 0.6) * 0.6 + vnoise(po.xz * 2.7) * 0.4;
-        albedo = mix(vec3(0.36, 0.36, 0.35), vec3(0.62, 0.62, 0.60), smoothstep(0.3, 0.7, vnoise(po.xz * 0.05 + 3.0))) * mix(0.85, 1.1, nr);
+        albedo = vec3(0.38, 0.38, 0.37) * mix(0.85, 1.1, nr) * mix(0.9, 1.06, vnoise(po.xz * 0.05 + 3.0));
+        // each building's own membrane: grey, beige, tan, dark, pale (impostor.rchit the same)
+        uint rs = instSeed(gl_InstanceCustomIndexEXT);
+        const vec3 RT[6] = vec3[6](vec3(1.0), vec3(1.1, 1.02, 0.86), vec3(0.98, 0.88, 0.72), vec3(0.55, 0.56, 0.58), vec3(1.22, 1.2, 1.16), vec3(0.8, 0.8, 0.8));
+        if (rs != 0u) albedo *= RT[pcg(rs * 1597334677u) % 6u];
     } else if (mt == 5u) {
         // clay roof tiles: courses down the slope, every tile its own shade
         vec3 tc = pal == 0u ? vec3(0.46, 0.20, 0.12) : pal == 1u ? vec3(0.54, 0.31, 0.18) : pal == 2u ? vec3(0.40, 0.24, 0.17) : pal == 3u ? vec3(0.27, 0.28, 0.29) : vec3(0.66, 0.65, 0.62);

@@ -1573,7 +1573,8 @@ impl Renderer {
                         sp.palms.extend(s.variants.clone().filter(tall));
                     }
                     if n.contains("english_oak") || n.contains("norway_maple") || n.contains("european_beech") {
-                        sp.city_trees.extend(s.variants.clone().filter(tall));
+                        // (mature crowns only: the young ones read as shrubs from the air)
+                        sp.city_trees.extend(s.variants.clone().filter(|v| r.catalog.variants[*v].height > 12.0));
                     }
                 }
                 println!("Cities: {} building archetypes, {} palm and {} broadleaf variants", sp.buildings.len(), sp.palms.len(), sp.city_trees.len());

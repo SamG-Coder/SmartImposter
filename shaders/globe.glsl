@@ -21,7 +21,7 @@ struct GlobeGlobals {
     vec4 cityE;
     vec4 cityN;
     vec4 cityP;
-    vec4 cityCores[8];
+    vec4 cityCores[10];
 };
 
 

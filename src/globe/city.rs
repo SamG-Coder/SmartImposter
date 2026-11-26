@@ -46,7 +46,7 @@ struct City {
 }
 
 /// Most cores a city has (the shader's globals hold this many).
-pub const MAX_CORES: usize = 8;
+pub const MAX_CORES: usize = 10;
 
 /// Miami: downtown and Brickell on the west shore of Biscayne Bay, Edgewater north of them, the
 /// high-rises along Miami Beach across the bay.
@@ -63,8 +63,10 @@ const CITIES: &[City] = &[City {
         Core { lat: 25.7520, lon: -80.2050, strength: 0.4, radius: 1200.0 },  // Coconut Grove side
         // the broad urban fields round them: Miami Beach mid-rise all along, the city round
         // downtown (walk-ups and apartment blocks rather than houses)
-        Core { lat: 25.8000, lon: -80.1300, strength: 0.4, radius: 1800.0 },  // Miami Beach
+        Core { lat: 25.8000, lon: -80.1280, strength: 0.4, radius: 1300.0 },  // Miami Beach
         Core { lat: 25.7760, lon: -80.2000, strength: 0.32, radius: 2400.0 }, // downtown's fringe
+        // the beach's west end, round the canals: packed mid-rise
+        Core { lat: 25.7860, lon: -80.1500, strength: 0.42, radius: 750.0 },
     ],
 }];
 
@@ -146,7 +148,7 @@ fn zone(dens: f64) -> u32 {
         3
     } else if dens > 0.2 {
         2
-    } else if dens > 0.05 {
+    } else if dens > 0.08 {
         1
     } else {
         0
@@ -897,7 +899,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 (2, 2)
             }
         }
-        _ => (3, 3),
+        _ => (4, 3),
     };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     for ly in 0..ny {
@@ -1891,6 +1893,21 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 if bu(i, j, salt + 7) < 0.7 {
                     spots.push((x0 + a as f64 * 18.0 + 14.5, y0 + b as f64 * 15.0 + 12.0, true, salt + 20_000));
                 }
+            }
+        }
+    }
+    // clumps of broad crowns between the buildings: two to four per block that is not a car
+    // park, six to nine trees each, a canopy that hides the ground (the houses' yards have
+    // theirs above)
+    if z >= 1 && !parking_block(z, i, j) {
+        let clumps = 2 + (bu(i, j, 5100) * 3.0) as u32;
+        for cl in 0..clumps {
+            let (cx, cy) = (x0 + 8.0 + (w - 16.0) * bu(i, j, 5200 + cl), y0 + 8.0 + (h - 16.0) * bu(i, j, 5300 + cl));
+            let n = 6 + (bu(i, j, 5400 + cl) * 4.0) as u32;
+            for t in 0..n {
+                let a = bu(i, j, 5500 + cl * 16 + t) * std::f64::consts::TAU;
+                let r = 2.0 + 8.0 * bu(i, j, 5600 + cl * 16 + t).sqrt();
+                spots.push((cx + r * a.cos(), cy + r * a.sin(), true, 5700 + cl * 16 + t));
             }
         }
     }

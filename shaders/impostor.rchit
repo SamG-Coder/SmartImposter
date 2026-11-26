@@ -43,6 +43,13 @@ void main() {
             tint = bs == 0u ? vec3(1.0) : C[pcg(bs * 2891336453u) % 12u];
         }
         pl.albedo = alb * mix(vec3(1.0), tint, 1.0 - glassB);
+        // roofs: the building's own membrane colour (building.rchit, the same seed)
+        {
+            const vec3 RT[6] = vec3[6](vec3(1.0), vec3(1.1, 1.02, 0.86), vec3(0.98, 0.88, 0.72), vec3(0.55, 0.56, 0.58), vec3(1.22, 1.2, 1.16), vec3(0.8, 0.8, 0.8));
+            float roofF = smoothstep(0.75, 0.9, dot(normalize(octDecode(unpackSnorm2x16(hit.normal))), vec3(0.0, 1.0, 0.0)));
+            vec3 rt = bs == 0u ? vec3(1.0) : RT[pcg(bs * 1597334677u) % 6u];
+            pl.albedo = mix(pl.albedo, alb * rt, roofF * (1.0 - glassB));
+        }
         pl.t = gl_HitTEXT;
         pl.n = n;
         pl.ng = n;
