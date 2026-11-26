@@ -146,7 +146,7 @@ fn bu(i: i64, j: i64, salt: u32) -> f64 {
 fn zone(dens: f64) -> u32 {
     if dens > 0.55 {
         3
-    } else if dens > 0.2 {
+    } else if dens > 0.16 {
         2
     } else if dens > 0.08 {
         1
@@ -2014,17 +2014,17 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
             }
         }
     }
-    // clumps of broad crowns between the buildings: two to four per block that is not a car
-    // park, six to nine trees each, a canopy that hides the ground (the houses' yards have
-    // theirs above)
+    // clumps of broad crowns between the buildings: three to six per block that is not a car
+    // park, eight to fourteen trees each, a canopy that hides the ground (the houses' yards
+    // have theirs above)
     if z >= 1 && !parking_block(z, i, j) {
-        let clumps = 2 + (bu(i, j, 5100) * 3.0) as u32;
+        let clumps = 3 + (bu(i, j, 5100) * 4.0) as u32;
         for cl in 0..clumps {
             let (cx, cy) = (x0 + 8.0 + (w - 16.0) * bu(i, j, 5200 + cl), y0 + 8.0 + (h - 16.0) * bu(i, j, 5300 + cl));
-            let n = 6 + (bu(i, j, 5400 + cl) * 4.0) as u32;
+            let n = 8 + (bu(i, j, 5400 + cl) * 7.0) as u32;
             for t in 0..n {
                 let a = bu(i, j, 5500 + cl * 16 + t) * std::f64::consts::TAU;
-                let r = 2.0 + 8.0 * bu(i, j, 5600 + cl * 16 + t).sqrt();
+                let r = 2.0 + 11.0 * bu(i, j, 5600 + cl * 16 + t).sqrt();
                 spots.push((cx + r * a.cos(), cy + r * a.sin(), true, 5700 + cl * 16 + t));
             }
         }
@@ -2059,6 +2059,11 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         }
         let list = if broad && !sp.city_trees.is_empty() { &sp.city_trees } else { &sp.palms };
         let Some(d) = in_tile(k, x, y, id) else { continue };
+        // (the lots' trees keep off the waterfront drive, as the buildings do; the waterfront's
+        // own palms line its edge)
+        if z >= 2 && !(8200..20_000).contains(&salt) && near_water(k, terrain, x, y, WATERFRONT) {
+            continue;
+        }
         let (lat, lon) = lat_lon(d);
         if !buildable(k, terrain, x, y) || built_share(terrain, lat, lon, 30.0) < 0.2 {
             continue;
