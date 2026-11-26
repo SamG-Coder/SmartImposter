@@ -88,6 +88,30 @@ fn sidewalk(arterial: bool) -> f64 {
         3.0
     }
 }
+/// The street lines: every BX / BY m, each moved by up to +-12 / +-10 m (blocks of
+/// different sizes, not one even grid; globe.rchit cLineX / cLineY).
+pub fn line_x(i: i64) -> f64 {
+    i as f64 * BX + (bu(i, 0, 40) - 0.5) * 24.0
+}
+pub fn line_y(j: i64) -> f64 {
+    j as f64 * BY + (bu(0, j, 41) - 0.5) * 20.0
+}
+/// The block (i, j) a plane point is in.
+fn cell(x: f64, y: f64) -> (i64, i64) {
+    let mut i = (x / BX).floor() as i64;
+    if x < line_x(i) {
+        i -= 1;
+    } else if x >= line_x(i + 1) {
+        i += 1;
+    }
+    let mut j = (y / BY).floor() as i64;
+    if y < line_y(j) {
+        j -= 1;
+    } else if y >= line_y(j + 1) {
+        j += 1;
+    }
+    (i, j)
+}
 fn art_x(i: i64) -> bool {
     i.rem_euclid(ART_X) == 0
 }
@@ -114,11 +138,11 @@ fn bu(i: i64, j: i64, salt: u32) -> f64 {
 
 /// Block zones: 0 houses, 1 shops and walk-ups, 2 office and apartment blocks, 3 towers.
 fn zone(dens: f64) -> u32 {
-    if dens > 0.5 {
+    if dens > 0.45 {
         3
-    } else if dens > 0.28 {
+    } else if dens > 0.2 {
         2
-    } else if dens > 0.1 {
+    } else if dens > 0.05 {
         1
     } else {
         0
@@ -127,10 +151,10 @@ fn zone(dens: f64) -> u32 {
 
 /// The inside of block (i, j) (between the sidewalks): x0, y0, width, height.
 fn interior(i: i64, j: i64) -> (f64, f64, f64, f64) {
-    let x0 = i as f64 * BX + half_width(art_x(i));
-    let x1 = (i + 1) as f64 * BX - half_width(art_x(i + 1));
-    let y0 = j as f64 * BY + half_width(art_y(j));
-    let y1 = (j + 1) as f64 * BY - half_width(art_y(j + 1));
+    let x0 = line_x(i) + half_width(art_x(i));
+    let x1 = line_x(i + 1) - half_width(art_x(i + 1));
+    let y0 = line_y(j) + half_width(art_y(j));
+    let y1 = line_y(j + 1) - half_width(art_y(j + 1));
     (x0, y0, x1 - x0, y1 - y0)
 }
 
@@ -214,7 +238,13 @@ fn density(k: usize, x: f64, y: f64) -> f64 {
 
 fn block_zone(k: usize, i: i64, j: i64) -> u32 {
     let (x0, y0, w, h) = interior(i, j);
-    zone(density(k, x0 + w * 0.5, y0 + h * 0.5) + (bu(i, j, 1) - 0.5) * 0.12)
+    let z = zone(density(k, x0 + w * 0.5, y0 + h * 0.5) + (bu(i, j, 1) - 0.5) * 0.12);
+    // shops and walk-ups along the arterials, between the house blocks
+    if z == 0 && (art_x(i) || art_x(i + 1) || art_y(j) || art_y(j + 1)) && bu(i, j, 6) < 0.6 {
+        1
+    } else {
+        z
+    }
 }
 
 /// What the terrain shader needs to draw the plan (globe.rchit cityGround).
@@ -358,7 +388,13 @@ fn block(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, need: f
             }
         }
         2 => (2, 2),
-        _ => (3, 2),
+        _ => {
+            if bu(i, j, 4) < 0.4 {
+                (2, 2)
+            } else {
+                (3, 2)
+            }
+        }
     };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     for ly in 0..ny {
@@ -476,11 +512,12 @@ impl Blocks {
         if archs.is_empty() {
             return false;
         }
-        let (i, j) = ((x / BX).floor() as i64, (y / BY).floor() as i64);
-        let (fx, fy) = (x - i as f64 * BX, y - j as f64 * BY);
+        let (i, j) = cell(x, y);
+        let (fx, fy) = (x - line_x(i), y - line_y(j));
+        let (bxw, byw) = (line_x(i + 1) - line_x(i), line_y(j + 1) - line_y(j));
         // the roadways (the sidewalks may have trees)
         let road = |a: bool| half_width(a) - sidewalk(a);
-        if fx < road(art_x(i)) || fx > BX - road(art_x(i + 1)) || fy < road(art_y(j)) || fy > BY - road(art_y(j + 1)) {
+        if fx < road(art_x(i)) || fx > bxw - road(art_x(i + 1)) || fy < road(art_y(j)) || fy > byw - road(art_y(j + 1)) {
             return true;
         }
         let b = self.cache.entry((k, i, j)).or_insert_with(|| block(k, archs, terrain, i, j, 0.0).iter().map(|p| [p.x, p.y, p.hx, p.hy]).collect());
@@ -533,8 +570,8 @@ pub fn grow(id: TileId, terrain: &Terrain, sp: &Species, tile: &mut TreeTile) {
         let (xl, xh, yl, yh) = (xl.max(-c.radius), xh.min(c.radius), yl.max(-c.radius), yh.min(c.radius));
         let lvl = TREE_LEVEL.saturating_sub(id.level);
         let need = min_height(lvl);
-        for j in (yl / BY).floor() as i64 - 1..=(yh / BY).floor() as i64 {
-            for i in (xl / BX).floor() as i64 - 1..=(xh / BX).floor() as i64 {
+        for j in (yl / BY).floor() as i64 - 1..=(yh / BY).floor() as i64 + 1 {
+            for i in (xl / BX).floor() as i64 - 1..=(xh / BX).floor() as i64 + 1 {
                 let placed = block(k, archs, terrain, i, j, need);
                 for p in &placed {
                     let Some(d) = in_tile(k, p.x, p.y, id) else { continue };
@@ -620,8 +657,8 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
     }
     for along_x in [false, true] {
         let (line, a) = if along_x { (j, art_y(j)) } else { (i, art_x(i)) };
-        let (start, len) = if along_x { (i as f64 * BX, BX) } else { (j as f64 * BY, BY) };
-        let fixed = if along_x { j as f64 * BY } else { i as f64 * BX };
+        let (start, len) = if along_x { (line_x(i), line_x(i + 1) - line_x(i)) } else { (line_y(j), line_y(j + 1) - line_y(j)) };
+        let fixed = if along_x { line_y(j) } else { line_x(i) };
         let at = |s: f64, off: f64| if along_x { (start + s, fixed + off) } else { (fixed + off, start + s) };
         let yaw0 = if along_x { 0.0 } else { std::f64::consts::FRAC_PI_2 };
         // decks every 20 m where the street is over water
@@ -864,24 +901,24 @@ fn street_palms(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: T
     if bh(i, 0, 50) % 3 != 0 {
         let a = art_x(i);
         let off = half_width(a) - sidewalk(a) + 1.1;
-        let (ys, ye) = (j as f64 * BY + half_width(art_y(j)) + 4.0, (j + 1) as f64 * BY - half_width(art_y(j + 1)) - 4.0);
+        let (ys, ye) = (line_y(j) + half_width(art_y(j)) + 4.0, line_y(j + 1) - half_width(art_y(j + 1)) - 4.0);
         let n = ((ye - ys) / 12.0).floor().max(1.0) as usize;
         for s in 0..=n {
             let y = ys + (ye - ys) * s as f64 / n as f64;
-            spots.push((i as f64 * BX - off, y, s as u32));
-            spots.push((i as f64 * BX + off, y, 100 + s as u32));
+            spots.push((line_x(i) - off, y, s as u32));
+            spots.push((line_x(i) + off, y, 100 + s as u32));
         }
     }
     // the east-west street at y = j BY, along this block's x span
     if bh(0, j, 51) % 3 != 0 {
         let a = art_y(j);
         let off = half_width(a) - sidewalk(a) + 1.1;
-        let (xs, xe) = (i as f64 * BX + half_width(art_x(i)) + 4.0, (i + 1) as f64 * BX - half_width(art_x(i + 1)) - 4.0);
+        let (xs, xe) = (line_x(i) + half_width(art_x(i)) + 4.0, line_x(i + 1) - half_width(art_x(i + 1)) - 4.0);
         let n = ((xe - xs) / 12.0).floor().max(1.0) as usize;
         for s in 0..=n {
             let x = xs + (xe - xs) * s as f64 / n as f64;
-            spots.push((x, j as f64 * BY - off, 200 + s as u32));
-            spots.push((x, j as f64 * BY + off, 300 + s as u32));
+            spots.push((x, line_y(j) - off, 200 + s as u32));
+            spots.push((x, line_y(j) + off, 300 + s as u32));
         }
     }
     for (x, y, n) in spots {

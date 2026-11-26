@@ -114,7 +114,7 @@ void main() {
         albedo = mix(vec3(0.36, 0.36, 0.35), vec3(0.62, 0.62, 0.60), smoothstep(0.3, 0.7, vnoise(po.xz * 0.05 + 3.0))) * mix(0.85, 1.1, nr);
     } else if (mt == 5u) {
         // clay roof tiles: courses down the slope, every tile its own shade
-        vec3 tc = pal == 0u ? vec3(0.46, 0.20, 0.12) : pal == 1u ? vec3(0.54, 0.31, 0.18) : vec3(0.40, 0.24, 0.17);
+        vec3 tc = pal == 0u ? vec3(0.46, 0.20, 0.12) : pal == 1u ? vec3(0.54, 0.31, 0.18) : pal == 2u ? vec3(0.40, 0.24, 0.17) : pal == 3u ? vec3(0.27, 0.28, 0.29) : vec3(0.66, 0.65, 0.62);
         vec2 q = vec2(po.x + po.z, po.y) * vec2(3.2, 4.0);
         float course = smoothstep(0.0, 0.25, fract(q.y));
         albedo = tc * mix(1.0, mix(0.75, 1.15, bHash(floor(q), 7u)) * mix(0.8, 1.0, course), detail) * grime;

@@ -377,6 +377,8 @@ int cMod(int i, int m) { return i - m * int(floor(float(i) / float(m))); }
 bool cArtX(int i) { return cMod(i, 6) == 0; }
 bool cArtY(int j) { return cMod(j, 5) == 0; }
 float cHalf(bool a) { return a ? 11.0 : 7.0; }
+float cLineX(int i) { return float(i) * gg.cityP.x + (cBu(i, 0, 40u) - 0.5) * 24.0; }
+float cLineY(int j) { return float(j) * gg.cityP.y + (cBu(0, j, 41u) - 0.5) * 20.0; }
 float cSide(bool a) { return a ? 4.0 : 3.0; }
 float cDensity(vec2 c) {
     float d = 0.0;
@@ -410,10 +412,14 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     if (r > gg.cityP.z) return 0.0;
     float BX = gg.cityP.x, BY = gg.cityP.y;
     int i = int(floor(c.x / BX)), j = int(floor(c.y / BY));
-    vec2 f = c - vec2(float(i) * BX, float(j) * BY);
+    if (c.x < cLineX(i)) i -= 1; else if (c.x >= cLineX(i + 1)) i += 1;
+    if (c.y < cLineY(j)) j -= 1; else if (c.y >= cLineY(j + 1)) j += 1;
+    float lx0 = cLineX(i), lx1 = cLineX(i + 1), ly0 = cLineY(j), ly1 = cLineY(j + 1);
+    vec2 f = c - vec2(lx0, ly0);
+    float bw = lx1 - lx0, bh = ly1 - ly0;
     // the nearest street lines and how far from them
-    int li = f.x < 0.5 * BX ? i : i + 1, lj = f.y < 0.5 * BY ? j : j + 1;
-    vec2 e = vec2(min(f.x, BX - f.x), min(f.y, BY - f.y));
+    int li = f.x < 0.5 * bw ? i : i + 1, lj = f.y < 0.5 * bh ? j : j + 1;
+    vec2 e = vec2(min(f.x, bw - f.x), min(f.y, bh - f.y));
     bool ax = cArtX(li), ay = cArtY(lj);
     vec2 hw = vec2(cHalf(ax), cHalf(ay));
     vec2 road = hw - vec2(cSide(ax), cSide(ay));
@@ -463,10 +469,11 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // ---- the block's lots
     float hx0 = cHalf(cArtX(i)), hx1 = cHalf(cArtX(i + 1)), hy0 = cHalf(cArtY(j)), hy1 = cHalf(cArtY(j + 1));
     vec2 b = f - vec2(hx0, hy0);
-    float W = BX - hx0 - hx1, H = BY - hy0 - hy1;
-    vec2 bc = vec2(float(i) * BX + hx0 + 0.5 * W, float(j) * BY + hy0 + 0.5 * H);
+    float W = bw - hx0 - hx1, H = bh - hy0 - hy1;
+    vec2 bc = vec2(lx0 + hx0 + 0.5 * W, ly0 + hy0 + 0.5 * H);
     float dz = cDensity(bc) + (cBu(i, j, 1u) - 0.5) * 0.12;
-    int zone = dz > 0.5 ? 3 : dz > 0.28 ? 2 : dz > 0.1 ? 1 : 0;
+    int zone = dz > 0.45 ? 3 : dz > 0.2 ? 2 : dz > 0.05 ? 1 : 0;
+    if (zone == 0 && (cArtX(i) || cArtX(i + 1) || cArtY(j) || cArtY(j + 1)) && cBu(i, j, 6u) < 0.6) zone = 1;
     vec3 pave = vec3(0.15, 0.145, 0.135) * mix(0.82, 1.1, n1);
     vec2 tj = abs(fract(c / vec2(1.2, 0.6)) - 0.5);
     vec3 plaza = vec3(0.175, 0.165, 0.15) * mix(0.82, 1.1, n1) * mix(0.9, 1.06, n3) * mix(1.0, 0.9, (1.0 - smoothstep(0.44, 0.5, max(tj.x, tj.y))) * shown);

@@ -433,6 +433,29 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
 }
 
 /// A house: stucco walls with windows, a tiled hip roof (or flat with a parapet).
+/// A hip roof over the rectangle +-hx, +-hz at height h, rising `pitch` x the shorter half
+/// width, with its soffit. Returns the ridge height.
+fn hip_roof(b: &mut B, hx: f32, hz: f32, h: f32, pitch: f32, tm: u8, soffit: u8) -> f32 {
+    let rise = pitch * hx.min(hz);
+    let along_x = hx >= hz;
+    let r = if along_x { hx - hz } else { hz - hx };
+    let (r0, r1) = if along_x { (Vec3::new(-r, h + rise, 0.0), Vec3::new(r, h + rise, 0.0)) } else { (Vec3::new(0.0, h + rise, -r), Vec3::new(0.0, h + rise, r)) };
+    let c = [Vec3::new(-hx, h, -hz), Vec3::new(hx, h, -hz), Vec3::new(hx, h, hz), Vec3::new(-hx, h, hz)];
+    if along_x {
+        b.quad([c[0], r0, r1, c[1]], tm);
+        b.quad([c[2], r1, r0, c[3]], tm);
+        b.quad([c[1], r1, r1, c[2]], tm);
+        b.quad([c[3], r0, r0, c[0]], tm);
+    } else {
+        b.quad([c[1], r0, r1, c[2]], tm);
+        b.quad([c[3], r1, r0, c[0]], tm);
+        b.quad([c[0], r0, r0, c[1]], tm);
+        b.quad([c[2], r1, r1, c[3]], tm);
+    }
+    b.cap(&ccw(c.iter().map(|p| Vec2::new(p.x, p.z)).collect()), h, false, soffit);
+    h + rise
+}
+
 fn house(b: &mut B, w: f32, d: f32, storeys: usize, hip: bool, pal: &Pal, rng: &mut Rng) -> f32 {
     let fh = 3.1;
     let poly = footprint(w, d, 0.0, 0);
@@ -466,8 +489,8 @@ fn house(b: &mut B, w: f32, d: f32, storeys: usize, hip: bool, pal: &Pal, rng: &
     }
 }
 
-/// All archetypes, deterministic. About 40 of them (the variant slots are shared with the
-/// plants: rt.glsl keeps a variant in 8 bits).
+/// All archetypes, deterministic (the variant slots are shared with the plants: 512, rt.glsl
+/// plantVariant).
 pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
     let mut meshes = Vec::new();
     let mut archs = Vec::new();
@@ -600,6 +623,125 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let h = storeys as f32 * 3.1;
         volume(&mut b, &poly, 0.0, h, 0.0, 3.1, Fac::Garage, &pal, true, &mut rng);
         push(b, format!("Building_Garage_{k}"), h + 4.0, &mut meshes, &mut archs);
+    }
+
+    // ---- more of the low and mid-rise city
+    // South Beach Art Deco walk-ups: pastel stucco, rounded street corners, "eyebrow" sun
+    // shades over every window band, a fin rising over the entrance
+    for k in 0..6 {
+        let mut b = B::new();
+        let pal = Pal { wall: [4, 6, 5, 0, 1, 4][k], glass: [5, 0, 1, 5, 2, 0][k], frame: 2 };
+        let (w, d, storeys) = [(28.0f32, 18.0f32, 3usize), (34.0, 20.0, 4), (24.0, 16.0, 3), (30.0, 22.0, 5), (36.0, 18.0, 3), (26.0, 20.0, 4)][k];
+        let poly = footprint(w, d, 5.0, 4);
+        let h = 3.3 * storeys as f32 + 0.6;
+        volume(&mut b, &poly, 0.0, h, 0.0, 3.3, Fac::Punched { col: 2.8, w: 1.7, h: 1.4 }, &pal, true, &mut rng);
+        for f in 1..=storeys {
+            let y = f as f32 * 3.3 - 0.75;
+            for e in 0..poly.len() {
+                b.strip(poly[e], poly[(e + 1) % poly.len()], y, y + 0.14, 0.0, 0.7, m(SLAB, 0));
+            }
+        }
+        // the fin over the entrance on the street side (-z)
+        b.bx(Vec3::new(-0.6, 0.0, -d * 0.5 - 0.5), Vec3::new(0.6, h + 4.0, -d * 0.5 + 1.0), m(WALL, pal.wall), false);
+        b.bx(Vec3::new(-2.5, h - 0.4, -d * 0.5 - 0.6), Vec3::new(2.5, h + 0.6, -d * 0.5 + 0.4), m(SPANDREL, [1u8, 3, 6, 5, 4, 1][k]), false);
+        push(b, format!("Building_Deco_{k}"), h + 4.0, &mut meshes, &mut archs);
+    }
+    // Mediterranean revival mid-rises: sand and cream stucco, recessed windows, tile hip roofs
+    for k in 0..5 {
+        let mut b = B::new();
+        let pal = Pal { wall: [7, 1, 3, 5, 0][k], glass: [2, 0, 1, 2, 5][k], frame: 2 };
+        let (w, d, storeys) = [(30.0f32, 22.0f32, 6usize), (40.0, 18.0, 8), (26.0, 26.0, 5), (36.0, 24.0, 10), (32.0, 20.0, 7)][k];
+        let poly = footprint(w, d, 0.0, 0);
+        let h = 3.2 * storeys as f32 + 1.0;
+        volume(&mut b, &poly, 0.0, h, 4.5, 3.2, Fac::Punched { col: 3.0, w: 1.4, h: 1.8 }, &pal, false, &mut rng);
+        b.cap(&poly, h, true, m(ROOF, 0));
+        let top = hip_roof(&mut b, w * 0.5 + 0.8, d * 0.5 + 0.8, h, 0.32, m(TILE, [0u8, 1, 0, 2, 1][k]), m(WALL, pal.wall));
+        push(b, format!("Building_Med_{k}"), top, &mut meshes, &mut archs);
+    }
+    // long condo slabs with balconies, 9-15 storeys
+    for k in 0..4 {
+        let mut b = B::new();
+        let pal = Pal { wall: 0, glass: [5, 0, 4, 1][k], frame: 2 };
+        let (w, d, storeys) = [(54.0f32, 16.0f32, 12usize), (46.0, 18.0, 9), (60.0, 16.0, 15), (40.0, 20.0, 11)][k];
+        let poly = footprint(w, d, 0.0, 0);
+        let h = 3.1 * storeys as f32 + 5.0;
+        volume(&mut b, &poly, 0.0, h, 5.0, 3.1, Fac::Balcony { depth: 1.8 }, &pal, true, &mut rng);
+        push(b, format!("Building_Condo_{k}"), h + 4.0, &mut meshes, &mut archs);
+    }
+    // L-shaped and courtyard apartment blocks, 3-6 storeys
+    for k in 0..4 {
+        let mut b = B::new();
+        let pal = Pal { wall: [1, 5, 7, 4][k], glass: [0, 2, 5, 1][k], frame: 2 };
+        let storeys = [3usize, 4, 5, 6][k];
+        let h = 3.0 * storeys as f32 + 0.8;
+        let fac = if k % 2 == 0 { Fac::Punched { col: 3.0, w: 1.5, h: 1.6 } } else { Fac::Balcony { depth: 1.6 } };
+        let a = ccw(vec![Vec2::new(-20.0, -16.0), Vec2::new(20.0, -16.0), Vec2::new(20.0, -3.0), Vec2::new(-20.0, -3.0)]);
+        let c = ccw(vec![Vec2::new(-20.0, -3.0), Vec2::new(-7.0, -3.0), Vec2::new(-7.0, 16.0), Vec2::new(-20.0, 16.0)]);
+        volume(&mut b, &a, 0.0, h, 0.0, 3.0, fac, &pal, true, &mut rng);
+        volume(&mut b, &c, 0.0, h, 0.0, 3.0, fac, &pal, true, &mut rng);
+        if k >= 2 {
+            let e = ccw(vec![Vec2::new(7.0, -3.0), Vec2::new(20.0, -3.0), Vec2::new(20.0, 16.0), Vec2::new(7.0, 16.0)]);
+            volume(&mut b, &e, 0.0, h, 0.0, 3.0, fac, &pal, true, &mut rng);
+        }
+        // the courtyard's pool
+        b.bx(Vec3::new(-4.0, 0.0, 2.0), Vec3::new(4.0, 0.15, 12.0), m(SLAB, 0), false);
+        b.bx(Vec3::new(-3.2, 0.15, 3.0), Vec3::new(3.2, 0.18, 11.0), m(POOL, 0), false);
+        push(b, format!("Building_Court_{k}"), h + 1.0, &mut meshes, &mut archs);
+    }
+    // strip malls, a big-box store, gas stations
+    for k in 0..3 {
+        let mut b = B::new();
+        let pal = Pal { wall: [1, 7, 3][k], glass: [2, 0, 1][k], frame: [1, 0, 2][k] };
+        let (w, d) = [(50.0f32, 16.0f32), (44.0, 18.0), (36.0, 14.0)][k];
+        let poly = footprint(w, d, 0.0, 0);
+        volume(&mut b, &poly, 0.0, 5.5, 5.0, 5.0, Fac::Punched { col: 6.0, w: 4.2, h: 2.6 }, &pal, true, &mut rng);
+        // the arcade along the front and a raised sign band
+        b.bx(Vec3::new(-w * 0.5, 3.4, -d * 0.5 - 2.5), Vec3::new(w * 0.5, 3.7, -d * 0.5), m(FRAME, pal.frame), false);
+        b.bx(Vec3::new(-w * 0.2, 5.5, -d * 0.5 - 0.2), Vec3::new(w * 0.2, 7.2, -d * 0.5 + 0.4), m(SPANDREL, [6u8, 4, 5][k]), false);
+        push(b, format!("Building_Strip_{k}"), 7.5, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        let pal = Pal { wall: 2, glass: 2, frame: 1 };
+        let poly = footprint(50.0, 38.0, 0.0, 0);
+        volume(&mut b, &poly, 0.0, 9.0, 0.0, 9.0, Fac::Ribbon { win: 0.12, col: 8.0 }, &pal, true, &mut rng);
+        b.bx(Vec3::new(-8.0, 0.0, -19.5), Vec3::new(8.0, 10.5, -18.5), m(SPANDREL, 1), false);
+        push(b, "Building_BigBox".into(), 11.0, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        let pal = Pal { wall: 0, glass: 0, frame: 1 };
+        // the canopy over the pumps on six pillars, the shop behind
+        b.bx(Vec3::new(-11.0, 4.6, -7.0), Vec3::new(11.0, 5.3, 7.0), m(SPANDREL, 1), true);
+        for x in [-8.0f32, 0.0, 8.0] {
+            for z in [-3.5f32, 3.5] {
+                b.bx(Vec3::new(x - 0.25, 0.0, z - 0.25), Vec3::new(x + 0.25, 4.6, z + 0.25), m(WALL, 0), false);
+                b.bx(Vec3::new(x - 0.9, 0.0, z - 0.4), Vec3::new(x + 0.9, 1.6, z + 0.4), m(PAINT, 1), false);
+            }
+        }
+        let shop = footprint(16.0, 10.0, 0.0, 0);
+        let moved: Vec<Vec2> = shop.iter().map(|p| *p + Vec2::new(0.0, 14.0)).collect();
+        volume(&mut b, &moved, 0.0, 4.5, 4.5, 4.5, Fac::Punched { col: 4.0, w: 3.0, h: 2.4 }, &pal, true, &mut rng);
+        push(b, "Building_Gas".into(), 5.5, &mut meshes, &mut archs);
+    }
+    // more houses: L-shaped with a garage wing, grey and white tile roofs, modern two-storey
+    for k in 0..6 {
+        let mut b = B::new();
+        let pal = Pal { wall: [0, 5, 1, 6, 0, 7][k], glass: [0, 2, 5, 0, 1, 2][k], frame: 2 };
+        let (w, d, storeys) = [(13.0f32, 10.0f32, 1usize), (14.0, 11.0, 2), (12.0, 10.0, 1), (15.0, 10.0, 1), (13.0, 12.0, 2), (14.0, 9.0, 1)][k];
+        let tile = [3u8, 4, 0, 3, 4, 1][k];
+        let main = footprint(w, d, 0.0, 0);
+        let h = storeys as f32 * 3.1 + 0.4;
+        volume(&mut b, &main, 0.0, h, 0.0, 3.1, Fac::Punched { col: 3.4, w: 1.5, h: 1.6 }, &pal, k == 4, &mut rng);
+        let mut top = h + 1.0;
+        if k != 4 {
+            top = hip_roof(&mut b, w * 0.5 + 0.6, d * 0.5 + 0.6, h, 0.45, m(TILE, tile), m(WALL, pal.wall));
+        }
+        // the garage wing (one storey) off one end, its door to the street (-z)
+        let gw: Vec<Vec2> = footprint(6.5, 7.0, 0.0, 0).iter().map(|p| *p + Vec2::new(w * 0.5 + 3.25, -d * 0.5 + 3.5)).collect();
+        volume(&mut b, &gw, 0.0, 3.0, 0.0, 3.0, Fac::Punched { col: 6.5, w: 0.1, h: 0.1 }, &pal, true, &mut rng);
+        b.bx(Vec3::new(w * 0.5 + 0.8, 0.1, -d * 0.5 - 0.05), Vec3::new(w * 0.5 + 5.7, 2.4, -d * 0.5 + 0.05), m(FRAME, 2), false);
+        push(b, format!("Building_House_L{k}"), top, &mut meshes, &mut archs);
     }
     // boats (origin at the waterline, bow towards +x): a centre-console runabout, a cabin
     // cruiser, a motor yacht; and a timber dock (from the shore at x = 0 out along +x)
@@ -757,7 +899,7 @@ pub fn class_of(name: &str) -> Class {
         Class::Bridge
     } else if name.contains("Tower") || name.contains("Residential") {
         Class::Tower
-    } else if name.contains("Office") || name.contains("Apartments") {
+    } else if name.contains("Office") || name.contains("Apartments") || name.contains("Med_") || name.contains("Condo") {
         Class::MidRise
     } else if name.contains("House") {
         Class::House
