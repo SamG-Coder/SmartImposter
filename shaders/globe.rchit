@@ -520,10 +520,20 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         lot = mix(lot, lawnC, edge * 0.8);
         if (zone == 2) lot = mix(lot, pave, 0.4);
     }
-    alb = mix(lot, mix(walk, asphalt, roadW), streetW);
+    vec3 planned = mix(lot, mix(walk, asphalt, roadW), streetW);
+    // where the land cover is not built up (parks, grounds, open land in the city): kept lawn
+    // under scattered shade, with paths, never the bare native soil showing through
+    float shade = smoothstep(0.55, 0.75, fbmN(c * 0.06 + 31.0, 3) * 0.7 + fbmN(c * 0.4 + 2.0, 2) * 0.3);
+    vec3 park = mix(lawnC * 1.05, lawnC * vec3(0.55, 0.62, 0.5), shade);
+    vec2 pp = abs(fract(c / vec2(37.0, 29.0)) - 0.5);
+    park = mix(park, vec3(0.24, 0.225, 0.2), (1.0 - smoothstep(0.012, 0.012 + fw / 37.0, min(pp.x, pp.y))) * shown * 0.6);
+    // wetland in the city: mangrove and dense shrub, a deep, uneven green
+    vec3 mangrove = vec3(0.028, 0.05, 0.02) * mix(0.7, 1.3, fbmN(c * 0.25 + 77.0, 3));
+    park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));
+    alb = mix(park, planned, smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)));
     // the city keeps off water and wetland; it fades in with the built-up land and out at its rim
-    float urban = smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z));
-    urban *= (1.0 - smoothstep(0.35, 0.7, waterF)) * (1.0 - smoothstep(0.1, 0.4, wetF));
+    float urban = 1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z);
+    urban *= 1.0 - smoothstep(0.35, 0.7, waterF);
     return urban;
 }
 
@@ -573,6 +583,13 @@ void main() {
     float above = hasLevel ? elev - level : 0.0; // height of the ground over the water level
     bool water = sd < 0.0;
     bool lake = water && (hasLevel ? level > 0.5 : elev > 0.5); // a water surface above sea level
+    // in a city the land cover's ponds above sea level (most are mapping noise in built-up
+    // land: dark puddles among the blocks) are land; the bay, the river and the canals stay
+    if (lake && cityNear(p)) {
+        water = false;
+        lake = false;
+        sd = 60.0;
+    }
     // Where the tile mesh is coarser than the data (far away), coastline and relief come from the
     // elevation grid per pixel instead (geometry cells ~ t / 160 m, see tiles.rs SPLIT_K).
     float footprint = t * gg.misc.x;
@@ -611,7 +628,7 @@ void main() {
     }
     // in a city the water is held by seawalls (all but sand beaches and mangroves): deep right
     // up to the wall
-    bool seawall = water && cityNear(p) && B.y < 0.3 && C.x < 0.3;
+    bool seawall = water && cityNear(p) && B.y < 0.6;
     if (seawall) depth = max(depth, 3.5);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
@@ -629,7 +646,7 @@ void main() {
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
         // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
         // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.
-        float wall = cityNear(p) ? (1.0 - smoothstep(0.2, 0.45, B.y)) * (1.0 - smoothstep(0.2, 0.45, C.x)) : 0.0;
+        float wall = cityNear(p) ? 1.0 - smoothstep(0.55, 0.8, B.y) : 0.0;
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore * (1.0 - wall), biome, seaSide, ao);
         urban *= 1.0 - shore * (1.0 - wall);
         if (urban > 0.0) {
@@ -638,9 +655,11 @@ void main() {
             ao = mix(ao, 1.0, urban);
         }
         if (wall > 0.0) {
-            vec3 cap = vec3(0.36, 0.35, 0.33) * mix(0.85, 1.08, nW0);
-            alb = mix(alb, cap, smoothstep(1.5 + footprint, 1.3, sd) * wall);
-            alb = mix(alb, vec3(0.05, 0.055, 0.05), smoothstep(0.3 + footprint, 0.05, sd) * wall);
+            // (a thin line: it fades out once it is under a pixel, never a bright outline)
+            vec3 cap = vec3(0.23, 0.225, 0.21) * mix(0.85, 1.08, nW0);
+            float thin = 1.0 - smoothstep(0.4, 1.2, footprint);
+            alb = mix(alb, cap, smoothstep(0.9 + footprint, 0.7, sd) * wall * thin);
+            alb = mix(alb, vec3(0.05, 0.055, 0.05), smoothstep(0.3 + footprint, 0.05, sd) * wall * thin);
         }
         // wet: right at the mapped water, and just above the water level along the contour
         float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd) * (1.0 - wall);
