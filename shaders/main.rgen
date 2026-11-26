@@ -302,6 +302,12 @@ void main() {
         uint mat = pl.flags & 0xFFu;
         bool leaf = mat == MAT_LEAF;
         vec3 alb = pl.albedo;
+        // a Florida city's broadleaf canopy: deep, dark green (live oak, ficus), not the
+        // temperate stand-ins' yellow-green
+        if (leaf && g.city.x > 0.5) {
+            alb *= vec3(0.72, 0.84, 0.66);
+            pl.trans *= 0.6;
+        }
         float ao = pl.ao;
         // Impostor normals arrive shortened to |mean n| (blade / leaf normal spread): Lambert on the
         // shortened normal is the texel's true mean diffuse. Everything else uses the direction.

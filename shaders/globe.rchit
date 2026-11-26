@@ -579,7 +579,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         // hedges along the lot lines
         float hedge = max(1.0 - smoothstep(0.5, 0.5 + fw, min(u, lw - u)), 1.0 - smoothstep(0.6, 0.6 + fw, 0.5 * H - dv));
         lot = mix(lot, vec3(0.035, 0.06, 0.02) * mix(0.8, 1.2, n2), hedge * step(6.0, dv));
-    } else if ((zone == 1 && cBu(i, j, 8u) < 0.3) || (zone == 2 && cBu(i, j, 3u) < 0.12)) {
+    } else if ((zone == 1 && cBu(i, j, 8u) < 0.08) || (zone == 2 && cBu(i, j, 3u) < 0.04)) {
         // asphalt parking: bays of 2.6 m stalls either side of 7 m aisles, rows every 18 m,
         // a planted strip round the edge
         float rowV = mod(b.y - 2.0, 18.0);
@@ -608,6 +608,14 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1);
         float band = 1.0 - smoothstep(9.5, 10.0 + fw, sd);
         lot = mix(lot, mix(prom, lawnC, smoothstep(4.0, 4.0 + fw, sd)), band * step(0.0, sd));
+    }
+    // the canopy of the city's trees as the ground sees it from afar (where a crown is a pixel
+    // or less): dark green clumps of ~20-60 m over the lots, as thick as the plan grows them
+    {
+        float cm = smoothstep(0.42, 0.62, fbmN(c * 0.03 + 91.0, 3) * 0.7 + fbmN(c * 0.11 + 17.0, 2) * 0.3);
+        float far = smoothstep(0.3, 1.2, fw);
+        vec3 crown = vec3(0.022, 0.040, 0.016) * mix(0.75, 1.25, fbmN(c * 0.4 + 5.0, 2));
+        lot = mix(lot, crown, cm * far * (zone == 0 ? 0.8 : 0.55));
     }
     vec3 planned = mix(lot, mix(walk, asphalt, roadW), streetW);
     {

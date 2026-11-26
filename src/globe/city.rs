@@ -741,7 +741,7 @@ fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
 /// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
 /// and shade trees.
 fn parking_block(z: u32, i: i64, j: i64) -> bool {
-    (z == 1 && bu(i, j, 8) < 0.3) || (z == 2 && bu(i, j, 3) < 0.12)
+    (z == 1 && bu(i, j, 8) < 0.08) || (z == 2 && bu(i, j, 3) < 0.04)
 }
 
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
@@ -793,7 +793,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         // (a tower in the mid-rise zone only next to a core)
         2 if density_at_block(k, i, j) > 0.38 => &[Class::MidRise, Class::MidRise, Class::Tower, Class::LowRise],
         2 => &[Class::MidRise, Class::MidRise, Class::MidRise, Class::LowRise],
-        1 => &[Class::LowRise, Class::LowRise, Class::MidRise],
+        1 => &[Class::LowRise, Class::MidRise, Class::MidRise],
         _ => &[Class::House],
     };
     if need > 0.0 && tallest(classes) < need {
