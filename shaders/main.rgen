@@ -832,6 +832,13 @@ void main() {
                 float Fh = 0.02 + 0.98 * pow(1.0 - max(dot(H, -dir), 0.0), 5.0);
                 glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
             }
+            // (a city's narrow channels: the bright hazy sky they mirror is held to a fraction
+            // of the sunlight, so a canal near the sun reads as water, not as a white sheet)
+            if (g.city.x > 0.5) {
+                float rl = dot(refl, vec3(0.2126, 0.7152, 0.0722));
+                float capL = 0.12 * g.sunDir.w;
+                if (rl > capL) refl *= capL / rl;
+            }
             col = mix(col, refl, F) + E * glint * F * sh;
             vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
             col = mix(col, foamCol, foam * 0.6);

@@ -602,6 +602,13 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         lot = mix(lot, bed, edge * 0.9);
         if (zone == 2) lot = mix(lot, pave, 0.25 * (1.0 - panel));
     }
+    // along every shore of the city's lots: a paved promenade at the seawall and a lawn
+    // strip, 10 m in all, before any lot (globe/city.rs keeps buildings and cars back)
+    {
+        vec3 prom = vec3(0.30, 0.285, 0.26) * mix(0.85, 1.08, n1);
+        float band = 1.0 - smoothstep(9.5, 10.0 + fw, sd);
+        lot = mix(lot, mix(prom, lawnC, smoothstep(4.0, 4.0 + fw, sd)), band * step(0.0, sd));
+    }
     vec3 planned = mix(lot, mix(walk, asphalt, roadW), streetW);
     {
         // the lamps of the nearest north-south and east-west streets
@@ -714,14 +721,17 @@ void main() {
     // the city's waterfront drive follows a low-passed shore: the field (before its noise)
     // averaged over a ring of 30 m round the point
     float sdSmooth = sd;
-    {
-        float ru = 30.0 / max(cellM * float(FIELD), 1.0);
+    if (cityNear(gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT)) {
+        // (two rings, 30 m and 60 m: the drive's lines are level sets of this, smooth curves)
         float acc = sd;
-        for (int k = 0; k < 12; ++k) {
-            float a = float(k) * 0.5235988;
-            acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+        for (int ring = 1; ring <= 2; ++ring) {
+            float ru = 30.0 * float(ring) / max(cellM * float(FIELD), 1.0);
+            for (int k = 0; k < 12; ++k) {
+                float a = float(k) * 0.5235988 + float(ring) * 0.26;
+                acc += shoreDist(V, clamp(tuv + vec2(cos(a), sin(a)) * ru, 0.0, 1.0));
+            }
         }
-        sdSmooth = acc / 13.0;
+        sdSmooth = acc / 25.0;
     }
     // the mapped shoreline is 10 m pixels made smooth: break it with Earth-fixed noise
     sd += ((fbmN(uvm * 0.07, 3) - 0.5) * 4.0 + (fbmN(uvm * 0.4 + 5.0, 2) - 0.5) * 1.2) * min(1.0, 8.0 / max(cellM, 1.0));

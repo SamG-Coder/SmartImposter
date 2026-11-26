@@ -730,7 +730,8 @@ fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (wx, wy) = to_world(x, y);
-    if on_way(wx, wy, 1.0) || in_clear(wx, wy) {
+    // (and 10 m back from the rivers' and canals' banks: the promenade, globe.rchit)
+    if on_way(wx, wy, 1.0) || in_clear(wx, wy) || channel_dist(wx, wy) < 10.0 {
         return false;
     }
     let (la, lo) = to_lat_lon(k, x, y);
