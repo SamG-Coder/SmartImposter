@@ -1144,7 +1144,7 @@ impl App {
             city: match s.geo.as_ref().and_then(|geo| globe::city::shader_city(geo.ecef)) {
                 Some(_) => {
                     let env = |k: &str, d: f32| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
-                    [env("SI_CITY_GI", 1.0), env("SI_CITY_HAZE", 4.0), env("SI_CITY_GRADE", 1.0), 0.0]
+                    [env("SI_CITY_GI", 1.0), env("SI_CITY_HAZE", 2.5), env("SI_CITY_GRADE", 1.0), 0.0]
                 }
                 None => [0.0; 4],
             },

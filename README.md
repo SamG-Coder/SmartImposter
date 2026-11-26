@@ -908,7 +908,7 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
 - **Light** (near a city, `Globals.city`): one traced bounce of light for the buildings and the
   ground instead of AO (a cosine ray, lit by the sun with its own shadow ray and the sky, or the
   sky where it escapes; DLSS Ray Reconstruction averages it), so walls in shade take up the sunlit
-  street and the towers across it; humid coastal haze (5x the clear-day aerosol, `atmoHaze` in
+  street and the towers across it; humid coastal haze (3.5x the clear-day aerosol, `atmoHaze` in
   `atmosphere.glsl`): the skyline a pale silhouette a few kilometres out, the sun warmer; a softer
   tone curve (lifted toe, a little less saturation, warm highlights). `SI_CITY_GI=0`,
   `SI_CITY_HAZE=<x>` and `SI_CITY_GRADE=0` turn them off or change them for comparisons.
