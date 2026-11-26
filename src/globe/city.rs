@@ -727,6 +727,13 @@ fn built_share(terrain: &Terrain, la: f64, lo: f64, size: f64) -> f32 {
     (urban_share(&f) + if pond { f[lc::WATER] } else { 0.0 }).min(1.0)
 }
 
+/// Is block (i, j) of zone z a surface car park round its buildings? (A third of the walk-up
+/// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
+/// and shade trees.
+fn parking_block(z: u32, i: i64, j: i64) -> bool {
+    (z == 1 && bu(i, j, 8) < 0.3) || (z == 2 && bu(i, j, 3) < 0.12)
+}
+
 /// Is the plane point on built-up, dry ground? `strict`: also needs enough built-up land.
 fn buildable(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     let (wx, wy) = to_world(x, y);
@@ -884,19 +891,13 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
             }
         }
         2 => {
-            if bu(i, j, 7) < 0.5 {
+            if bu(i, j, 7) < 0.45 {
                 (3, 2)
             } else {
                 (2, 2)
             }
         }
-        _ => {
-            if bu(i, j, 4) < 0.4 {
-                (2, 2)
-            } else {
-                (3, 2)
-            }
-        }
+        _ => (3, 3),
     };
     let (lw, lh) = (w / nx as f64, h / ny as f64);
     for ly in 0..ny {
@@ -1455,7 +1456,7 @@ fn parked(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId,
     let z = block_zone(k, i, j);
     let free = |x: f64, y: f64| !placed.iter().any(|p| (x - p.x).abs() < p.hx + 1.2 && (y - p.y).abs() < p.hy + 1.2);
     let mut n = 0u32;
-    if z == 1 || (z == 2 && bu(i, j, 3) < 0.3) {
+    if parking_block(z, i, j) {
         // stalls of 2.6 m either side of 7 m aisles, rows every 18 m (from 2 m in)
         let mut row = 0;
         loop {
@@ -1859,7 +1860,7 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
                 }
             }
         }
-    } else if z == 1 || (z == 2 && bu(i, j, 3) < 0.3) {
+    } else if parking_block(z, i, j) {
         // the planted strip round a parking lot (2.2 m wide)
         let per = 2.0 * (w + h);
         let n = (per / 15.0).floor() as u32;
@@ -1886,8 +1887,9 @@ fn lot_trees(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: Tile
         for a in 0..nx {
             for b in 0..ny {
                 let salt = 4400 + (a * 31 + b) as u32;
-                if bu(i, j, salt + 7) < 0.8 {
-                    spots.push((x0 + a as f64 * 18.0 + 11.0, y0 + b as f64 * 15.0 + 9.5, bu(i, j, salt + 9) < 0.75, salt));
+                spots.push((x0 + a as f64 * 18.0 + 8.0, y0 + b as f64 * 15.0 + 7.5, bu(i, j, salt + 9) < 0.8, salt));
+                if bu(i, j, salt + 7) < 0.7 {
+                    spots.push((x0 + a as f64 * 18.0 + 14.5, y0 + b as f64 * 15.0 + 12.0, true, salt + 20_000));
                 }
             }
         }

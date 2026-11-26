@@ -89,8 +89,13 @@ vec3 atmosphere(vec3 ro, vec3 rd, float tmax, vec3 L, float sunI, out vec3 T) {
     float pR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
     float g2 = MIE_G * MIE_G;
     float pM = 3.0 / (8.0 * PI) * ((1.0 - g2) * (1.0 + mu * mu)) / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * MIE_G * mu, 1.5));
+    // (the extra coastal haze, atmoHaze - 1: larger, wetter particles scatter more evenly,
+    // a broad lobe: the whole sky turns a pale, warm grey, not only the sun's side)
+    const float HAZE_G = 0.35;
+    float h2 = HAZE_G * HAZE_G;
+    float pH = 3.0 / (8.0 * PI) * ((1.0 - h2) * (1.0 + mu * mu)) / ((2.0 + h2) * pow(1.0 + h2 - 2.0 * HAZE_G * mu, 1.5));
     T = extinction(od);
-    return sunI * (sumR * BETA_R * pR + sumM * BETA_M * atmoHaze * pM);
+    return sunI * (sumR * BETA_R * pR + sumM * BETA_M * (pM + (atmoHaze - 1.0) * pH * vec3(1.0, 0.96, 0.9)));
 }
 
 #endif

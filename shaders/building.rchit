@@ -18,8 +18,8 @@ hitAttributeEXT vec2 bary;
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
 layout(set = 0, binding = 4, scalar) readonly buffer Meshes { MeshInfo meshes[]; };
 
-const vec3 B_WALL[9] = vec3[9](vec3(0.75, 0.72, 0.66), vec3(0.78, 0.72, 0.60), vec3(0.56, 0.57, 0.57), vec3(0.64, 0.57, 0.46),
-                               vec3(0.80, 0.64, 0.60), vec3(0.82, 0.75, 0.54), vec3(0.60, 0.73, 0.71), vec3(0.72, 0.66, 0.56), vec3(0.44, 0.43, 0.41));
+const vec3 B_WALL[9] = vec3[9](vec3(0.75, 0.72, 0.66), vec3(0.78, 0.72, 0.60), vec3(0.74, 0.70, 0.61), vec3(0.70, 0.63, 0.52),
+                               vec3(0.80, 0.68, 0.62), vec3(0.82, 0.76, 0.58), vec3(0.79, 0.76, 0.68), vec3(0.72, 0.66, 0.56), vec3(0.62, 0.58, 0.51));
 const vec3 B_GLASS[8] = vec3[8](vec3(0.32, 0.50, 0.52), vec3(0.24, 0.36, 0.52), vec3(0.36, 0.38, 0.40), vec3(0.46, 0.38, 0.29),
                                 vec3(0.60, 0.63, 0.66), vec3(0.34, 0.58, 0.62), vec3(0.20, 0.22, 0.24), vec3(0.32, 0.48, 0.40));
 const vec3 B_FRAME[4] = vec3[4](vec3(0.10, 0.105, 0.11), vec3(0.46, 0.47, 0.48), vec3(0.76, 0.76, 0.74), vec3(0.04, 0.04, 0.045));

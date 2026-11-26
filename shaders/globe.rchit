@@ -579,7 +579,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
         // hedges along the lot lines
         float hedge = max(1.0 - smoothstep(0.5, 0.5 + fw, min(u, lw - u)), 1.0 - smoothstep(0.6, 0.6 + fw, 0.5 * H - dv));
         lot = mix(lot, vec3(0.035, 0.06, 0.02) * mix(0.8, 1.2, n2), hedge * step(6.0, dv));
-    } else if (zone == 1 || (zone == 2 && cBu(i, j, 3u) < 0.3)) {
+    } else if ((zone == 1 && cBu(i, j, 8u) < 0.3) || (zone == 2 && cBu(i, j, 3u) < 0.12)) {
         // asphalt parking: bays of 2.6 m stalls either side of 7 m aisles, rows every 18 m,
         // a planted strip round the edge
         float rowV = mod(b.y - 2.0, 18.0);

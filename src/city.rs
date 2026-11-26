@@ -517,7 +517,7 @@ fn house(b: &mut B, w: f32, d: f32, storeys: usize, hip: bool, pal: &Pal, rng: &
         let r = if along_x { (hx - hz).max(0.0) } else { (hz - hx).max(0.0) };
         let (r0, r1) = if along_x { (Vec3::new(-r, h + rise, 0.0), Vec3::new(r, h + rise, 0.0)) } else { (Vec3::new(0.0, h + rise, -r), Vec3::new(0.0, h + rise, r)) };
         let c = [Vec3::new(-hx, h, -hz), Vec3::new(hx, h, -hz), Vec3::new(hx, h, hz), Vec3::new(-hx, h, hz)];
-        let tm = m(TILE, rng.pick(3) as u8);
+        let tm = m(TILE, [3u8, 4, 4, 0, 3, 4][rng.pick(6)]);
         if along_x {
             b.quad([c[0], r0, r1, c[1]], tm); // north slope
             b.quad([c[2], r1, r0, c[3]], tm);
@@ -755,7 +755,7 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         let h = 3.2 * storeys as f32 + 1.0;
         volume(&mut b, &poly, 0.0, h, 4.5, 3.2, Fac::Punched { col: 3.0, w: 1.4, h: 1.8 }, &pal, false, &mut rng);
         b.cap(&poly, h, true, m(ROOF, 0));
-        let top = hip_roof(&mut b, w * 0.5 + 0.8, d * 0.5 + 0.8, h, 0.32, m(TILE, [0u8, 1, 0, 2, 1][k]), m(WALL, pal.wall));
+        let top = hip_roof(&mut b, w * 0.5 + 0.8, d * 0.5 + 0.8, h, 0.32, m(TILE, [4u8, 3, 4, 0, 4][k]), m(WALL, pal.wall));
         push(b, format!("Building_Med_{k}"), top, &mut meshes, &mut archs);
     }
     // long condo slabs with balconies, 9-15 storeys
