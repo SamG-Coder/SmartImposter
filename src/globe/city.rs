@@ -1026,6 +1026,41 @@ fn streets(k: usize, terrain: &Terrain, sp: &Species, i: i64, j: i64, id: TileId
             s += 20.0;
             n += 1;
         }
+        // street lights along both sidewalks, every ~30 m on alternate sides, and traffic
+        // signals at the street's crossings with arterials (on land only: bridges have lamps)
+        if cars {
+            let light = sp.buildings.iter().find(|r| r.class == Class::Street && r.height > 8.0);
+            let signal = sp.buildings.iter().find(|r| r.class == Class::Street && r.height < 8.0);
+            if let (Some(light), Some(signal)) = (light, signal) {
+                let kerb = half_width(a) - sidewalk(a) + 0.6;
+                let cross = |ii: i64, jj: i64| if along_x { half_width(art_x(ii)) } else { half_width(art_y(jj)) };
+                let (c0, c1) = if along_x { (cross(i, j), len - cross(i + 1, j)) } else { (cross(i, j), len - cross(i, j + 1)) };
+                let mut s = c0 + 6.0;
+                let mut n = 0u32;
+                while s < c1 - 4.0 {
+                    let side = if n % 2 == 0 { -1.0 } else { 1.0 };
+                    let (x, y) = at(s, side * kerb);
+                    if !water_at(k, terrain, x, y) {
+                        // (the arm reaches over the road: towards the line from this side)
+                        let yaw = yaw0 - std::f64::consts::FRAC_PI_2 * side * if along_x { -1.0 } else { 1.0 };
+                        put_at(k, sp, light, x, y, ground(k, terrain, x, y), yaw, bh(i, j, 8800 + n + along_x as u32 * 100), id, tile);
+                    }
+                    s += 30.0;
+                    n += 1;
+                }
+                // the crossing at this block's start of the line, if either street is an arterial
+                let other = if along_x { art_x(i) } else { art_y(j) };
+                if (a || other) && !along_x {
+                    let (lx, ly) = (line_x(i), line_y(j));
+                    let (hx, hy) = (half_width(art_x(i)) - sidewalk(art_x(i)) + 0.7, half_width(art_y(j)) - sidewalk(art_y(j)) + 0.7);
+                    for (cx, cy, yaw) in [(lx - hx, ly - hy, 0.0f64), (lx + hx, ly + hy, std::f64::consts::PI)] {
+                        if !water_at(k, terrain, cx, cy) {
+                            put_at(k, sp, signal, cx, cy, ground(k, terrain, cx, cy), yaw, bh(i, j, 8990), id, tile);
+                        }
+                    }
+                }
+            }
+        }
         if !cars || kinds.len() < 6 {
             continue;
         }

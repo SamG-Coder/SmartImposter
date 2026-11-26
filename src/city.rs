@@ -49,6 +49,8 @@ pub enum Class {
     Highway,
     /// towers of their own shapes: one each in the densest cores
     Landmark,
+    /// street lights and traffic signals
+    Street,
 }
 
 pub struct Arch {
@@ -902,6 +904,27 @@ pub fn archetypes() -> (Vec<MeshData>, Vec<Arch>) {
         car(&mut b, len, wid, hgt, kind);
         push(b, format!("Building_Car_{k}"), hgt, &mut meshes, &mut archs);
     }
+    // street furniture (its arm towards +x): a street light (a 9 m pole, an arm of 2.4 m, the
+    // head) and a traffic signal (a pole with a 7 m mast arm over the road, three signal heads
+    // hanging from it, a pedestrian signal on the pole)
+    {
+        let mut b = B::new();
+        b.bx(Vec3::new(-0.09, 0.0, -0.09), Vec3::new(0.09, 9.0, 0.09), m(FRAME, 1), false);
+        b.bx(Vec3::new(0.0, 8.8, -0.05), Vec3::new(2.4, 8.95, 0.05), m(FRAME, 1), false);
+        b.bx(Vec3::new(1.9, 8.6, -0.22), Vec3::new(2.8, 8.85, 0.22), m(FRAME, 0), false);
+        push(b, "Building_StreetLight".into(), 9.0, &mut meshes, &mut archs);
+    }
+    {
+        let mut b = B::new();
+        b.bx(Vec3::new(-0.16, 0.0, -0.16), Vec3::new(0.16, 6.6, 0.16), m(FRAME, 0), false);
+        b.bx(Vec3::new(0.0, 6.2, -0.1), Vec3::new(7.5, 6.42, 0.1), m(FRAME, 0), false);
+        for x in [2.8f32, 5.0, 7.0] {
+            b.bx(Vec3::new(x - 0.18, 5.05, -0.18), Vec3::new(x + 0.18, 6.2, 0.18), m(DARK, 0), false);
+            b.bx(Vec3::new(x - 0.1, 5.85, -0.2), Vec3::new(x + 0.1, 6.0, -0.18), m(PAINT, 1), false);
+        }
+        b.bx(Vec3::new(-0.2, 2.4, 0.16), Vec3::new(0.2, 2.9, 0.4), m(DARK, 0), false);
+        push(b, "Building_Signal".into(), 6.6, &mut meshes, &mut archs);
+    }
     // elevated road decks, 20 m along (+x), deck top at 10 m: the highway (six lanes, a median
     // barrier, two columns on a crossbeam) and a ramp (one lane, one column); the columns run
     // 6 m into the ground, so a deck sunk for a ramp's climb still stands on them
@@ -1108,7 +1131,9 @@ pub fn pack() -> (TreePack, Vec<Arch>) {
 
 /// An archetype's class from its name (the variants keep only their names).
 pub fn class_of(name: &str) -> Class {
-    if name.contains("Landmark") {
+    if name.contains("StreetLight") || name.contains("Signal") {
+        Class::Street
+    } else if name.contains("Landmark") {
         Class::Landmark
     } else if name.contains("Highway") {
         Class::Highway
