@@ -668,10 +668,11 @@ const CHANNELS: &[Channel] = &[
     Channel { a: (-3760.0, -235.0), b: (-3938.0, -560.0), half: 34.0, amp: 0.0, wave: 1000.0 },
     // where the river meets the city's inner bay: a lagoon, arms of water north and south of
     // the river joined at their ends, the land between them wooded islands (ISLAND_PARKS)
-    Channel { a: (-4350.0, -140.0), b: (-2900.0, -170.0), half: 150.0, amp: 60.0, wave: 1400.0 },
-    Channel { a: (-4350.0, -1180.0), b: (-2900.0, -1140.0), half: 150.0, amp: 70.0, wave: 1300.0 },
-    Channel { a: (-4350.0, -140.0), b: (-4350.0, -1180.0), half: 120.0, amp: 0.0, wave: 1000.0 },
-    Channel { a: (-2900.0, -170.0), b: (-2900.0, -1140.0), half: 120.0, amp: 0.0, wave: 1000.0 },
+    // (curving, never straight: the arms meander, the ends bow)
+    Channel { a: (-4150.0, -190.0), b: (-2950.0, -230.0), half: 105.0, amp: 120.0, wave: 1000.0 },
+    Channel { a: (-4150.0, -1110.0), b: (-2950.0, -1080.0), half: 100.0, amp: 130.0, wave: 900.0 },
+    Channel { a: (-4150.0, -190.0), b: (-4150.0, -1110.0), half: 85.0, amp: 110.0, wave: 1500.0 },
+    Channel { a: (-2950.0, -230.0), b: (-2950.0, -1080.0), half: 85.0, amp: 100.0, wave: 1400.0 },
     // a canal looping south off it round a peninsula
     Channel { a: (-2690.0, -720.0), b: (-2620.0, -1080.0), half: 28.0, amp: 0.0, wave: 1000.0 },
     Channel { a: (-2620.0, -1080.0), b: (-2900.0, -1260.0), half: 28.0, amp: 0.0, wave: 1000.0 },
@@ -835,8 +836,9 @@ const TOWER_SPOTS: &[(f64, f64, f64)] = &[
 ];
 
 /// Wooded islands, nothing built on them (world plane rectangles: x0, y0, x1, y1): the land
-/// the lagoon's arms and the river leave between them.
-const ISLAND_PARKS: &[(f64, f64, f64, f64)] = &[(-4230.0, -1030.0, -3020.0, -290.0)];
+/// the lagoon's arms and the river leave north of the river (south of it the island is built,
+/// with its marina).
+const ISLAND_PARKS: &[(f64, f64, f64, f64)] = &[(-4100.0, -560.0, -3000.0, -150.0)];
 
 /// Is block (i, j) of zone z a surface car park round its buildings? (A third of the walk-up
 /// blocks, a few mid-rise ones; globe.rchit cityGround the same.) The rest are lawns, paths
