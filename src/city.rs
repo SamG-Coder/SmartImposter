@@ -213,6 +213,18 @@ fn ccw(mut p: Vec<Vec2>) -> Vec<Vec2> {
 
 /// The polygon moved inwards by `d` (convex: every edge moved along its normal, corners kept on
 /// the bisectors).
+/// Is q inside polygon p (even-odd)?
+fn inside(p: &[Vec2], q: Vec2) -> bool {
+    let mut c = false;
+    for k in 0..p.len() {
+        let (a, b) = (p[k], p[(k + 1) % p.len()]);
+        if (a.y > q.y) != (b.y > q.y) && q.x < a.x + (b.x - a.x) * (q.y - a.y) / (b.y - a.y) {
+            c = !c;
+        }
+    }
+    c
+}
+
 fn inset(p: &[Vec2], d: f32) -> Vec<Vec2> {
     let n = p.len();
     (0..n)
@@ -446,12 +458,23 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 let cx = rng.range(lo.x + sx * 0.5, hi.x - sx * 0.5);
                 let cz = rng.range(lo.y + sz * 0.5, hi.y - sz * 0.5);
                 let h = rng.range(1.2, 3.2);
+                // (in the roof's own outline, not its bounding box: a rounded or chamfered roof's
+                // corners are open)
+                let corners = [Vec2::new(cx - sx * 0.5, cz - sz * 0.5), Vec2::new(cx + sx * 0.5, cz - sz * 0.5), Vec2::new(cx + sx * 0.5, cz + sz * 0.5), Vec2::new(cx - sx * 0.5, cz + sz * 0.5)];
+                if !corners.iter().all(|c| inside(&core, *c)) {
+                    continue;
+                }
                 b.bx(Vec3::new(cx - sx * 0.5, y1, cz - sz * 0.5), Vec3::new(cx + sx * 0.5, y1 + h, cz + sz * 0.5), m(EQUIP, rng.pick(3) as u8), false);
             }
             let (ax, az) = (hi.x - lo.x, hi.y - lo.y);
             // a water tank on legs
             if ax * az > 200.0 && rng.f() < 0.45 {
                 let (cx, cz) = (rng.range(lo.x + 2.0, hi.x - 2.0), rng.range(lo.y + 2.0, hi.y - 2.0));
+                let (cx, cz) = if inside(&core, Vec2::new(cx - 1.4, cz - 1.4)) && inside(&core, Vec2::new(cx + 1.4, cz + 1.4)) && inside(&core, Vec2::new(cx - 1.4, cz + 1.4)) && inside(&core, Vec2::new(cx + 1.4, cz - 1.4)) {
+                    (cx, cz)
+                } else {
+                    ((lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5)
+                };
                 let tank: Vec<Vec2> = footprint(2.6, 2.6, 0.75, 0).iter().map(|p| *p + Vec2::new(cx, cz)).collect();
                 for (dx, dz) in [(-0.9f32, -0.9f32), (0.9, -0.9), (0.9, 0.9), (-0.9, 0.9)] {
                     b.bx(Vec3::new(cx + dx - 0.08, y1, cz + dz - 0.08), Vec3::new(cx + dx + 0.08, y1 + 2.0, cz + dz + 0.08), m(FRAME, 0), false);

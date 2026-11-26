@@ -644,6 +644,12 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     vec3 park = mix(lawnC * 1.05, lawnC * vec3(0.6, 0.72, 0.55), shade);
     vec2 pp = abs(fract(c / vec2(37.0, 29.0)) - 0.5);
     park = mix(park, vec3(0.24, 0.225, 0.2), (1.0 - smoothstep(0.012, 0.012 + fw / 37.0, min(pp.x, pp.y))) * shown * 0.6);
+    // (seen from afar the parks and grounds are under their trees' canopy too, as the lots are)
+    {
+        float cmP = smoothstep(0.38, 0.6, fbmN(c * 0.03 + 47.0, 3) * 0.7 + fbmN(c * 0.11 + 9.0, 2) * 0.3);
+        vec3 crownP = vec3(0.022, 0.040, 0.016) * mix(0.75, 1.25, fbmN(c * 0.4 + 15.0, 2));
+        park = mix(park, crownP, cmP * smoothstep(0.3, 1.2, fw) * 0.75);
+    }
     // wetland in the city: mangrove and dense shrub, a deep, uneven green
     vec3 mangrove = vec3(0.028, 0.05, 0.02) * mix(0.7, 1.3, fbmN(c * 0.25 + 77.0, 3));
     park = mix(park, mangrove, smoothstep(0.15, 0.45, wetF));

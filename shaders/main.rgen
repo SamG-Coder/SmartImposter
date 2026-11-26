@@ -773,9 +773,11 @@ void main() {
             // it, and calmer still towards the banks)
             if (g.city.x > 0.5) {
                 float paw = smoothstep(0.42, 0.78, vnoise(q * 0.045 + vec2(0.06, 0.03) * tm) * 0.7 + vnoise(q * 0.13 - vec2(0.02, 0.05) * tm) * 0.3);
-                float calm = mix(0.15, 1.0, paw) * mix(0.45, 1.0, smoothstep(4.0, 45.0, -wq.z));
-                lostVar *= 0.12 * calm;
-                gr *= 0.8 * calm;
+                float bank = mix(0.45, 1.0, smoothstep(4.0, 45.0, -wq.z));
+                // (the patches only shade the roughness a little, over a floor: the sun's
+                // reflection stays one soft, continuous streak, not white blotches)
+                lostVar = max(lostVar * 0.12 * mix(0.75, 1.0, paw) * bank, 0.0025);
+                gr *= 0.8 * mix(0.45, 1.0, paw) * bank;
             }
             if (globeWater) {
                 vec3 wup = normalize(gq);
@@ -886,6 +888,13 @@ void main() {
                 float D = exp((c2 - 1.0) / (c2 * m2)) / (PI * m2 * c2 * c2);
                 float Fh = 0.02 + 0.98 * pow(1.0 - max(dot(H, -dir), 0.0), 5.0);
                 glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
+                if (g.city.x > 0.5) {
+                    // fine glitter in the streak: the 3 cm ripples' facets flashing, a few in a
+                    // hundred at a time, changing several times a second (mean kept)
+                    vec2 cell = floor(q * 22.0) + floor(tm * 6.0) * vec2(17.13, 3.71);
+                    float hs = fract(sin(dot(cell, vec2(12.9898, 78.233))) * 43758.5453);
+                    glint *= mix(0.75, 4.3, step(0.93, hs));
+                }
             }
             // (a city's narrow channels: the bright hazy sky they mirror is held to a fraction
             // of the sunlight towards the sun, so a canal there reads as water, not as a white

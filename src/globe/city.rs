@@ -825,7 +825,11 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
         1 => &[Class::LowRise, Class::MidRise, Class::MidRise],
         _ => &[Class::House],
     };
-    if need > 0.0 && tallest(classes) < need {
+    // a waterfront mid-rise block now and then has a slender tower of 25-40 storeys at its
+    // corner, as Miami's residential towers line its bay and river (its first lot)
+    let water_tower = z == 2 && bu(i, j, 8100) < 0.4 && near_water(k, terrain, x0 + w * 0.5, y0 + h * 0.5, w.max(h) * 0.5 + 70.0);
+    let tower_cls: &[Class] = &[Class::Tower];
+    if need > 0.0 && tallest(if water_tower { tower_cls } else { classes }) < need && tallest(classes) < need {
         return out;
     }
     let dens = density(k, x0 + w * 0.5, y0 + h * 0.5);
@@ -993,7 +997,7 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
     for ly in 0..ny {
         for lx in 0..nx {
             let lot = (ly * nx + lx) as u32;
-            let class = classes[(bh(i, j, 10 + lot) as usize) % classes.len()];
+            let class = if water_tower && lot == 0 { Class::Tower } else { classes[(bh(i, j, 10 + lot) as usize) % classes.len()] };
             let (cx, cy) = (x0 + (lx as f64 + 0.5) * lw, y0 + (ly as f64 + 0.5) * lh);
             let mut fits: Vec<(usize, u32)> = Vec::new();
             for (a, r) in archs.iter().enumerate() {
@@ -1029,7 +1033,13 @@ fn block_plan(k: usize, archs: &[ArchRef], terrain: &Terrain, i: i64, j: i64, ne
                 // taller towers nearer the core centres, and now and then a much taller one
                 // (outside the cores only the shortest towers: the mid-rise city round them is
                 // 10-25 storeys)
-                let mut want = if z == 3 { 70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot)) } else { 55.0 + 35.0 * bu(i, j, 90 + lot) };
+                let mut want = if z == 3 {
+                    70.0 + 170.0 * dens.powf(1.3) * (0.55 + 0.6 * bu(i, j, 90 + lot))
+                } else if water_tower {
+                    85.0 + 45.0 * bu(i, j, 90 + lot)
+                } else {
+                    55.0 + 35.0 * bu(i, j, 90 + lot)
+                };
                 if z == 3 && bu(i, j, 95 + lot) < 0.15 {
                     want *= 1.6;
                 }
