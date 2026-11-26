@@ -944,28 +944,30 @@ fn bridged(k: usize, terrain: &Terrain, x: f64, y: f64, along_x: bool, arterial:
     if !water_at(k, terrain, x, y) {
         return false;
     }
-    // a crossing has water on both sides of the street (a street running along a shore just off
-    // it does not)
-    let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
-    if !water_at(k, terrain, x + px, y + py) || !water_at(k, terrain, x - px, y - py) {
-        return false;
-    }
-    // (canals for the side streets, the river and the like for the arterials; the bay only on
-    // the causeways)
+    // decided for the whole crossing, the same at every point of it: walk out both ways to the
+    // first bank (30 m of solid land), within reach (canals for the side streets, rivers for
+    // the arterials, the bay only on the causeways); then the crossing must have water both
+    // sides of the street at its middle (a street running along a shore just off it does not)
     let reach = if arterial && bh(line, along_x as i64, 77) % 2 == 0 { 1600.0 } else if arterial { 250.0 } else { 70.0 };
-    let land = |dir: f64| {
-        let mut s = 10.0;
+    let pt = |s: f64| if along_x { (x + s, y) } else { (x, y + s) };
+    let bank = |dir: f64| -> Option<f64> {
+        let mut s = 0.0;
         while s <= reach {
-            let (px, py) = if along_x { (x + dir * s, y) } else { (x, y + dir * s) };
-            if !water_at(k, terrain, px, py) {
-                return true;
+            let solid = (0..4).all(|n| {
+                let (px, py) = pt(dir * (s + 10.0 * n as f64));
+                !water_at(k, terrain, px, py)
+            });
+            if solid {
+                return Some(s);
             }
             s += 10.0;
         }
-        false
+        None
     };
-    // (both banks within reach: the whole crossing is shorter than about twice that)
-    land(1.0) && land(-1.0)
+    let (Some(a), Some(b)) = (bank(-1.0), bank(1.0)) else { return false };
+    let (mx, my) = pt((b - a) * 0.5);
+    let (px, py) = if along_x { (0.0, 40.0) } else { (40.0, 0.0) };
+    water_at(k, terrain, mx + px, my + py) && water_at(k, terrain, mx - px, my - py)
 }
 
 /// Bridge decks and traffic on the street lines of block (i, j) (as street_palms: the
@@ -1187,15 +1189,25 @@ fn water_at(k: usize, terrain: &Terrain, x: f64, y: f64) -> bool {
     sea_level_water(terrain, la, lo)
 }
 
-/// Mapped water whose surface is at sea level: some point within ~40 m is under 0.6 m (the
-/// heights over water are noisy; a pond is above that throughout, as globe.rchit decides by
-/// its water level).
+/// Mapped water whose surface is at sea level, decided as the terrain decides a water level
+/// (tiles.rs water_levels: the lower quartile of the mapped water's heights around, under 1 m
+/// is the sea; globe.rchit makes the water above it land in a city).
 fn sea_level_water(terrain: &Terrain, la: f64, lo: f64) -> bool {
     if terrain.cover.class_group(la, lo) != Some(lc::WATER) {
         return false;
     }
-    let (dla, dlo) = (40.0 / 110_540.0, 40.0 / (111_320.0 * la.to_radians().cos()));
-    (-1..=1).any(|a| (-1..=1).any(|b| terrain.height(la + a as f64 * dla, lo + b as f64 * dlo) < 0.6))
+    let (dla, dlo) = (12.0 / 110_540.0, 12.0 / (111_320.0 * la.to_radians().cos()));
+    let mut h: Vec<f32> = Vec::with_capacity(25);
+    for a in -2..=2 {
+        for b in -2..=2 {
+            let (pa, po) = (la + a as f64 * dla, lo + b as f64 * dlo);
+            if terrain.cover.class_group(pa, po) == Some(lc::WATER) {
+                h.push(terrain.height(pa, po));
+            }
+        }
+    }
+    h.sort_by(|a, b| a.total_cmp(b));
+    h[h.len() / 4] < 1.0
 }
 
 /// Place a boat (variant of `r`) at plane point (x, y), bow towards `yaw` (from east towards

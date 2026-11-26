@@ -971,12 +971,39 @@ fn car(b: &mut B, len: f32, wid: f32, hgt: f32, kind: u32) {
     };
     let top = hgt - 0.05;
     let inset = if kind == 4 { 0.02 } else { 0.12 };
-    let g = ccw(vec![Vec2::new(x0, -hw + inset), Vec2::new(x1, -hw + inset), Vec2::new(x1, hw - inset), Vec2::new(x0, hw - inset)]);
-    b.prism(&g, belt, top, m(GLASS, 6), m(CARPAINT, 0), false);
-    // the roof's pillars (paint) at the ends of the glass
-    for x in [x0, x1] {
-        b.bx(Vec3::new(x - 0.06, belt, -hw + inset - 0.01), Vec3::new(x + 0.06, top, hw - inset + 0.01), m(CARPAINT, 0), false);
+    // tapered: the windscreen and the rear window raked, the sides leaning in (tumblehome), so
+    // the glass shows from above as it does on a real car; the roof is paint
+    let (rake_f, rake_r, tumble) = match kind {
+        0 => (0.95, 0.65, 0.16),
+        1 => (0.7, 0.25, 0.12),
+        2 => (0.6, 0.06, 0.12),
+        3 => (0.9, 0.08, 0.1),
+        _ => (0.12, 0.05, 0.02),
+    };
+    let (zb, zt) = (hw - inset, hw - inset - tumble);
+    let (xa, xb) = (x0 + rake_r, x1 - rake_f);
+    let v = |x: f32, y: f32, z: f32| Vec3::new(x, y, z);
+    let glass = m(GLASS, 6);
+    b.quad([v(x1, belt, -zb), v(x1, belt, zb), v(xb, top, zt), v(xb, top, -zt)], glass); // windscreen
+    b.quad([v(x0, belt, zb), v(x0, belt, -zb), v(xa, top, -zt), v(xa, top, zt)], glass); // rear window
+    b.quad([v(x0, belt, -zb), v(x1, belt, -zb), v(xb, top, -zt), v(xa, top, -zt)], glass); // sides
+    b.quad([v(x1, belt, zb), v(x0, belt, zb), v(xa, top, zt), v(xb, top, zt)], glass);
+    b.quad([v(xa, top, -zt), v(xb, top, -zt), v(xb, top, zt), v(xa, top, zt)], m(CARPAINT, 0)); // roof
+    // pillars between the side windows (B pillar), paint
+    let xm = 0.5 * (xa + xb);
+    for zs in [-1.0f32, 1.0] {
+        b.bx(Vec3::new(xm - 0.07, belt, zs * zb - 0.02), Vec3::new(xm + 0.07, top - 0.02, zs * zb + 0.02), m(CARPAINT, 0), false);
     }
+    // headlights and taillights
+    let ly = belt - 0.22;
+    for zs in [-1.0f32, 1.0] {
+        let z = zs * (hw - 0.4);
+        b.bx(Vec3::new(hl - 0.05, ly, z - 0.25), Vec3::new(hl + 0.02, ly + 0.14, z + 0.25), m(GLASS, 4), false);
+        b.bx(Vec3::new(-hl - 0.02, ly, z - 0.22), Vec3::new(-hl + 0.05, ly + 0.16, z + 0.22), m(PAINT, 1), false);
+    }
+    // bumpers, dark, front and back
+    b.bx(Vec3::new(hl - 0.1, sill - 0.05, -hw + 0.15), Vec3::new(hl + 0.05, sill + 0.18, hw - 0.15), m(DARK, 0), false);
+    b.bx(Vec3::new(-hl - 0.05, sill - 0.05, -hw + 0.15), Vec3::new(-hl + 0.1, sill + 0.18, hw - 0.15), m(DARK, 0), false);
     if kind == 2 {
         // the bed: low walls round an open box
         b.bx(Vec3::new(-hl, belt - 0.05, -hw), Vec3::new(x0 - 0.1, belt + 0.05, hw), m(DARK, 0), false);

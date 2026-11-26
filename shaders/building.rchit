@@ -78,14 +78,15 @@ void main() {
     // large-scale weathering, in the mesh's own metres
     float grime = mix(0.9, 1.04, vnoise(po.xz * 0.11 + po.y * 0.07)) * mix(0.94, 1.0, vnoise(vec2(po.y * 0.35, po.x * 0.21 + po.z * 0.17)));
     vec3 albedo;
-    float glass = 0.0;
+    float glass = 0.0, coat = 0.0;
     if (mt == 1u || mt == 7u) {
         // glass: window by window a little different (coating, blinds behind it)
         vec3 tint = B_GLASS[min(pal, 7u)];
         albedo = tint * mix(1.0, mix(0.86, 1.12, r1), detail);
         glass = mt == 7u ? 0.45 : mix(1.0, mix(0.8, 1.0, r2), detail);
         if (mt == 7u) albedo = mix(albedo, vec3(0.62, 0.66, 0.66), 0.45); // rails: frosted, lighter
-        if (mt == 1u) {
+        if (mt == 1u && pal != 6u) {
+            // (plain glass, pal 6: cars' and boats' windows, has no facade cells and no frames)
             // mullions at the cell edges and a spandrel band at the foot of each storey (opaque
             // glass): drawn where the pixel resolves them, their average beyond
             float mw = clamp(0.05 * cellsPerM, 0.01, 0.12);
@@ -137,7 +138,7 @@ void main() {
         // car paint: each car's own colour (its record's seed; white in the bake, the impostor
         // applies the same colour: impostor.rchit carPaint), glossy
         albedo = vec3(0.85) * carPaint(instSeed(gl_InstanceCustomIndexEXT));
-        glass = 0.35;
+        coat = 1.0;
     } else if (mt == 15u) {
         // a bridge's roadway: asphalt with its centre line
         albedo = vec3(0.075, 0.075, 0.078) * mix(0.85, 1.15, vnoise(po.xz * 0.3));
@@ -171,5 +172,7 @@ void main() {
     pl.ao = 1.0;
     pl.sunVis = 1.0;
     pl.shadowMask = 0xFFu;
-    pl.trans = vec3(0.0, 0.0, glass);
+    // (x: a clearcoat over the paint, main.rgen)
+    // (y: plain tinted glass, cars' and boats' windows: F0 0.04, not a coated curtain wall)
+    pl.trans = vec3(coat, (mt == 1u && pal == 6u) ? 1.0 : 0.0, glass);
 }

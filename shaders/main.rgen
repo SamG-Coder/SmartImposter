@@ -564,11 +564,13 @@ void main() {
             // albedo is that tint). The reflection is traced (other towers, the bay, the sky),
             // the sun's highlight is GGX.
             float gls = clamp(pl.trans.z, 0.0, 1.0);
-            float rough = mix(0.85, 0.035, gls);
+            // car paint (building.rchit: trans.x): its colour under a smooth clearcoat
+            bool coat = pl.trans.x > 0.5;
+            float rough = coat ? 0.09 : mix(0.85, 0.035, gls);
             vec3 V = -dir;
             float NdV = max(dot(nDir, V), 1e-3);
             vec3 diffA = alb * mix(1.0, 0.11, gls);
-            vec3 F0 = mix(vec3(0.04), vec3(0.15) + alb * 0.32, gls); // coated curtain-wall glass: 0.25-0.35 at normal incidence
+            vec3 F0 = coat ? vec3(0.05) : pl.trans.y > 0.5 ? vec3(0.04) : mix(vec3(0.04), vec3(0.15) + alb * 0.32, gls); // coated curtain-wall glass: 0.25-0.35 at normal incidence
             vec3 spec = vec3(0.0);
             if (ndl > 0.0) {
                 vec3 H = normalize(L + V);
@@ -583,7 +585,7 @@ void main() {
             }
             vec3 Fe = F0 + (max(vec3(1.0 - rough), F0) - F0) * pow(1.0 - NdV, 5.0);
             vec3 env = amb;
-            if (gls > 0.2) {
+            if (gls > 0.2 || coat) {
                 vec3 upW = globe() ? normalize(gq) : vec3(0.0, 1.0, 0.0);
                 vec3 R = reflect(dir, nDir);
                 vec3 org2 = p + ng * (0.05 + pl.t * 2e-4);
