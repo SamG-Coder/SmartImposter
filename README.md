@@ -930,8 +930,20 @@ cargo run --release -- --globe --at 25.770,-80.205,60,0,-20 --time 2026-11-26T20
   downtown a tower stands at one end of its lot with a garage or shops podium filling the rest;
   every building has a wall tint of its own (whites, creams, pastels; the same in its mesh and its
   impostor, from its record's seed), dirt at the foot of its walls and rain streaks down them.
-- **Still to do**: cars (the 256 variant slots are full: a plant record keeps its variant in 8
-  bits), boat wakes, bridges and causeways, lights at night.
+- **Cars, bridges, boats under way.** Plant records keep their variant in 9 bits (512 slots;
+  `forest.rs rec_data`). Six car archetypes (compact, sedan, SUV, pickup, van, bus), each car's
+  paint its own (by its record's seed, the same in mesh and impostor), park in the stalls the
+  ground shader draws and in the driveways, and drive on the right in the lanes. Bridge decks
+  carry the streets over canals and the river, causeways over the bay on every other arterial.
+  Three in four boats out on the water are under way, trailing a wake of foam patches (the
+  turbulent trail and the Kelvin wedge's arms).
+- **Variety.** About 85 building archetypes in all: also South Beach Art Deco walk-ups,
+  Mediterranean revival mid-rises with tile roofs, condo slabs, courtyard apartment blocks, strip
+  malls, a big-box store, gas stations, L-shaped houses with garages. The street lines are moved
+  by up to +-12 m each (blocks of different sizes), shops and walk-ups line the arterials between
+  the house blocks, and the downtown cores are tight clusters.
+- **Still to do**: lights at night; the street plan is one grid turned nowhere (the real city's
+  street pattern is not used: the city is generated, not mapped).
 
 **Still to do** (see the plan): rivers from HydroRIVERS (the 10 m land cover has the wide ones),
 stars, seasons in the vegetation, and wind.

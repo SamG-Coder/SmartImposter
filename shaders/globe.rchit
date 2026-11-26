@@ -463,7 +463,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     float verge = (!ax ? (1.0 - smoothstep(road.x + 1.4, road.x + 1.4 + fw, e.x)) * inSX : 0.0) + (!ay ? (1.0 - smoothstep(road.y + 1.4, road.y + 1.4 + fw, e.y)) * inSY : 0.0);
     // lawn: St Augustine grass, patchy, browner where it dries out, darker in tufts
     float nl = fbmN(c * 0.3 + 5.0, 3), nd = fbmN(c * 0.07 + 13.0, 3);
-    vec3 lawnC = mix(vec3(0.062, 0.085, 0.030), vec3(0.105, 0.098, 0.052), smoothstep(0.45, 0.8, nd)) * mix(0.72, 1.18, nl) * mix(0.88, 1.08, fbmN(c * 2.1 + 9.0, 2));
+    vec3 lawnC = mix(vec3(0.062, 0.085, 0.030), vec3(0.095, 0.098, 0.050), 0.6 * smoothstep(0.62, 0.9, nd)) * mix(0.72, 1.18, nl) * mix(0.88, 1.08, fbmN(c * 2.1 + 9.0, 2));
     walk = mix(walk, lawnC, clamp(verge, 0.0, 1.0) * (1.0 - curb));
 
     // ---- the block's lots
@@ -531,7 +531,7 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     // where the land cover is not built up (parks, grounds, open land in the city): kept lawn
     // under scattered shade, with paths, never the bare native soil showing through
     float shade = smoothstep(0.55, 0.75, fbmN(c * 0.06 + 31.0, 3) * 0.7 + fbmN(c * 0.4 + 2.0, 2) * 0.3);
-    vec3 park = mix(lawnC * 1.05, lawnC * vec3(0.55, 0.62, 0.5), shade);
+    vec3 park = mix(lawnC * 1.05, lawnC * vec3(0.6, 0.72, 0.55), shade);
     vec2 pp = abs(fract(c / vec2(37.0, 29.0)) - 0.5);
     park = mix(park, vec3(0.24, 0.225, 0.2), (1.0 - smoothstep(0.012, 0.012 + fw / 37.0, min(pp.x, pp.y))) * shown * 0.6);
     // wetland in the city: mangrove and dense shrub, a deep, uneven green
@@ -540,7 +540,8 @@ float cityGround(vec3 p, float footprint, float built, float waterF, float wetF,
     alb = mix(park, planned, smoothstep(0.08, 0.3, built) * (1.0 - smoothstep(0.2, 0.5, wetF)));
     // the city keeps off water and wetland; it fades in with the built-up land and out at its rim
     float urban = 1.0 - smoothstep(0.85, 1.0, r / gg.cityP.z);
-    urban *= 1.0 - smoothstep(0.35, 0.7, waterF);
+    // (land by the shore field is land, right up to the water: no fade by the water fraction,
+    // which let the native mud show along every shore)
     return urban;
 }
 
@@ -635,7 +636,7 @@ void main() {
     }
     // in a city the water is held by seawalls (all but sand beaches and mangroves): deep right
     // up to the wall
-    bool seawall = water && cityNear(p) && B.y < 0.6;
+    bool seawall = water && cityNear(p) && (B.y < 0.6 || B.x > 0.08);
     if (seawall) depth = max(depth, 3.5);
     float nW0 = fbmN(uvm * 0.3 + 71.0, 2); // breaks up the wet strip
     // the strip along the water: pebbles, and wet (darker) right at the waterline
@@ -653,7 +654,7 @@ void main() {
         // A built-up shore in a city is a seawall, not a beach: the city's ground runs to a
         // concrete cap with a dark, wet face at the edge (main.rgen: no lapping foam there, the
         // water is deep at once). Natural shores (beach sand, mangroves) keep their strip.
-        float wall = cityNear(p) ? 1.0 - smoothstep(0.55, 0.8, B.y) : 0.0;
+        float wall = cityNear(p) ? max(1.0 - smoothstep(0.55, 0.8, B.y), smoothstep(0.06, 0.18, B.x)) : 0.0;
         alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore * (1.0 - wall), biome, seaSide, ao);
         urban *= 1.0 - shore * (1.0 - wall);
         if (urban > 0.0) {
