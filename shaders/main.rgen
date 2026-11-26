@@ -524,6 +524,17 @@ void main() {
             // (on the scale of the sky model above: amb is PI x the zenith radiance)
             indirect = Lin * PI * ao;
         }
+        // a city's facades: the light bounced up off the sunlit pavements, walls and roofs
+        // around them (warm: stucco, concrete, sand), more than the one traced bounce gathers
+        // off the dark lawns and asphalt, and a little more fill in their shade: shaded walls
+        // read warm cream, not the blue sky's grey (the half of the view below the horizon,
+        // irradiance E sin(sun) x albedo ~0.3 / 2 of it)
+        if (globe() && g.city.x > 0.5 && (pl.flags & FLAG_BUILDING) != 0u) {
+            vec3 upB = normalize(gq);
+            float sunUp = max(dot(L, upB), 0.0);
+            float below = 0.5 - 0.5 * dot(nDir, upB);
+            indirect = indirect * vec3(1.22, 1.18, 1.1) + E * (sunUp * (0.25 + below)) * vec3(0.42, 0.35, 0.25) / PI * ao;
+        }
         col = direct + alb * indirect;
         // a city at dusk: the street lamps' pools of light on the ground (globe.rchit cityLamp)
         if (globe() && mat == MAT_TERRAIN && !globeWater && g.city.x > 0.5) {

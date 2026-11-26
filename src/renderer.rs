@@ -1059,7 +1059,16 @@ impl Renderer {
                 k.u64(p.mesh as u64).u64(m.vertex_count() as u64).u64(m.tri_count() as u64).bytes(bytemuck::cast_slice(&p.xform.to_cols_array()))
             });
             // (building variants: their hit shader too; the plants' keys stay as they were)
-            let mesh_key = if building { mesh_key.bytes(spv!("building.rchit")) } else { mesh_key };
+            // (and their materials and positions: a building's look changes with its materials
+            // alone, the counts staying the same)
+            let mesh_key = if building {
+                t.parts.iter().fold(mesh_key.bytes(spv!("building.rchit")), |k, p| {
+                    let m = &pack.meshes[p.mesh as usize];
+                    k.bytes(&m.materials).bytes(bytemuck::cast_slice(&m.positions))
+                })
+            } else {
+                mesh_key
+            };
             let key = mesh_key.u64(square as u64).u64(res[0] as u64).u64(res[1] as u64).u64(mips as u64).u64(vi.texel_scale.to_bits() as u64).get();
             let path = crate::atlas::path_for(&t.name, key);
             let full = VariantAtlas { name: t.name.clone(), grid: imp.grid, res, mips, square, crop, skip, key, path, base, full: None, loading: false, upload: None, wanted: 0 };

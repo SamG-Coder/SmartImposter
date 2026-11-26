@@ -328,11 +328,14 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 let u0 = perimeter_u(&core, k);
                 b.wall(a, c, ys, y1, 0.0, m(GLASS, pal.glass), Some((u0, 2.4, ys, fh)));
             }
+            // (on a coloured block with solid parapets the slabs' edges and plates are its stucco
+            // too: a white block is white, the others their colour, not white bands on them)
+            let sm = if solid && pal.wall != 0 { m(WALL, pal.wall) } else { m(SLAB, 0) };
             for f in 0..floors {
                 let y = ys + f as f32 * fh;
                 // the slab (a plate over the whole footprint: its edge and soffit show)
                 for k in 0..n {
-                    b.wall(poly[k], poly[(k + 1) % n], y - 0.3, y, 0.0, m(SLAB, 0), None);
+                    b.wall(poly[k], poly[(k + 1) % n], y - 0.3, y, 0.0, sm, None);
                     if solid {
                         // a solid parapet, the slab's edge carried up: white concrete on a white
                         // block (wall 0), the block's own stucco on the others
@@ -351,7 +354,7 @@ fn volume(b: &mut B, poly: &[Vec2], y0: f32, y1: f32, fh0: f32, fh: f32, fac: Fa
                 // plate top between the rail and the glass: an annulus as quads
                 for k in 0..n {
                     let (a0, a1, c0, c1) = (ring[k], ring[(k + 1) % n], core[k], core[(k + 1) % n]);
-                    b.quad([Vec3::new(a0.x, y, a0.y), Vec3::new(c0.x, y, c0.y), Vec3::new(c1.x, y, c1.y), Vec3::new(a1.x, y, a1.y)], m(SLAB, 0));
+                    b.quad([Vec3::new(a0.x, y, a0.y), Vec3::new(c0.x, y, c0.y), Vec3::new(c1.x, y, c1.y), Vec3::new(a1.x, y, a1.y)], sm);
                 }
                 // balcony dividers every ~9 m
                 for k in 0..n {
