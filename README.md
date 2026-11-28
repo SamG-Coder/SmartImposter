@@ -1000,6 +1000,7 @@ cargo run --release
 | `SI_VALIDATION` | same as `--validation` |
 | `SI_PROF_SKIP` | profiling, a sum of: 1 no sun-shadow rays, 2 no AO rays, 4 no traced sky light, 8 no clouds in the view, 16 none in reflections, 32 no cloud shadows |
 | `SI_PROF_FRAMES=n` | with `--shot`: once the view has streamed in, hold it n more frames and time those alone (the profile line otherwise averages every frame since the start, loading included) |
+| `SI_ROADS=off\|offline` | globe: the main roads (motorway to tertiary) are fetched live from OpenStreetMap through the Overpass API as one flies, one request per ~40 km map tile, cached in `assets/earth/osm`, and painted on the ground (`src/globe/roads.rs`, `shaders/roads.glsl`); `off`: no roads, `offline`: only what is cached. Map data © OpenStreetMap contributors, ODbL |
 | `SI_TEX_MAX`, `SI_GROUND_TEX_MAX` | maximum plant / ground texture size (default 2048) |
 | `SI_GROUND_DIR` | Fab library cache with the ground surfaces |
 | `SI_IMPOSTOR_MB` | GPU memory for full impostor atlases (default 25% of VRAM) |

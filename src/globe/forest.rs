@@ -198,7 +198,11 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let (r_keep, r_pick, r_size, r_yaw) = (rng.f(), rng.f(), rng.f(), rng.f());
                 let d = face_dir(id.face, u0 + fu * s, v0 + fv * s);
                 let (lat, lon) = lat_lon(d);
-                let Some(g) = terrain.cover.class_group(lat, lon) else { continue };
+                // (the class from a point up to ~7 m away: the land cover's 10 m pixels have
+                // straight edges and corners, and plants stopped at them as at a mown line; this
+                // way one cover thins out into the next over a few metres)
+                let (jn, je) = ((rng.f() - 0.5) * 14.0 / 111_320.0, (rng.f() - 0.5) * 14.0 / (111_320.0 * lat.to_radians().cos().max(0.05)));
+                let Some(g) = terrain.cover.class_group(lat + jn, lon + je) else { continue };
                 use super::landcover as lc;
                 let biome = tree_biome(terrain, lat, lon);
                 // deserts and dry scrub: dry grass only, and far fewer plants (mostly bare ground)
@@ -219,6 +223,9 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                     (0, lc::BARE) => (0.12, &sp.dry),
                     (0, lc::SHRUB) if r_pick < 0.35 && !sp.dry.is_empty() => (0.55, &sp.dry),
                     (2, lc::GRASS) => (0.9, &sp.grass),
+                    // (towns, until they have their buildings: yards and verges, grass and the odd shrub)
+                    (2, lc::BUILT) => (0.6, &sp.grass),
+                    (0, lc::BUILT) => (0.04, &sp.shrubs),
                     (2, lc::CROP) => (0.8, &sp.dry_grass),
                     (2, lc::WETLAND) => (0.85, &sp.wet_grass),
                     (2, lc::SHRUB) => (0.5, &sp.grass),
@@ -245,6 +252,15 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                         continue;
                     }
                 }
+                // Grass does not stand evenly: thick in clumps and drifts, thin between them
+                // (over ~6 m and ~30 m)
+                let p = if layer == 2 {
+                    let pk = d * R_EARTH;
+                    let clump = vnoise3(pk / 30.0 + DVec3::splat(3.0)) * 0.55 + vnoise3(pk / 6.0 + DVec3::splat(11.0)) * 0.45;
+                    p * (0.3 + 1.0 * smooth(0.3, 0.7, clump))
+                } else {
+                    p
+                };
                 let list = if list.is_empty() && layer < 3 && !(layer == 0 && g == lc::BARE) { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
                 if list.is_empty() || r_keep > p {
                     continue;
@@ -588,14 +604,31 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let up = d;
             let east = DVec3::Z.cross(up).normalize();
             let north = up.cross(east);
+            // No two trees of a variant alike, and no forest one even carpet:
+            // - stands: over ~100 m the trees are taller or shorter together (soil, water, the
+            //   stand's age), over ~300 m a shade greener, yellower, lighter or darker together;
+            //   each tree varies round its stand;
+            // - a lean of a few degrees, the odd one more (wind, a neighbour's shade, soft ground).
+            // (Earth-fixed noise: the same at every tile level, so a tree keeps its look as the
+            // tiles refine.)
+            let pk = d * (R_EARTH / 1000.0);
+            let stand = vnoise3(pk * 9.0 + DVec3::splat(3.7)) * 0.65 + vnoise3(pk * 31.0 + DVec3::splat(8.1)) * 0.35;
+            let tone = vnoise3(pk * 3.3 + DVec3::splat(21.0)) * 0.6 + vnoise3(pk * 14.0 + DVec3::splat(5.0)) * 0.4;
+            let shade = vnoise3(pk * 5.1 + DVec3::splat(47.0)) * 0.6 + vnoise3(pk * 19.0 + DVec3::splat(13.0)) * 0.4;
             let a = rng.f() * std::f64::consts::TAU;
+            let (lean, lean_to) = (0.11 * rng.f().powi(3) + 0.02 * rng.f(), rng.f() * std::f64::consts::TAU);
+            let up = (up + (east * lean_to.cos() + north * lean_to.sin()) * lean.tan()).normalize();
             let x = east * a.cos() + north * a.sin();
+            let x = (x - up * x.dot(up)).normalize();
             let z = x.cross(up);
-            let sc = 0.85 + 0.3 * rng.f();
+            let sc = 0.62 + 0.5 * ((stand - 0.5) * 1.8 + 0.5).clamp(0.0, 1.0) + 0.26 * rng.f();
             let (x, y, z) = (x * sc, up * sc, z * sc);
             let t = d * (R_EARTH + h - 0.2) - center;
             let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
-            let seed = 1 + (rng.f() * 8190.0) as u32;
+            // the tint's two numbers (shared.glsl treeTint: hue in the low 6 bits, brightness in
+            // the 7 above): the stand's, and the tree's own share
+            let mixed = |field: f64, r: f64| (((field - 0.5) * 1.7 + 0.5) * 0.6 + r * 0.4).clamp(0.0, 1.0);
+            let seed = (((mixed(tone, rng.f()) * 63.0) as u32) | ((mixed(shade, rng.f()) * 127.0) as u32) << 6).max(1);
             let mut rec = [0u32; REC_WORDS];
             for (ri, row) in rows.iter().enumerate() {
                 for (ci, v) in row.iter().enumerate() {

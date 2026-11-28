@@ -31,6 +31,9 @@ struct Globals {
     vec4 lawn2;     //   x texels per view, y gutter texels, z atlas levels, w atlas slot
     vec4 lawn3;     //   xy slope (cot elevation) of the steepest and flattest views, z 1 = the park (--park: watered, no dried grass), w real blades around the camera to this distance (m)
     vec4 lawn4;     //   x segments of a blade, y auto mode: the short grass as a part of the baked height (0 = not auto), z the low end of the height patches, w the distance (m) by which the layer has faded into the ground texture
+    vec4 road0;     // globe roads (roads.glsl): a point of the camera frame -> metres east of the roads' anchor (xyz . p + w)
+    vec4 road1;     //   and north
+    vec4 road2;     //   x which half of the road buffer is current, y 1 once roads are loaded, zw the grids' cell sizes
     vec4 acInv0;    // --test-flight, the aircraft: the renderer's frame -> its model frame (rows, w the translation)
     vec4 acInv1;
     vec4 acInv2;

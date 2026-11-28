@@ -7,6 +7,7 @@ pub mod etopo;
 pub mod forest;
 pub mod landcover;
 pub mod ocean;
+pub mod roads;
 pub mod scene;
 pub mod sky;
 pub mod tiles;

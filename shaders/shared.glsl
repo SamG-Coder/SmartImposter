@@ -16,7 +16,7 @@
 #define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
-#define MAX_GROUND_TEX 81 // 3 per ground layer (26 layers); then the grass map (--lawn auto) and the far / near masks
+#define MAX_GROUND_TEX 84 // 3 per ground layer (27 layers); then the grass map (--lawn auto) and the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
 #define NEAR_HALF 2048.0
 #define TERRAIN_HALF 60000.0
@@ -158,10 +158,12 @@ vec3 foliageLook(vec3 alb, uint look, uint seed) {
 
 vec3 treeTint(uint seed, float leafiness) {
     if (seed == 0u) return vec3(1.0);
-    uint s = pcg(seed * 7919u);
-    float h1 = float(s & 0xFFFFu) / 65535.0;
-    float h2 = float(s >> 16) / 65535.0;
-    vec3 leafT = mix(vec3(0.82, 1.0, 0.70), vec3(1.18, 1.02, 0.62), h1) * mix(0.78, 1.18, h2);
+    // The seed's low 6 bits are the hue (blue-green .. yellow-green), the 7 above the brightness:
+    // read as they are, so whoever plants the trees can give neighbours kindred seeds (the
+    // globe's stands, forest.rs) or random ones (the forest scenes: every tree its own).
+    float h1 = float(seed & 63u) / 63.0;
+    float h2 = float((seed >> 6) & 127u) / 127.0;
+    vec3 leafT = mix(vec3(0.80, 1.0, 0.74), vec3(1.20, 1.02, 0.60), h1) * mix(0.72, 1.22, h2);
     return mix(vec3(1.0), leafT, leafiness);
 }
 

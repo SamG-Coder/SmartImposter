@@ -31,6 +31,7 @@ pub const TREE: usize = 0;
 pub const SHRUB: usize = 1;
 pub const GRASS: usize = 2;
 pub const CROP: usize = 3;
+pub const BUILT: usize = 4;
 pub const BARE: usize = 5;
 pub const WATER: usize = 7;
 pub const WETLAND: usize = 8;

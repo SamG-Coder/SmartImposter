@@ -1141,6 +1141,7 @@ impl App {
             cloud: [self.args.cloud_cover, if s.clouds { 1.0 } else { 0.0 }, if s.smooth_thin { 1.0 } else { 0.0 }, s.clock as f32],
             biome: biome::current().ground_packed(),
             lawn: [[0.0; 4]; 4], // (set by the renderer)
+            road: [[0.0; 4]; 3], // (set by the renderer)
             ..Default::default()
         };
         if let (Some(p), Some(geo)) = (s.pilot.as_mut(), s.geo.as_ref()) {

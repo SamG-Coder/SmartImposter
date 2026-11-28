@@ -589,6 +589,15 @@ pub struct GlobeScene {
     /// ocean waves (ocean.rs): the simulation thread, its textures (A, B per cascade), and the
     /// statistics of the frame they hold (Globals.ocean*)
     ocean: super::ocean::Ocean,
+    /// roads (roads.rs): the worker, both layouts' buffer on the GPU (two halves: a new layout is
+    /// copied into the idle half and shown from the next frame on), the layout shown, and the one
+    /// that has arrived / been copied this frame
+    roads: Option<super::roads::Roads>,
+    pub road_buf: Buffer,
+    pub road_now: Option<Arc<super::roads::Build>>,
+    road_half: u32,
+    road_wait: Option<Arc<super::roads::Build>>,
+    road_next: Option<Arc<super::roads::Build>>,
     /// the sea state and where the camera was when it was measured
     sea: Option<(DVec3, super::ocean::SeaState)>,
     pub ocean_tex: Vec<Image>,
@@ -641,6 +650,9 @@ impl GlobeScene {
             vk::Format::R8G8B8A8_UNORM,
             "weather map",
         )?;
+        // roads from OpenStreetMap (roads.rs; SI_ROADS=off: none, offline: only what is on the disk)
+        let road_worker = (std::env::var("SI_ROADS").map(|v| v != "off").unwrap_or(true)).then(|| super::roads::Roads::spawn(terrain.clone()));
+        let road_buf = gpu.create_buffer(2 * super::roads::HALF_WORDS as u64 * 4, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, MemoryLocation::GpuOnly, "roads")?;
         let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
         let table = gpu.create_buffer(MAX_TERRAIN_TILES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
         let recs = forest::CAPACITY as u64;
@@ -733,6 +745,12 @@ impl GlobeScene {
             elev_tex,
             weather_tex,
             ocean: super::ocean::Ocean::spawn(),
+            roads: road_worker,
+            road_buf,
+            road_now: None,
+            road_half: 0,
+            road_wait: None,
+            road_next: None,
             sea: None,
             clock: 0.0,
             ocean_tex: ocean_images(gpu)?,
@@ -806,6 +824,17 @@ impl GlobeScene {
     /// The ocean statistics for Globals.ocean0..2 (main.rgen).
     pub fn ocean_globals(&self) -> [[f32; 4]; 3] {
         self.ocean_stats
+    }
+
+    /// The roads for Globals.road (roads.glsl): the camera frame (`rot`: ECEF -> camera frame, the
+    /// camera at `cam`) -> metres east and north of the current layout's anchor.
+    pub fn road_globals(&self, cam: DVec3, rot: DMat3) -> [[f32; 4]; 3] {
+        let Some(b) = &self.road_now else { return [[0.0; 4]; 3] };
+        let row = |axis: DVec3| {
+            let r = rot * axis;
+            [r.x as f32, r.y as f32, r.z as f32, (cam - b.anchor).dot(axis) as f32]
+        };
+        [row(b.east), row(b.north), [self.road_half as f32, 1.0, super::roads::FINE, super::roads::COARSE]]
     }
 
     pub fn record(&mut self, gpu: &Gpu, cb: vk::CommandBuffer) {
@@ -1007,7 +1036,15 @@ impl GlobeScene {
 
     pub fn busy(&self) -> bool {
         // nothing requested before the first frames
-        self.frame < 2 || self.waiting > 0 || !self.tree_pending.is_empty() || !self.backlog.is_empty() || !self.tree_backlog.is_empty()
+        self.frame < 2
+            || self.waiting > 0
+            || !self.tree_pending.is_empty()
+            || !self.backlog.is_empty()
+            || !self.tree_backlog.is_empty()
+            // (a --shot also waits for the roads that are on the way)
+            || self.road_next.is_some()
+            || self.road_wait.is_some()
+            || self.roads.as_ref().is_some_and(|r| r.working())
     }
 
     /// Terrain tiles from the backlog into pool slots, as far as this frame's staging and scratch
@@ -1150,6 +1187,9 @@ impl GlobeScene {
         let lead = if lead.length() > MAX_LEAD { lead * (MAX_LEAD / lead.length()) } else { lead };
         let ahead = (lead.length() > MIN_LEAD).then(|| cam + lead);
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
+        if let Some(r) = self.roads.as_mut() {
+            r.at(cam);
+        }
         // (the fetch is measured again every 400 m the camera moves)
         if self.sea.is_none_or(|(p, _)| (p - cam).length() > 400.0) {
             self.sea = Some((cam, sea_state(cam, &self.terrain)));
@@ -1315,6 +1355,33 @@ impl GlobeScene {
     /// uploaded here are drawn from the next frame on. Returns CPU ms: terrain, trees.
     pub fn update(&mut self, gpu: &Gpu) -> Result<[f64; 2]> {
         self.begin_frame();
+        // roads: the layout copied last frame is the one shown from now on; a new one goes into
+        // the idle half of the buffer
+        if let Some(b) = self.road_next.take() {
+            if self.road_now.as_ref().is_none_or(|o| o.ways != b.ways) {
+                println!("Roads: {} OpenStreetMap ways round the camera ({} segments)", b.ways, b.segs.len() / super::roads::SEG_WORDS);
+            }
+            self.road_half ^= 1;
+            self.road_now = Some(b);
+        }
+        if let Some(b) = self.roads.as_ref().and_then(|r| r.take()).or(self.road_wait.take()) {
+            use super::roads::{HALF_WORDS, IDX_AT, SEG_AT};
+            let base = (self.road_half ^ 1) as u64 * HALF_WORDS as u64 * 4;
+            let parts = [(0u64, &b.cells), (IDX_AT as u64 * 4, &b.index), (SEG_AT as u64 * 4, &b.segs)];
+            let need: u64 = parts.iter().map(|p| p.1.len() as u64 * 4 + 256).sum();
+            if self.staging_used + need <= STAGING {
+                for (off, words) in parts {
+                    if words.is_empty() {
+                        continue;
+                    }
+                    let src = self.stage(bytemuck::cast_slice(words)).expect("staging");
+                    self.ops.push(Op::Copy { src, dst: self.road_buf.raw, dst_off: base + off, size: words.len() as u64 * 4 });
+                }
+                self.road_next = Some(b);
+            } else {
+                self.road_wait = Some(b); // (a full frame of uploads: next frame)
+            }
+        }
         // the newest ocean frame: its textures into the frame's staging, copied in record()
         if let Some(f) = self.ocean.take() {
             for (k, data) in f.tex.iter().enumerate() {
