@@ -584,6 +584,8 @@ pub struct GlobeScene {
     tree_backlog: VecDeque<TreeTile>,
     /// The whole ETOPO grid (R16_SNORM, mips) for per-pixel coastlines / relief far away.
     pub elev_tex: Image,
+    /// The weather map (weather.rs: cloud cover and type of the whole Earth), binding 38.
+    pub weather_tex: Image,
     /// ocean waves (ocean.rs): the simulation thread, its textures (A, B per cascade), and the
     /// statistics of the frame they hold (Globals.ocean*)
     ocean: super::ocean::Ocean,
@@ -631,6 +633,14 @@ impl GlobeScene {
             "etopo",
         )?;
         println!("Elevation grid on the GPU ({:.1}s)", t.elapsed().as_secs_f32());
+        let weather_tex = crate::textures::upload_with_mips(
+            gpu,
+            super::weather::W as u32,
+            super::weather::H as u32,
+            &super::weather::load_or_build(&terrain.etopo),
+            vk::Format::R8G8B8A8_UNORM,
+            "weather map",
+        )?;
         let ubo = gpu.create_buffer(256, vk::BufferUsageFlags::UNIFORM_BUFFER, MemoryLocation::CpuToGpu, "globe globals")?;
         let table = gpu.create_buffer(MAX_TERRAIN_TILES as u64 * 8, vk::BufferUsageFlags::STORAGE_BUFFER, MemoryLocation::CpuToGpu, "tile table")?;
         let recs = forest::CAPACITY as u64;
@@ -721,6 +731,7 @@ impl GlobeScene {
             backlog: VecDeque::new(),
             tree_backlog: VecDeque::new(),
             elev_tex,
+            weather_tex,
             ocean: super::ocean::Ocean::spawn(),
             sea: None,
             clock: 0.0,

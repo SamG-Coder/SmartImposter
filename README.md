@@ -998,7 +998,8 @@ cargo run --release
 | `SI_DLSS_JITTER` | DLSS jitter sign test: `+x` and / or `+y` pass the raw sample offset instead of the (measured sharpest) flipped one |
 | `SI_NO_SER` | disable Shader Execution Reordering |
 | `SI_VALIDATION` | same as `--validation` |
-| `SI_PROF_SKIP` | profiling: 1 no sun-shadow rays, 2 no AO rays, 3 neither |
+| `SI_PROF_SKIP` | profiling, a sum of: 1 no sun-shadow rays, 2 no AO rays, 4 no traced sky light, 8 no clouds in the view, 16 none in reflections, 32 no cloud shadows |
+| `SI_PROF_FRAMES=n` | with `--shot`: once the view has streamed in, hold it n more frames and time those alone (the profile line otherwise averages every frame since the start, loading included) |
 | `SI_TEX_MAX`, `SI_GROUND_TEX_MAX` | maximum plant / ground texture size (default 2048) |
 | `SI_GROUND_DIR` | Fab library cache with the ground surfaces |
 | `SI_IMPOSTOR_MB` | GPU memory for full impostor atlases (default 25% of VRAM) |

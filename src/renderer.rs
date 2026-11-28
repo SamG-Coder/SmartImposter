@@ -1186,6 +1186,8 @@ impl Renderer {
             // the aircraft (aircraft.rchit): its skin's three maps, its materials
             b(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 3, rt_all),
             b(37, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            // the globe's weather map (clouds.glsl weatherAt)
+            b(38, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -1793,6 +1795,12 @@ impl Renderer {
             (None, Some(d)) => (buf(&d.0), buf(&d.1), d.2.view),
             _ => unreachable!("globe bindings without resources"),
         };
+        let globe_weather = match (&self.globe, &self.globe_dummy) {
+            (Some(g), _) => g.weather_tex.view,
+            (None, Some(d)) => d.2.view,
+            _ => unreachable!("globe bindings without resources"),
+        };
+        let globe_weather = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_weather).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let globe_elev = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_elev).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let cloud_info = |v: vk::ImageView| [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(v).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let (cloud_shape, cloud_detail) = (cloud_info(self.cloud_noise[0].view), cloud_info(self.cloud_noise[1].view));
@@ -1863,6 +1871,7 @@ impl Renderer {
             w(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_detail),
             w(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ac_tex),
             w(37, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ac_mats),
+            w(38, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&globe_weather),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -2859,7 +2868,8 @@ impl Renderer {
             }
             _ => [[0.0; 4]; 4],
         };
-        // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
+        // Profiling switch (main.rgen), bits: SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 4 no
+        // traced sky light, 8 no clouds in the view, 16 none in reflections, 32 no cloud shadows.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
         let dlss = self.dlss_mode.is_some();
         if dlss {

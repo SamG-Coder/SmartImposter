@@ -412,6 +412,8 @@ struct State {
     geo: Option<Geo>,
     /// globe: frames a capture waited for streaming
     settle: u32,
+    /// SI_PROF_FRAMES: frames a settled --shot view is held and timed before the capture
+    prof_held: u32,
     /// `--tour`: the scripted camera tour in progress
     tour: Option<TourRun>,
     /// seconds of animation since the start (cloud evolution and drift)
@@ -642,6 +644,7 @@ impl App {
             haze: haze0,
             geo,
             settle: 0,
+            prof_held: 0,
             tour: None,
             clock: 0.0,
             pilot: None,
@@ -1148,6 +1151,17 @@ impl App {
         let capture = shot_due || s.capture_next;
         // globe: a view is only captured once its terrain and trees have streamed in
         let settling = self.args.bench_move == 0.0 && s.tour.is_none() && s.pilot.is_none() && s.r.globe.as_ref().map(|g| g.busy()).unwrap_or(false) && s.settle < 2000;
+        // SI_PROF_FRAMES=n: once the view has settled, hold it n more frames and time those alone
+        // (the profile otherwise averages every frame since the start, loading included)
+        let prof_frames = std::env::var("SI_PROF_FRAMES").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
+        let mut settling = settling;
+        if !settling && shot_due && s.prof_held < prof_frames {
+            if s.prof_held == 0 {
+                s.r.profile = Default::default();
+            }
+            s.prof_held += 1;
+            settling = true;
+        }
         let capture = capture && !settling;
         if let Some(gs) = s.r.globe.as_mut() {
             gs.clock = s.clock;

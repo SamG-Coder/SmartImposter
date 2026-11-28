@@ -10,3 +10,4 @@ pub mod ocean;
 pub mod scene;
 pub mod sky;
 pub mod tiles;
+pub mod weather;

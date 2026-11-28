@@ -320,7 +320,7 @@ void main() {
         vec3 E = sunColor();
         vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
         cFoot = pl.t * cloudPixAngle(); // (far ground: its cloud shadows from the blurred shapes)
-        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * cloudShadow(gq, L);
+        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * ((uint(g.params.x) & 32u) != 0u ? 1.0 : cloudShadow(gq, L, vec3(rnd(rng), rnd(rng), rnd(rng))));
         // (the forest scenes: the clouds' shadows drift over the land)
         float cloudSun = 1.0;
         if (!globe() && cloudsOn() && dbg == 0u) {
@@ -750,9 +750,10 @@ void main() {
                     refl = refl * Tr + hazeColor(R) * (1.0 - Tr);
                 }
             }
-            if (globeWater && cloudsOn()) {
+            if (globeWater && cloudsOn() && (profSkip & 16u) == 0u) {
                 // the clouds in the reflection (sky or far shore behind them)
-                vec4 cr = cloudMarch(p - g.planet.xyz, R, pl.t < 0.0 ? 1e30 : pl.t, 20, rnd(rng));
+                // (seen steeply the water mirrors a few percent of the sky: its clouds in fewer steps)
+                vec4 cr = cloudMarch(p - g.planet.xyz, R, pl.t < 0.0 ? 1e30 : pl.t, F < 0.06 ? 10 : 20, rnd(rng));
                 refl = refl * cr.a + cr.rgb;
             } else if (!globe() && cloudsOn()) {
                 refl = forestClouds(refl, p - g.planet.xyz, R, pl.t, 20, rnd(rng));
@@ -818,7 +819,7 @@ void main() {
         if (od > 1e-3) col = mix(col, vapourLight(), 1.0 - exp(-od));
     }
     // Clouds in front of whatever the ray found (sky or ground), jittered per pixel and frame.
-    if (globe() && dbg == 0u && cloudsOn()) {
+    if (globe() && dbg == 0u && cloudsOn() && (uint(g.params.x) & 8u) == 0u) {
         vec4 cl = cloudMarch(-g.planet.xyz, dir, pl.t < 0.0 ? 1e30 : pl.t, 40, rnd(rng));
         col = col * cl.a + cl.rgb;
     } else if (!globe() && dbg == 0u) {
