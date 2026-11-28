@@ -38,6 +38,8 @@ pub struct TreeInstance {
     pub seed: u16, // 13 bits, never 0 (0 = untinted, used by the baker)
     /// dryness tint 0..15 (rt.glsl plantDry; biome.rs Preset::dry_tint)
     pub dry: u8,
+    /// foliage look 0..15 (shared.glsl foliageLook; --foliage)
+    pub look: u8,
 }
 
 pub struct World {
@@ -159,6 +161,29 @@ fn land() -> &'static Land {
 
 /// The park (`--park`): gentle hills of lawn (lawn.rs) with groves and single trees, instead of
 /// the eroded landscape and its forest. Set by main before the world is built.
+/// Foliage looks (shared.glsl foliageLook), by `--foliage` name; index = look number.
+pub const FOLIAGE_LOOKS: [&str; 7] = ["natural", "lush", "mangrove", "boreal", "autumn", "spring", "dusty"];
+static FOLIAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+/// `--foliage <look>`: every tree and shrub takes this look instead of its biome's. False when the
+/// name is unknown.
+pub fn set_foliage(name: &str) -> bool {
+    match FOLIAGE_LOOKS.iter().position(|n| *n == name) {
+        Some(i) => {
+            FOLIAGE.store(i as u32, Ordering::Relaxed);
+            true
+        }
+        None => false,
+    }
+}
+/// The look `--foliage` set for every plant, if any.
+pub fn foliage() -> Option<u32> {
+    let v = FOLIAGE.load(Ordering::Relaxed);
+    (v != u32::MAX).then_some(v)
+}
+fn foliage_or(natural: u8) -> u8 {
+    foliage().map(|v| v as u8).unwrap_or(natural)
+}
+
 static PARK: AtomicBool = AtomicBool::new(false);
 pub fn set_park() {
     PARK.store(true, Ordering::Relaxed);
@@ -884,7 +909,7 @@ impl World {
                 let pos = Vec3::new(x + tw * 0.5 - (t.bmin.x + t.bmax.x) * 0.5, 0.0, z - depth * 0.5 - (t.bmin.z + t.bmax.z) * 0.5);
                 let xform = Affine3A::from_translation(pos);
                 let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
-                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, dry: 0 });
+                w.trees.push(TreeInstance { xform, center, variant: v as u8, seed: 0, dry: 0, look: 0 });
                 x += tw;
             }
             z -= depth + 2.0;
@@ -967,7 +992,7 @@ impl World {
             let seed = 1 + (rng.f() * 8190.0) as u16;
             canopy.push(world.trees.len());
             rng.next(); // (a draw kept so the forest's random sequence, and so the scene, stays the same)
-            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint });
+            world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint, look: foliage_or(0) });
             counts[0] += 1;
         }
         world.cover = world.splat_cover(trees, cat);
@@ -1124,7 +1149,7 @@ impl World {
                     let seed = 1 + (hs(gx, gz, 8) * 8190.0) as u16;
                     // (the boulder scans are mossy: in dry biomes they take the dry tint too)
                     let dry = bp.dry_tint;
-                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry });
+                    world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry, look: 0 });
                     counts[(layer as usize).min(4)] += 1;
                 }
             }
@@ -1209,7 +1234,7 @@ impl World {
                 let t = &trees[variant];
                 let center = xform.transform_point3((t.bmin + t.bmax) * 0.5);
                 let seed = 1 + (hs(gx, gz, 10) * 8190.0) as u16;
-                world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint });
+                world.trees.push(TreeInstance { xform, center, variant: variant as u8, seed, dry: bp.dry_tint, look: foliage_or(0) });
                 if in_grove {
                     grove_trees += 1;
                 } else {

@@ -120,7 +120,7 @@ const INST_HAS_MESH: u32 = 1;
 const INST_VARIANT_SHIFT: u32 = 24;
 /// InstInfo.flags: which part of its plant the instance is (from this bit up; tri.rchit's per-leaf
 /// colour variation).
-const INST_PART_SHIFT: u32 = 5;
+const INST_PART_SHIFT: u32 = 9;
 
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1607,7 +1607,7 @@ impl Renderer {
             } else {
                 c.keep += 1;
             }
-            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21);
+            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21) | ((t.look as u32 & 15) << 28);
             recs.push(PlantRecGpu::new(t.xform.matrix3.into(), t.xform.translation.into(), data));
             aabbs.push(plant_box(t, &pack.trees[t.variant as usize]));
         }
@@ -2512,8 +2512,8 @@ impl Renderer {
                 let center = t.center.to_array();
                 let rec = self.rec_of[i];
                 let tree = (rec & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
-                // tri.rahit: dissolve; bits 1..4 the biome's dryness tint (tri.rchit)
-                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1);
+                // tri.rahit: dissolve; bits 1..4 the biome's dryness tint, 5..8 the foliage look (tri.rchit)
+                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1) | ((t.look as u32 & 15) << 5);
                 for (pi, p) in variant.parts.iter().enumerate() {
                     let alpha = self.catalog.mesh_alpha[p.mesh as usize];
                     let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
@@ -2917,7 +2917,7 @@ impl Renderer {
                     states.insert(rec, state);
                     let seed = ((r[12] >> 8) & 0x1FFF) << 11;
                     let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT);
-                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1;
+                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1 | ((r[12] >> 28) & 15) << 5;
                     for (pi, p) in pack.trees[v].parts.iter().enumerate() {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };

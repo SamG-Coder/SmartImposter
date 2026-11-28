@@ -26,6 +26,10 @@ pub const TUNDRA: u8 = 11;
 pub const MEDITERRANEAN: u8 = 12;
 pub const DESERT: u8 = 13;
 pub const MANGROVES: u8 = 14;
+/// Not a RESOLVE biome: flooded grassland in the subtropics and tropics (the Everglades, the
+/// Pantanal, the Okavango, the Sudd), whose trees are tropical hammock, not temperate poplar and
+/// willow (forest.rs tree_biome).
+pub const SUBTROPICAL_FLOODED: u8 = 15;
 
 pub struct Biomes {
     w: usize,
@@ -66,14 +70,43 @@ impl Biomes {
         Ok(Some(Biomes { w, h, grid, biome_of }))
     }
 
-    fn eco(&self, lat: f64, lon: f64) -> u16 {
+    fn cell(&self, lat: f64, lon: f64) -> (usize, usize) {
         let x = (((lon + 180.0).rem_euclid(360.0)) / 360.0 * self.w as f64) as usize;
         let y = ((90.0 - lat) / 180.0 * self.h as f64) as usize;
-        self.grid[y.min(self.h - 1) * self.w + x.min(self.w - 1)]
+        (x.min(self.w - 1), y.min(self.h - 1))
     }
 
     /// Biome number at lat / lon (0 = none).
+    ///
+    /// The grid's ~3.7 km cells miss small islands, keys, spits and the land at a ragged coast
+    /// (their cell is "sea"): there the nearest biome within 3 cells (~11 km) stands, the most
+    /// common of the nearest ring, so Key Biscayne grows Florida's trees, not the "no data" list.
     pub fn biome(&self, lat: f64, lon: f64) -> u8 {
-        self.biome_of[self.eco(lat, lon) as usize]
+        let (x, y) = self.cell(lat, lon);
+        let b = self.biome_of[self.grid[y * self.w + x] as usize];
+        if b != 0 {
+            return b;
+        }
+        for r in 1..=3i64 {
+            let mut count = [0u8; 16];
+            for dy in -r..=r {
+                for dx in -r..=r {
+                    if dx.abs() != r && dy.abs() != r {
+                        continue; // the ring only
+                    }
+                    let yy = (y as i64 + dy).clamp(0, self.h as i64 - 1) as usize;
+                    let xx = (x as i64 + dx).rem_euclid(self.w as i64) as usize;
+                    let nb = self.biome_of[self.grid[yy * self.w + xx] as usize] as usize;
+                    if nb != 0 && nb < 16 {
+                        count[nb] = count[nb].saturating_add(1);
+                    }
+                }
+            }
+            let (best, n) = count.iter().enumerate().max_by_key(|(_, n)| **n).unwrap();
+            if *n > 0 {
+                return best as u8;
+            }
+        }
+        0
     }
 }

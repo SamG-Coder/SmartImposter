@@ -41,6 +41,12 @@ const float CLOUD_LIFT = 400.0;
 const float CLOUD_LOCAL_GAIN = 2.2;
 
 bool cloudsOn() { return g.cloud.y > 0.5; }
+
+// The size of a pixel (m) where the current sample lies: the noise is read at the mip of that
+// footprint (no speckle from noise finer than a pixel), and the fine erosion fades out where its
+// billows are smaller than a pixel (from far away, or high above, a cumulus field is its shapes).
+float cFoot = 0.0;
+float cloudPixAngle() { return 2.0 * g.camUp.w / float(gl_LaunchSizeEXT.y); }
 // the forest scenes (not the globe)
 bool cloudsLocal() { return g.planet.w < 0.5; }
 
@@ -84,11 +90,12 @@ vec3 cloudDrift(vec3 e, float speed) {
 // x low cover, y low type (0 stratus / stratocumulus, 0.5 cumulus, 1 cumulonimbus), z mid cover,
 // w high (cirrus) cover.
 // land fraction around u (~60 km blur): coastlines change the weather gradually, not at a line
-float landAt(vec3 u) {
+float landAtLod(vec3 u, float lod) {
     float lat = asin(clamp(u.z, -1.0, 1.0)), lon = atan(u.y, u.x);
-    float e = textureLod(cloudElev, vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI), 6.0).r * 32767.0;
+    float e = textureLod(cloudElev, vec2(lon / (2.0 * PI) + 0.5, 0.5 - lat / PI), lod).r * 32767.0;
     return smoothstep(-150.0, 150.0, e);
 }
+float landAt(vec3 u) { return landAtLod(u, 6.0); }
 vec4 weatherAt(vec3 e) {
     if (cloudsLocal()) {
         // The forest scenes: a fair day. Fields of cumulus with clearer lanes between them
@@ -122,10 +129,18 @@ vec4 weatherAt(vec3 e) {
     // weather systems: fronts and highs ~800 km, moving and changing over hours
     vec3 q = e / 800.0 + vec3(0.0, 0.0, cloudTime() / 20000.0);
     float sys = cnoise3(q) * 0.65 + cnoise3(q * 2.3 + 7.7) * 0.35;
+    // The subtropics are clear only where the air sinks dry: the continental interiors (deserts,
+    // land ~500 km around) and the cool eastern oceans (where the decks form). The trade-wind
+    // oceans and the humid coasts (Florida, the Caribbean, south China) have fair-weather cumulus
+    // most days (~20-35% cover).
+    float inland = smoothstep(0.5, 0.9, landAtLod(u, 9.0));
+    float dry = max(inland, deck);
+    float trade = subtrop * (1.0 - dry);
     // (broken cumulus on a typical day; overcast only where the systems and the climate agree)
     // (decks: closed cells, ~75% cover, not a featureless sheet)
-    float c = 0.16 + 0.25 * itcz + 0.22 * storm + 0.2 * polar + 0.5 * deck - 0.2 * subtrop * (1.0 - deck) - 0.2 * subtrop * landF;
-    c += (sys - 0.5) * (0.8 + 0.4 * storm);
+    // (the trades: the same scattered cumulus day after day, rarely overcast)
+    float c = 0.16 + 0.25 * itcz + 0.22 * storm + 0.2 * polar + 0.5 * deck - 0.4 * subtrop * dry - 0.05 * trade;
+    c += (sys - 0.5) * (0.8 + 0.4 * storm) * (1.0 - 0.55 * trade);
     c = clamp(c * (g.cloud.x / 0.45), 0.0, 1.0);
     // type: towering over the ITCZ (and over warm land on unsettled days), sheets in the decks and
     // the polar regions, cumulus in the trades, mixed in the storm tracks
@@ -153,18 +168,18 @@ float lowDensity(vec3 e, float h, vec4 W, bool detail) {
     vec3 p = e - cloudDrift(e, 8.0);
     float t = cloudTime();
     // cells of ~12 km that grow and decay (the tile's z axis is time)
-    float cell = textureLod(cloudShape, p / 48.0 + vec3(0.0, 0.0, t / 3000.0), 0.0).r;
+    float cell = textureLod(cloudShape, p / 48.0 + vec3(0.0, 0.0, t / 3000.0), max(log2(cFoot / 375.0), 0.0)).r;
     float cov = clamp(W.x + (cell - 0.5) * 0.8, 0.0, 1.0);
     if (cov <= 0.02) return 0.0;
     // height profile: flat base, rounded top; stratus thin and even, towers anvil-wide at the top
     float prof = smoothstep(0.0, 0.08 + 0.1 * W.y, hn) * smoothstep(1.0, mix(0.55, 0.75, W.y), hn);
     if (W.y > 0.85) prof = max(prof, smoothstep(0.82, 0.9, hn) * smoothstep(1.0, 0.94, hn)); // anvil
-    vec4 s = textureLod(cloudShape, p / 9.0 + vec3(0.0, 0.0, t / 1200.0), 0.0);
+    vec4 s = textureLod(cloudShape, p / 9.0 + vec3(0.0, 0.0, t / 1200.0), max(log2(cFoot / 70.0), 0.0));
     float wf = s.g * 0.625 + s.b * 0.25 + s.a * 0.125;
     float base = cremap(s.r, wf - 1.0, 1.0, 0.0, 1.0) * prof;
     float d = clamp(cremap(base, 1.0 - cov, 1.0, 0.0, 1.0), 0.0, 1.0) * cov;
     if (d <= 0.0 || !detail) return d;
-    vec3 dt = textureLod(cloudDetail, p / 1.2 + vec3(0.0, 0.0, t / 400.0), 0.0).rgb;
+    vec3 dt = textureLod(cloudDetail, p / 1.2 + vec3(0.0, 0.0, t / 400.0), max(log2(cFoot / 37.0), 0.0)).rgb;
     float df = dt.r * 0.625 + dt.g * 0.25 + dt.b * 0.125;
     float m = mix(df, 1.0 - df, clamp(hn * 8.0, 0.0, 1.0)); // wispy bases, billowy tops
     return clamp(cremap(d, m * 0.35, 1.0, 0.0, 1.0), 0.0, 1.0);
@@ -224,14 +239,16 @@ float dropletPhase(float mu, float k) {
 }
 
 // Optical depth (per unit extinction) towards the sun from x through one layer (coarse density).
-float lightDepthCloud(vec3 x, vec3 L, int layer, vec4 W) {
-    float od = 0.0, t = 0.0, dl = layer == 0 ? 60.0 : 120.0;
-    for (int j = 0; j < 5; ++j) {
+// `fine`: the first ~200 m through the detailed shape, so each billow shades the next one
+// towards the shadow side: the lit and shaded lobes that make a cumulus read as a solid.
+float lightDepthCloud(vec3 x, vec3 L, int layer, vec4 W, bool fine) {
+    float od = 0.0, t = 0.0, dl = layer == 0 ? 25.0 : 120.0;
+    for (int j = 0; j < 7; ++j) {
         t += dl;
         vec3 y = x + L * (t - 0.5 * dl);
         float h = length(y) - R_GROUND;
         vec3 e = cloudEarth(y);
-        float d = layer == 0 ? lowDensity(e, h, W, false) : midDensity(e, h, W, false);
+        float d = layer == 0 ? lowDensity(e, h, W, fine && j < 3) : midDensity(e, h, W, false);
         od += d * dl;
         dl *= 2.0;
     }
@@ -252,11 +269,10 @@ float cloudShadow(vec3 x, vec3 L) {
         float ds = (t1 - t0) / 8.0;
         for (int i = 0; i < 8; ++i) {
             vec3 y = x + L * (t0 + (float(i) + 0.5) * ds);
-            float d = lowDensity(cloudEarth(y), length(y) - R_GROUND, W, false);
-            // (the coarse density has thin fringes far beyond the cloud one sees, which the
-            // detail erodes away: the forest scenes' fair-weather clouds are mostly fringe, and
-            // their shadows are the clouds' own shape)
-            if (cloudsLocal()) d = clamp((d - 0.17) / 0.83, 0.0, 1.0);
+            // (with the detail: the coarse shape alone has thin fringes far beyond the cloud one
+            // sees, which the detail erodes away; without it the shadows spread well past the
+            // clouds and the sunlit gaps between them close)
+            float d = lowDensity(cloudEarth(y), length(y) - R_GROUND, W, true);
             od += d * ds * SIGMA_LOW;
         }
     }
@@ -362,7 +378,11 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
     vec3 L = g.sunDir.xyz;
     float mu = dot(rd, L);
     // phase, with Wrenninge's octaves (a = 0.5 attenuation, b = 0.5 contribution, c = 0.5 eccentricity)
-    float ph[3] = float[3](dropletPhase(mu, 1.0), dropletPhase(mu, 0.5), dropletPhase(mu, 0.25));
+    // (four octaves: each a later generation of bounces inside the cloud, which reaches deeper
+    // (extinction x 0.25 per octave), adds half as much and scatters more evenly. With fewer, or a
+    // gentler falloff, the sunlight dies within tens of metres and the clouds are lit by the sky
+    // alone: flat grey. A cumulus is bright to its core because light bounces through it.)
+    float ph[4] = float[4](dropletPhase(mu, 1.0), dropletPhase(mu, 0.5), dropletPhase(mu, 0.25), dropletPhase(mu, 0.125));
     float T = 1.0;
     vec3 S = vec3(0.0);
     float q = float(steps) / 40.0;
@@ -393,8 +413,15 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
         vec3 up = normalize(xm);
         vec3 Esun = g.sunDir.w * extinction(lightDepth(xm, L));
         if (sky.x < 0.0) {
+            // The sky's irradiance on the cloud: the whole dome, not the zenith alone (the
+            // horizon is two to three times brighter, and round the sun brighter still): the
+            // zenith, and 25 degrees up towards and away from the sun, weighted by the share of
+            // the dome each stands for. Once per ray.
             vec3 Tz;
-            sky = atmosphere(xm, up, 1e30, L, g.sunDir.w, Tz) * PI;
+            vec3 hz = normalize(L - up * dot(L, up) + vec3(1e-5, 0.0, 0.0));
+            vec3 dTo = normalize(hz * 0.906 + up * 0.423), dAway = normalize(-hz * 0.906 + up * 0.423);
+            sky = (0.40 * atmosphere(xm, up, 1e30, L, g.sunDir.w, Tz) + 0.33 * atmosphere(xm, dTo, 1e30, L, g.sunDir.w, Tz)
+                 + 0.27 * atmosphere(xm, dAway, 1e30, L, g.sunDir.w, Tz)) * PI;
         }
         if (cloudsLocal()) {
             // The forest scenes' light is not the atmosphere's: their own sun (main.rgen
@@ -402,14 +429,54 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
             Esun = vec3(1.0, 0.92, 0.80) * g.sunDir.w * smoothstep(-0.02, 0.1, L.y);
             sky = vec3(0.13, 0.20, 0.36) * 1.6;
         }
-        vec3 bounce = Esun * max(dot(up, L), 0.0) * 0.15;
+        // Light from below: the sunlit surface under the layer, sea ~0.06, land ~0.15, and where
+        // the layer is broken cumulus over more cloud, the cloud deck's ~0.6 (clouds light each
+        // other's flanks and bases)
+        vec4 Wm = mix(Wa, Wb, 0.5);
+        float below = mix(mix(0.06, 0.15, landAt(normalize(cloudEarth(xm)))), 0.6, clamp(Wm.x * 1.2, 0.0, 1.0) * (layer > 0 ? 1.0 : 0.4));
+        vec3 bounce = Esun * max(dot(up, L), 0.0) * below;
         float odPrev = -1.0;
         int lit = 0;
-        for (int i = 0; i < n; ++i) {
-            float ta = len * pow(float(i) / float(n), pw);
-            float ds = len * pow(float(i + 1) / float(n), pw) - ta;
-            float t = sl.x + ta + jitter * ds;
+        // Two speeds (Schneider, Nubis): long steps on the cheap shape alone through the clear air
+        // between clouds; on touching one, back up a long step and go on in short steps with the
+        // detail until the ray has been clear for a while. The detail goes where the clouds are,
+        // nothing is spent on the empty sky between cumulus, and the short step follows a pixel's
+        // footprint (fine on near clouds, ~100 m on the ones at the horizon). (The shape alone is
+        // never thinner than with the detail, which only erodes it: no cloud is stepped over.)
+        bool adaptive = !craft && layer < 2;
+        float dsBig = len / float(n);
+        float tc = sl.x + jitter * dsBig;
+        float tDone = sl.x; // marched in short steps up to here: never backed into again
+        int fine = 0;
+        for (int i = 0; i < (adaptive ? 3 * n : n); ++i) {
+            float t, ds;
+            if (adaptive) {
+                if (tc >= sl.y) break;
+                if (fine == 0) {
+                    vec3 xc = ro + rd * tc;
+                    vec4 Wc = mix(Wa, Wb, (tc - sl.x) / max(len, 1.0));
+                    float hc = length(xc) - R_GROUND;
+                    float dc = layer == 0 ? lowDensity(cloudEarth(xc), hc, Wc, false) : midDensity(cloudEarth(xc), hc, Wc, false);
+                    if (dc <= 0.0) {
+                        tc += dsBig;
+                        continue;
+                    }
+                    tc = max(tc - dsBig, tDone);
+                    fine = 8;
+                }
+                // (fewer steps asked for: the sky light's and reflections' rays, coarser)
+                ds = min(max(tc * 0.005, (layer == 0 ? 40.0 : 80.0) / q), dsBig * 0.5);
+                t = tc + jitter * ds;
+                tc += ds;
+                tDone = tc;
+                --fine;
+            } else {
+                float ta = len * pow(float(i) / float(n), pw);
+                ds = len * pow(float(i + 1) / float(n), pw) - ta;
+                t = sl.x + ta + jitter * ds;
+            }
             vec3 x = ro + rd * t;
+            cFoot = t * cloudPixAngle();
             float carve = 0.0;
             if (nc > 0 && layer < 2) x = wakeWarp(x, cand, nc, carve);
             float h = length(x) - R_GROUND;
@@ -418,6 +485,7 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
             float d = layer == 0 ? lowDensity(e, h, W, true) : layer == 1 ? midDensity(e, h, W, true) : highDensity(e, h, W);
             d *= 1.0 - carve;
             if (d <= 0.0) continue;
+            if (adaptive) fine = 8;
             if (tFirst < 0.0) tFirst = t;
             float hn = layer == 0 ? (h - LOW_BASE) / (lowTop(W.y) - LOW_BASE) : layer == 1 ? (h - MID_BASE) / (MID_TOP - MID_BASE) : 0.5;
             // sunlight: optical depth to the sun, Wrenninge's octaves
@@ -425,15 +493,16 @@ vec4 cloudScatter(vec3 ro, vec3 rd, float tmax, int steps, float jitter, out flo
             // sample reuses it)
             float odL;
             if (layer == 2) odL = d * 600.0;
-            else if ((lit & 1) == 1 && odPrev >= 0.0) odL = odPrev;
-            else odL = lightDepthCloud(x, L, layer, W);
+            // (coarse rays: one in four; faint fringe samples, which add little light, reuse it too)
+            else if (((lit & 1) == 1 || (q < 0.3 && (lit & 3) != 0) || d < 0.05) && odPrev >= 0.0) odL = odPrev;
+            else odL = lightDepthCloud(x, L, layer, W, q > 0.5);
             odPrev = odL;
             ++lit;
             float sunS = 0.0, a = 1.0, b = 1.0;
-            for (int o = 0; o < 3; ++o) {
+            for (int o = 0; o < 4; ++o) {
                 sunS += b * ph[o] * exp(-sigma * a * odL);
-                a *= 0.5;
-                b *= 0.5;
+                a *= 0.3;
+                b *= 0.45;
             }
             // powder: thin edges catch little light scattered towards the eye, seen away from the sun
             float powder = 1.0 - exp(-sigma * d * 400.0);

@@ -976,6 +976,7 @@ cargo run --release
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
 | `--gallery` | every variant on flat ground, one row per species |
 | `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
+| `--foliage natural\|lush\|mangrove\|boreal\|autumn\|spring\|dusty` | every tree and shrub takes this leaf colour instead of its biome's own (the globe gives the wet tropics a deep green, mangroves dark olive crowns, the taiga blue-green; autumn turns each tree gold, orange, red or keeps it green). Four bits per plant and one table lookup in the shader: no re-bake, no textures, nothing measurable per frame |
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |

@@ -68,10 +68,12 @@ impl Catalog {
 
 fn lod_for(height: f32) -> (f32, f32) {
     let lod_scale = (height / 16.0).clamp(0.25, 1.2);
+    // (grass and low shrubs to ~250-450 m: nearer, the meadow ended in bare ground a stone's throw
+    // away; they thin out over the last fifth, impostor.rint)
     let cull = if height < 2.0 {
-        120.0 + 60.0 * height
+        220.0 + 130.0 * height
     } else if height < 6.0 {
-        450.0
+        650.0
     } else {
         0.0
     };

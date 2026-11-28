@@ -333,7 +333,7 @@ impl Sim {
         // a new sea state: rebuild the spectra (the random phases stay: the sea changes, not jumps)
         let changed = match self.state {
             None => true,
-            Some(s) => (s.wind - st.wind).abs() > 0.3 || (s.dir[0] * st.dir[0] + s.dir[1] * st.dir[1]) < 0.995 || (s.swell_hs - st.swell_hs).abs() > 0.1,
+            Some(s) => (s.wind - st.wind).abs() > 0.3 || (s.dir[0] * st.dir[0] + s.dir[1] * st.dir[1]) < 0.995 || (s.swell_hs - st.swell_hs).abs() > 0.1 || (s.fetch / st.fetch).ln().abs() > 0.15,
         };
         if changed {
             // (the foam on the water and the breaking rate carry over)

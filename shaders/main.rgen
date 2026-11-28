@@ -319,6 +319,7 @@ void main() {
 
         vec3 E = sunColor();
         vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
+        cFoot = pl.t * cloudPixAngle(); // (far ground: its cloud shadows from the blurred shapes)
         if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * cloudShadow(gq, L);
         // (the forest scenes: the clouds' shadows drift over the land)
         float cloudSun = 1.0;
@@ -461,11 +462,42 @@ void main() {
             // sky light: the zenith radiance over the hemisphere (as globe.rgen did)
             vec3 up = normalize(gq), Tz;
             vec3 skyZ = atmosphere(gq, up, 1e30, L, g.sunDir.w, Tz);
+            vec3 skyZ0 = skyZ;
             // under the clouds less sky light reaches the ground (an overcast sky is dimmer)
             if (cloudsOn()) skyZ *= 1.0 - 0.45 * cloudCover(cloudEarth(gq));
             skyUp = skyZ * PI;
             ground = skyUp * 0.25;
             amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
+            // (water: its bed's light hardly shows; far land: the estimate above is as good there)
+            if (dbg == 0u && (profSkip & 4u) == 0u && (pl.flags & FLAG_WATER) == 0u && pl.t < 2500.0) {
+                // Sky light, ray traced through the clouds: one cosine-weighted direction per
+                // pixel and frame (TAA / DLSS average them), E = PI L. What the ground sees there:
+                // the sky behind the clouds dimmed by them, plus the light they scatter. Under a
+                // cumulus the ground is lit by its grey base, beside it by the blue sky and the
+                // cloud's sunlit flanks; an overcast sky is dim and even. Below the horizon: the
+                // sunlit land around (albedo ~0.12).
+                vec3 d2 = cosineSample(nDir, rng);
+                float du = dot(d2, up);
+                vec3 Ls;
+                if (du > 0.0) {
+                    // the clear sky there: the zenith's, paler and brighter towards the horizon
+                    // and round the sun (an atmosphere integral per ray costs as much as the clouds)
+                    float hz = 1.0 - du;
+                    Ls = skyZ0 * (1.0 + 0.9 * hz * hz) + skyZ0 * 1.5 * pow(max(dot(d2, L), 0.0), 8.0);
+                    Ls = mix(Ls, vec3(dot(Ls, vec3(0.2126, 0.7152, 0.0722))) * 1.1, 0.35 * hz * hz);
+                    if (cloudsOn()) {
+                        float tF;
+                        vec4 cl = cloudScatter(gq, d2, 1e30, 8, rnd(rng), tF);
+                        Ls = Ls * cl.a + cl.rgb;
+                    }
+                } else {
+                    Ls = (E * max(dot(L, up), 0.0) + skyZ * PI) * (0.12 / PI);
+                }
+                // (the sky by the sun is many times the zenith's: kept from turning into speckle)
+                float cap = 6.0 * dot(skyZ0, vec3(0.2126, 0.7152, 0.0722)) + 1e-4;
+                Ls *= min(1.0, cap / max(dot(Ls, vec3(0.2126, 0.7152, 0.0722)), 1e-6));
+                amb = Ls * PI;
+            }
         }
         col = direct + alb * amb * ao;
         if (craftHit && dbg == 0u) {
@@ -516,18 +548,42 @@ void main() {
             // it is shallow, a ray-traced reflection by Fresnel, and the sun glint.
             vec3 ps = org + dir * tSurf;
             if (under < 0.0) under = pl.t - tSurf;     // view path through the water
+            // The bed's sunlight comes through the surface up-sun of it (refracted, steeper than
+            // in air): shadows of reeds, trees and banks fall on the bed shifted by the depth, and
+            // not on the surface (water has no diffuse surface of its own). The shadow ray starts
+            // where that refracted sun ray enters the water.
+            float shBed = sh;
+            if (globeWater && wd < 4.0 && L.y > 0.0 && (profSkip & 1u) == 0u) {
+                vec3 upW = normalize(gq);
+                float cA = max(dot(L, upW), 0.02), sW = sqrt(max(1.0 - cA * cA, 0.0)) / 1.33;
+                vec3 hz = normalize(L - upW * cA + vec3(1e-5, 0.0, 0.0));
+                vec3 Lw = hz * sW + upW * sqrt(1.0 - sW * sW);
+                float bedDepth = max(wd - pl.wlevel, 0.0);
+                vec3 entry = p - upW * bedDepth + Lw * ((bedDepth + pl.wlevel) / dot(Lw, upW));
+                shBed = traceShadow(entry + upW * 0.03, L, 1.0e4, 0xFFu) * pl.sunVis;
+                col += alb / PI * E * max(ndl, 0.0) * (shBed - sh);
+            }
             float sunPath = wd / max(L.y, 0.08);       // sunlight down to the bed
             // clear, slightly green lake / river water; the sea is bluer and scatters more blue
             // the sea: clear deep blue over the open ocean (pure water absorbs red, barely blue),
             // greener and murkier over the shelf (plankton, dissolved matter); by floor depth
             float open = sea ? smoothstep(25.0, 200.0, wfloor) : 0.0;
-            vec3 SIGMA = sea ? mix(vec3(0.45, 0.075, 0.075), vec3(0.40, 0.055, 0.022), open) : vec3(0.42, 0.10, 0.075); // 1/m
+            // bays, lagoons and flats (the floor a few metres down): turbid green, with silt and
+            // plankton stirred off the bottom (Biscayne Bay, Florida Bay, the Wadden Sea)
+            // (the floor depth is ETOPO's 1.8 km cells, which blend a narrow bay with the sea
+            // outside: the measured enclosure around the camera says it is a bay too)
+            float bayK = clamp(g.ocean1.w - 1.0, 0.0, 1.0);
+            float bay = sea ? max(1.0 - smoothstep(4.0, 15.0, wfloor), bayK * (1.0 - smoothstep(25.0, 80.0, wfloor))) : 0.0;
+            vec3 SIGMA = sea ? mix(mix(vec3(0.45, 0.075, 0.075), vec3(0.40, 0.055, 0.022), open), vec3(0.50, 0.15, 0.24), bay) : vec3(0.42, 0.10, 0.075); // 1/m
             vec3 Tv = exp(-SIGMA * under);
             vec3 Ts = exp(-SIGMA * sunPath);
             // light scattered back out of deep water (globe: dark blue-green lakes, deep blue sea;
             // the bed shows only where it is shallow)
-            vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? mix(vec3(0.0018, 0.0075, 0.012), vec3(0.0007, 0.0032, 0.0135), open) : vec3(0.003, 0.010, 0.010);
-            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 + skyUp * 2.0);
+            vec3 body = !globe() ? vec3(0.012, 0.035, 0.032) : sea ? mix(mix(vec3(0.0018, 0.0075, 0.012), vec3(0.0007, 0.0032, 0.0135), open), vec3(0.0042, 0.0115, 0.0068), bay) : vec3(0.003, 0.010, 0.010);
+            // (the sunlight in the water is shaded with the bed: trees and banks cast their
+            // shadows into it, not only onto the glitter)
+            // (the water column under a shadow is lit from the sides: soft, and only partly dark)
+            vec3 inscat = body * (E * max(L.y, 0.0) * 0.5 * (0.35 + 0.65 * mix(shBed, sh, 0.5)) + skyUp * 2.0);
             vec3 refr = col * Ts * Tv + inscat * (1.0 - Tv);
             // flowing ripples: two octaves drifting at different speeds and directions, fixed to
             // the ground (globe: the Earth-fixed water coordinates, not the camera frame)
@@ -560,6 +616,13 @@ void main() {
                 }
                 gr = s / max(vec2(1.0) + jd, vec2(0.25));
                 lostVar += g.ocean0.y;
+                // gusts and lulls: patches ~150 m across where the wind blows harder or softer
+                // (cat's paws), drifting downwind; the chop and its glitter follow them, so the
+                // surface never reads as one repeating texture
+                vec2 wdg = g.ocean1.xy;
+                float gust = 0.45 + 0.9 * smoothstep(0.25, 0.8, vnoise(q * 0.007 - wdg * tm * 0.035) * 0.65 + vnoise(q * 0.021 + 3.1 - wdg * tm * 0.1) * 0.35);
+                gr *= gust;
+                lostVar *= gust * gust;
                 // whitecaps where the crests fold (ocean.rs: the coverage for the wind)
                 waveFoam = max(oA(1, x, lod.y).w * oAmp.y, oA(2, x, lod.z).w * oAmp.z);
             } else if (globeWater) {
@@ -605,12 +668,15 @@ void main() {
             if (globeWater) {
                 vec3 wup = normalize(gq);
                 n = normalize(wup - wtan * gr.x - wvd * gr.y);
-                // lapping foam: a thin, broken line that runs up and back at the waterline
+                // lapping foam at the waterline, as much as there are waves to break: a bay's
+                // chop leaves a thin broken line, the open coast a wide swash. White lace with
+                // holes (bubbles of 10-30 cm), running up and back.
                 float sdW = wq.z;
-                float swash = 0.5 + 0.35 * sin(tm * 0.9 + vnoise(q * 0.12) * 6.2831853);
-                float band = smoothstep(-swash - 0.8, -swash * 0.4, sdW) * (1.0 - smoothstep(-0.1, 0.15, sdW));
-                float brk = smoothstep(0.42, 0.78, vnoise(q * 1.6 + vec2(0.3, 0.5) * tm) * 0.6 + vnoise(q * 5.5 - vec2(0.2, 0.4) * tm) * 0.4);
-                foam = band * brk * (sea ? 0.9 : 0.35) * smoothstep(300.0, 60.0, tSurf);
+                float waveA = seaFFT ? clamp(g.ocean0.z / 0.8, 0.0, 1.0) : 0.15;
+                float swash = (0.25 + 0.9 * waveA) * (0.6 + 0.4 * sin(tm * 0.9 + vnoise(q * 0.12) * 6.2831853));
+                float band = smoothstep(-swash - 0.3 - 1.5 * waveA, -swash * 0.3, sdW) * (1.0 - smoothstep(-0.05, 0.1, sdW));
+                float laceS = smoothstep(0.55, 0.78, vnoise(q * 6.0 + vec2(0.3, 0.5) * tm) * 0.55 + vnoise(q * 15.0 - vec2(0.2, 0.4) * tm) * 0.45);
+                foam = band * laceS * (sea ? 0.3 + 0.65 * waveA : 0.25) * smoothstep(200.0, 40.0, tSurf);
                 // whitecaps (FFT sea): a breaking crest is a lace of bubbles and streaks, not a
                 // solid patch; finer near the camera, an even mix further out (mips)
                 // fresh foam on the breaking crest is dense and bright; older foam trails behind
@@ -698,14 +764,17 @@ void main() {
                 // sea's unresolved slope variance (Cox-Munk): the glitter path widens with the
                 // wind as it does over the real sea. (The reflection rays skip the sun disc's
                 // share: the lobe carries it.)
-                float m2 = max(lostVar, 2e-4);
+                // (only the slopes below a pixel widen the lobe, and of those only part: the
+                // resolved facets make the glitter, each a sparkle, not one milky sheet)
+                float m2 = max(lostVar * 0.4, 2e-4);
                 float NdH = max(dot(n, H), 1e-3), NdV = max(dot(n, -dir), 1e-3), c2 = NdH * NdH;
                 float D = exp((c2 - 1.0) / (c2 * m2)) / (PI * m2 * c2 * c2);
                 float Fh = 0.02 + 0.98 * pow(1.0 - max(dot(H, -dir), 0.0), 5.0);
                 glint = dot(n, L) > 0.0 ? D * Fh / (4.0 * NdV) / max(F, 1e-3) : 0.0;
             }
             col = mix(col, refl, F) + E * glint * F * sh;
-            vec3 foamCol = vec3(0.75) * (E * max(L.y, 0.0) / PI * sh + skyUp);
+            // (white: lit by the sun and the whole sky, not tinted blue by the zenith)
+            vec3 foamCol = vec3(0.78) * (E * max(L.y, 0.0) / PI * sh + vec3(dot(skyUp, vec3(0.2126, 0.7152, 0.0722))));
             col = mix(col, foamCol, foam * 0.6);
             gbN = n;
             gbAlb = mix(vec3(0.02, 0.04, 0.04), vec3(0.75), foam);

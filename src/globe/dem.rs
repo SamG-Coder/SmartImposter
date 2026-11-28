@@ -345,10 +345,29 @@ impl Terrain {
 
     /// Elevation (m): 30 m data where its tiles exist, ETOPO elsewhere. GLO-30 flattens the sea to
     /// exactly 0; there ETOPO's seafloor is used instead.
+    ///
+    /// GLO-30 is a surface model: the radar's echo comes off the top of what covers the ground,
+    /// and over a forest that is the canopy (the mangroves at Oleta River read 8-13 m on ground
+    /// that lies 1-2 m above the bay). The globe grows its own trees, so the 30 m heights are
+    /// lowered by the biome's typical canopy excess times the tree cover there (WorldCover): the
+    /// trees stand on the ground, a forest is not a raised carpet that slopes into the water under
+    /// its trees, and their trunks meet the waterline. Land stays above the water it borders.
     pub fn height(&self, lat: f64, lon: f64) -> f32 {
         let coarse = self.etopo.height(lat, lon);
         match self.glo.height(lat, lon) {
-            Some(fine) if !(fine == 0.0 && coarse < 0.0) => fine,
+            Some(fine) if !(fine == 0.0 && coarse < 0.0) => {
+                if fine <= 0.0 {
+                    return fine;
+                }
+                // (the cover of the ~120 m around, squared: the radar's 30 m cells only rise to the
+                // canopy over closed forest; a clump in a meadow, or a forest's edge, barely shows
+                // in them, and taking its full height off dug a pit under it)
+                let tree = self.cover.fractions(lat, lon, 120.0).map(|f| f[super::landcover::TREE]).unwrap_or(0.0);
+                if tree <= 0.0 {
+                    return fine;
+                }
+                (fine - tree * tree * canopy_excess(self.biome(lat, lon), lat)).max(fine.min(0.5))
+            }
             _ => coarse,
         }
     }
@@ -375,5 +394,25 @@ impl Terrain {
             return true; // huge box (or across the date line): refine and decide further down
         }
         (a0..=a1).any(|a| (o0..=o1).any(|o| self.glo.has(a, o)))
+    }
+}
+
+/// How far above the ground a surface model (GLO-30, X-band radar) reads over closed forest of a
+/// biome (m): about two thirds of the canopy height (the radar enters the crowns a little).
+fn canopy_excess(biome: u8, lat: f64) -> f32 {
+    use super::biomes as b;
+    match biome {
+        b::MANGROVES => 8.0,
+        b::FLOODED if lat.abs() < 31.0 => 9.0,
+        b::FLOODED => 10.0,
+        b::TROPICAL_MOIST => 20.0,
+        b::TROPICAL_DRY | b::TROPICAL_CONIFER => 13.0,
+        b::TEMPERATE_BROADLEAF => 15.0,
+        b::TEMPERATE_CONIFER => 18.0,
+        b::BOREAL => 11.0,
+        b::MONTANE => 9.0,
+        b::SAVANNA | b::MEDITERRANEAN | b::TEMPERATE_GRASSLAND => 6.0,
+        b::TUNDRA | b::DESERT => 3.0,
+        _ => 8.0,
     }
 }

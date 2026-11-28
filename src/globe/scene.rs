@@ -303,10 +303,38 @@ fn ocean_images(gpu: &Gpu) -> Result<Vec<Image>> {
     Ok(v)
 }
 
-/// The sea state under the camera (ocean.rs): the climatological wind there, in the patch
-/// coordinates (the cube face's u, v: the texture coordinates the water shading uses), a swell
-/// from a little off the wind, an open-sea fetch.
-fn sea_state(cam: DVec3) -> super::ocean::SeaState {
+/// Open water (m) from the ground point `d` (unit) towards the bearing `toward` ((east, north)
+/// unit), up to `max`: how far a wind or a swell has run over water before reaching here. The 10 m
+/// WorldCover water map where it has data, else ETOPO (sea where the relief is below 0). The
+/// samples spread with distance (25 m near, 4 km far), at a resolution to match.
+fn open_water(terrain: &Terrain, d: DVec3, toward: [f32; 2], max: f64) -> f64 {
+    let east = DVec3::Z.cross(d).normalize_or(DVec3::X);
+    let north = d.cross(east);
+    let dirv = (east * toward[0] as f64 + north * toward[1] as f64).normalize_or(east);
+    let (mut s, mut step) = (25.0f64, 25.0f64);
+    while s < max {
+        let (lat, lon) = tiles::lat_lon((d + dirv * (s / R_EARTH)).normalize());
+        let land = match terrain.cover.water_frac(lat, lon, step) {
+            Some(w) => w < 0.5,
+            None => terrain.height_at(lat, lon, 1000.0) > 0.0,
+        };
+        if land {
+            return s;
+        }
+        s += step;
+        step = (step * 1.25).min(4000.0);
+    }
+    max
+}
+
+/// The sea state for the water around the camera (ocean.rs): the climatological wind there, in
+/// the patch coordinates (the cube face's u, v: the texture coordinates the water shading uses);
+/// the fetch, how far that wind has blown over open water (a bay, a lagoon, a river: a few
+/// hundred metres to kilometres, short steep chop; the open sea: a fully developed sea); and a
+/// swell from a little off the wind only as far as the open ocean reaches in (none in a bay
+/// behind barrier islands). Without the fetch every bay had the open Atlantic's 100 m swells,
+/// and the land beside them looked like a model.
+fn sea_state(cam: DVec3, terrain: &Terrain) -> super::ocean::SeaState {
     let d = cam.normalize();
     let (lat, lon) = tiles::lat_lon(d);
     let (wind, en) = super::ocean::wind_at(lat, lon);
@@ -322,13 +350,38 @@ fn sea_state(cam: DVec3) -> super::ocean::SeaState {
         [p.x as f32, p.y as f32]
     };
     let ang = (en[1] as f64).atan2(en[0] as f64) + 0.5;
+    let swell_to = [ang.cos() as f32, ang.sin() as f32];
+    // the water in view: under the camera, or (over land) the nearest of a ring around it
+    let water = |p: DVec3| {
+        let (lat, lon) = tiles::lat_lon(p);
+        terrain.cover.water_frac(lat, lon, 50.0).map(|w| w > 0.5).unwrap_or(terrain.height_at(lat, lon, 1000.0) <= 0.0)
+    };
+    let mut at = d;
+    if !water(d) {
+        'ring: for r in [300.0, 800.0, 2000.0] {
+            for k in 0..8 {
+                let a = k as f64 * std::f64::consts::FRAC_PI_4;
+                let p = (d + (east * a.cos() + north * a.sin()) * (r / R_EARTH)).normalize();
+                if water(p) {
+                    at = p;
+                    break 'ring;
+                }
+            }
+        }
+    }
+    let fetch = open_water(terrain, at, [-en[0], -en[1]], 300_000.0);
+    let exposed = open_water(terrain, at, [-swell_to[0], -swell_to[1]], 200_000.0);
+    let s = |e0: f64, e1: f64, x: f64| {
+        let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+        (t * t * (3.0 - 2.0 * t)) as f32
+    };
     super::ocean::SeaState {
         wind,
         dir: to_patch(en),
-        fetch: 300_000.0,
-        swell_hs: 0.5 + 0.09 * wind,
+        fetch: fetch.max(1500.0) as f32,
+        swell_hs: (0.5 + 0.09 * wind) * s(3_000.0, 60_000.0, exposed),
         swell_t: 9.0 + 0.25 * wind,
-        swell_dir: to_patch([ang.cos() as f32, ang.sin() as f32]),
+        swell_dir: to_patch(swell_to),
     }
 }
 
@@ -534,6 +587,8 @@ pub struct GlobeScene {
     /// ocean waves (ocean.rs): the simulation thread, its textures (A, B per cascade), and the
     /// statistics of the frame they hold (Globals.ocean*)
     ocean: super::ocean::Ocean,
+    /// the sea state and where the camera was when it was measured
+    sea: Option<(DVec3, super::ocean::SeaState)>,
     pub ocean_tex: Vec<Image>,
     ocean_stats: [[f32; 4]; 3],
     /// globe.rchit globals (binding 30) and terrain tile table (binding 31)
@@ -667,6 +722,7 @@ impl GlobeScene {
             tree_backlog: VecDeque::new(),
             elev_tex,
             ocean: super::ocean::Ocean::spawn(),
+            sea: None,
             clock: 0.0,
             ocean_tex: ocean_images(gpu)?,
             ocean_stats: [[0.0; 4]; 3],
@@ -1083,7 +1139,11 @@ impl GlobeScene {
         let lead = if lead.length() > MAX_LEAD { lead * (MAX_LEAD / lead.length()) } else { lead };
         let ahead = (lead.length() > MIN_LEAD).then(|| cam + lead);
         let eye = cam.length() - tiles::ground_radius(&self.terrain, cam);
-        self.ocean.post(sea_state(cam), self.clock as f32);
+        // (the fetch is measured again every 400 m the camera moves)
+        if self.sea.is_none_or(|(p, _)| (p - cam).length() > 400.0) {
+            self.sea = Some((cam, sea_state(cam, &self.terrain)));
+        }
+        self.ocean.post(self.sea.unwrap().1, self.clock as f32);
         self.range = forest::tree_range(eye);
         let mut near = forest::under_tiles(cam);
         near.extend(forest::tiles_near(cam, self.range));
@@ -1254,7 +1314,9 @@ impl GlobeScene {
             let s = f.state;
             self.ocean_stats = [
                 [s.wind, f.residual, f.amplitude, super::ocean::CHOP],
-                [s.dir[0], s.dir[1], f.coverage, 1.0],
+                // (w: 1 once a frame is in, plus how enclosed the water is: 1 in a bay or lagoon
+                // with a few km of fetch, 0 on the open sea; main.rgen colours bays turbid green)
+                [s.dir[0], s.dir[1], f.coverage, 1.0 + 1.0 - ((s.fetch - 4000.0) / 36000.0).clamp(0.0, 1.0)],
                 f.slope_var,
             ];
         }

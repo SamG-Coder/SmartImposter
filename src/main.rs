@@ -324,6 +324,11 @@ fn parse_args() -> Args {
                 i -= 1;
             }
             "--walk" => a.walk = Some(next != "off"),
+            "--foliage" => {
+                if !world::set_foliage(&next) {
+                    eprintln!("--foliage: one of {}", world::FOLIAGE_LOOKS.join(", "));
+                }
+            }
             "--test-flight" => {
                 a.test_flight = true;
                 a.globe = true;

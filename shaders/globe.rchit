@@ -137,7 +137,8 @@ float organic(float a, float n, float sharp) {
 // Ground albedo, ambient occlusion and normal from the land cover fractions.
 // `bed` (0..1): the bottom of a lake, river or the sea; `shore`: the strip of land at the water.
 // `biome`: RESOLVE biome number (biomes.rs); `sea`: the water at the shore / over the bed is sea.
-vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, int biome, bool sea, out float ao) {
+// `coast` (0..1): within a beach's width of the water (only there is bare ground a beach).
+vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, float coast, int biome, bool sea, out float ao) {
     float slope = 1.0 - max(dot(n, up), 0.0);
     vec2 q = uvm;
     float desert = biome == 13 ? 1.0 : 0.0;
@@ -243,8 +244,18 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
     // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
     float bareFlat = w[7];
-    // bare ground at sea level is a beach: sand, whatever the biome
-    if (sea && bed == 0.0) { w[12] += bareFlat * 0.85; w[7] = bareFlat * 0.15; bareFlat = 0.0; }
+    // bare ground along the sea is a beach: sand, whatever the biome. Only by the water: low land
+    // inland (all of south Florida is under 4 m) is not a beach, and sand there made white blots.
+    if (sea && bed == 0.0) {
+        float bch = bareFlat * coast;
+        w[12] += bch * 0.85;
+        w[7] -= bch * 0.85;
+        bareFlat -= bch;
+    }
+    // wet lowlands of the tropics and subtropics (the Everglades, mangrove swamps): bare ground is
+    // grey marl and mud, not gravel
+    float wetTrop = (biome == 9 && abs(degrees(asin(clamp(normalize(mat3(gl_WorldToObjectEXT) * up).z, -1.0, 1.0)))) < 31.0) || biome == 14 ? 1.0 : 0.0;
+    w[20] += bareFlat * wetTrop * 0.65;
     w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
     w[14] = bareFlat * (desert * (0.45 - 0.3 * nB) + hot * 0.4 + med * 0.8);
     w[15] += bareFlat * hot * 0.5;
@@ -256,7 +267,7 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[1] += moss * 0.5;                                                           // moss, sedge
     w[2] += moss * 0.25;                                                          // sedge
     w[3] += moss * 0.1;
-    w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
+    w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9 - wetTrop * 0.65, 0.0);
     w[8] *= 1.0 - 0.6 * arctic;
     // towns: grey gravel (never the biome's red earth or sand), on dry land half the local soil
     w[7] += built * 0.55 * (1.0 - 0.5 * dryLand) * soil;
@@ -443,15 +454,27 @@ void main() {
     // (inside the mapped water but above the level: by the height over the water)
     float shore = water ? 0.0 : smoothstep(band, band * 0.25, sd);
     int biome = int(biomeF + 0.5);
-    bool seaSide = elev < 4.0; // the water at this shore / over this bed is the sea
+    // the water at this shore / over this bed is the sea: low land with the ocean within ~15 km
+    // (ETOPO blurred: below sea level there). Low land alone is not enough: all of south Florida
+    // is under 4 m, and every pond in the Everglades got a beach.
+    bool seaSide = elev < 4.0 && elevAt(elevUV(upE), 3.0) < 0.5;
     if (water) {
         n = up;
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, 1.0, biome, !lake, ao);
     } else if (cover) {
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
-        // wet: right at the mapped water, and just above the water level along the contour
-        float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd);
+        float coast = smoothstep(28.0 + 12.0 * nW0, 8.0, sd);
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, coast, biome, seaSide, ao);
+        // wet: right at the mapped water, and just above the water level along the contour; on a
+        // sea beach the swash keeps a wider band of sand dark and wet
+        float damp = max(smoothstep(1.2 + 0.6 * nW0, 0.0, sd), seaSide ? 0.75 * smoothstep(4.5 + 3.0 * nW0, 0.6, sd) : 0.0);
         alb *= mix(1.0, 0.55, damp);
+        if (seaSide) {
+            // the wrack line: seaweed and driftwood left at the last high tide, a broken dark band
+            // a few metres up the beach (not where the trees stand)
+            float at = 7.5 + 4.0 * (fbmN(uvm * 0.05 + 9.0, 2) - 0.5);
+            float wr = smoothstep(1.4, 0.2, abs(sd - at)) * smoothstep(0.45, 0.7, fbmN(uvm * 0.7 + 3.0, 2)) * (1.0 - A.x);
+            alb = mix(alb, alb * vec3(0.42, 0.38, 0.30), wr * 0.85);
+        }
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
     }
