@@ -27,7 +27,7 @@ void main() {
     vec4 v = unpackUnorm4x8(hit.vis);
 
     pl.albedo = alb * treeTint(plantSeed(pr), leafiness);
-    pl.albedo = mix(pl.albedo, dryTint(pl.albedo, plantDry(pr)), leafiness);
+    pl.albedo = mix(pl.albedo, foliageLook(dryTint(pl.albedo, plantDry(pr)), plantLook(pr), plantSeed(pr)), leafiness);
     pl.t = gl_HitTEXT;
     // Normal spread (length of the averaged baked normal, bake.rgen). Trees: the normal is
     // shortened to it, so main.rgen's Lambert term gives the mean diffuse over the leaves while

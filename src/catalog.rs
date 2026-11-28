@@ -68,10 +68,12 @@ impl Catalog {
 
 fn lod_for(height: f32) -> (f32, f32) {
     let lod_scale = (height / 16.0).clamp(0.25, 1.2);
+    // (grass and low shrubs to ~250-450 m: nearer, the meadow ended in bare ground a stone's throw
+    // away; they thin out over the last fifth, impostor.rint)
     let cull = if height < 2.0 {
-        120.0 + 60.0 * height
+        220.0 + 130.0 * height
     } else if height < 6.0 {
-        450.0
+        650.0
     } else {
         0.0
     };
@@ -175,7 +177,7 @@ pub fn load(dir: &str, fallback: &str, fallback_tex: &str, only: Option<&str>) -
 
 /// Ground layers in shader order (tri.rchit): Fab library folder name prefix of each Megascans
 /// surface (`<Name>-<first 8 hex digits of the Fab listing id>`).
-pub const GROUND_LAYERS: [&str; 26] = [
+pub const GROUND_LAYERS: [&str; 27] = [
     "Forest_Floor-cf8af196",     // (a second Forest_Floor scan exists: pin this one)
     "Mossy_Grass",
     "Uncut_Grass",
@@ -204,6 +206,7 @@ pub const GROUND_LAYERS: [&str; 26] = [
     "Icelandic_Lava_Sand",   // 23 volcanic sand
     "Sparse_Grassy_Soil",    // 24 steppe
     "Dried_Grass-57a98bb5",  // 25 savanna, dry grassland
+    "Asphalt_Road",          // 26 the roads (roads.glsl; RealisticDrive's asphalt scan)
 ];
 
 /// Ground surfaces from the Fab library cache (Quixel scans exported as glTF with UE textures).

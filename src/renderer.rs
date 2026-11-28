@@ -29,7 +29,7 @@ const OCEAN_TEX: usize = crate::globe::ocean::CASCADES * 2;
 /// Leaf transmission relative to albedo (calibrated so Black Alder keeps its earlier back-lit look).
 const TRANS_GAIN: f32 = 8.0;
 /// Ground material textures (binding 16). Must match shared.glsl.
-pub const MAX_GROUND_TEX: usize = 81;
+pub const MAX_GROUND_TEX: usize = 84;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable, Default)]
@@ -73,6 +73,10 @@ pub struct Globals {
     /// edge, views (azimuths, slopes); texels per view, gutter texels, atlas levels, atlas slot;
     /// slope of the steepest and the flattest views.
     pub lawn: [[f32; 4]; 4],
+    /// Globe mode, the roads (globe/roads.rs, roads.glsl): a point of the camera frame -> metres
+    /// east (row 0) and north (row 1) of the roads' anchor; row 2: x which half of the buffer is
+    /// current, y 1 once roads are loaded, zw the grids' cell sizes
+    pub road: [[f32; 4]; 3],
     /// `--test-flight` (the aircraft; main.rgen, aircraft.glsl, clouds.glsl): the renderer's frame
     /// -> the aircraft's model frame (rows, w the translation)
     pub ac_inv: [[f32; 4]; 3],
@@ -120,7 +124,7 @@ const INST_HAS_MESH: u32 = 1;
 const INST_VARIANT_SHIFT: u32 = 24;
 /// InstInfo.flags: which part of its plant the instance is (from this bit up; tri.rchit's per-leaf
 /// colour variation).
-const INST_PART_SHIFT: u32 = 5;
+const INST_PART_SHIFT: u32 = 9;
 
 /// Per-tree LOD state.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1186,6 +1190,10 @@ impl Renderer {
             // the aircraft (aircraft.rchit): its skin's three maps, its materials
             b(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 3, rt_all),
             b(37, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            // the globe's roads (roads.glsl)
+            b(39, vk::DescriptorType::STORAGE_BUFFER, 1, rt_all),
+            // the globe's weather map (clouds.glsl weatherAt)
+            b(38, vk::DescriptorType::COMBINED_IMAGE_SAMPLER, 1, rt_all),
         ];
         let set_layout = unsafe {
             gpu.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None)?
@@ -1607,7 +1615,7 @@ impl Renderer {
             } else {
                 c.keep += 1;
             }
-            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21);
+            let data = t.variant as u32 | ((t.seed as u32 & 0x1FFF) << 8) | ((t.dry as u32 & 15) << 21) | ((t.look as u32 & 15) << 28);
             recs.push(PlantRecGpu::new(t.xform.matrix3.into(), t.xform.translation.into(), data));
             aabbs.push(plant_box(t, &pack.trees[t.variant as usize]));
         }
@@ -1793,6 +1801,17 @@ impl Renderer {
             (None, Some(d)) => (buf(&d.0), buf(&d.1), d.2.view),
             _ => unreachable!("globe bindings without resources"),
         };
+        let globe_roads = match (&self.globe, &self.globe_dummy) {
+            (Some(g), _) => buf(&g.road_buf),
+            (None, Some(d)) => buf(&d.1),
+            _ => unreachable!("globe bindings without resources"),
+        };
+        let globe_weather = match (&self.globe, &self.globe_dummy) {
+            (Some(g), _) => g.weather_tex.view,
+            (None, Some(d)) => d.2.view,
+            _ => unreachable!("globe bindings without resources"),
+        };
+        let globe_weather = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_weather).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let globe_elev = [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(globe_elev).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let cloud_info = |v: vk::ImageView| [vk::DescriptorImageInfo::default().sampler(self.mat_sampler).image_view(v).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
         let (cloud_shape, cloud_detail) = (cloud_info(self.cloud_noise[0].view), cloud_info(self.cloud_noise[1].view));
@@ -1863,6 +1882,8 @@ impl Renderer {
             w(35, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&cloud_detail),
             w(36, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&ac_tex),
             w(37, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ac_mats),
+            w(38, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&globe_weather),
+            w(39, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&globe_roads),
         ];
         let gbuf = [img(self.tg.viewz.view), img(self.tg.motion.view), img(self.tg.nrm.view), img(self.tg.diff.view), img(self.tg.spec.view)];
         for (k, info) in gbuf.iter().enumerate() {
@@ -2512,8 +2533,8 @@ impl Renderer {
                 let center = t.center.to_array();
                 let rec = self.rec_of[i];
                 let tree = (rec & 0xFF_FFFF) | ((t.variant as u32) << INST_VARIANT_SHIFT);
-                // tri.rahit: dissolve; bits 1..4 the biome's dryness tint (tri.rchit)
-                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1);
+                // tri.rahit: dissolve; bits 1..4 the biome's dryness tint, 5..8 the foliage look (tri.rchit)
+                let band = if state == Lod::Both { INST_HAS_MESH } else { 0 } | ((t.dry as u32 & 15) << 1) | ((t.look as u32 & 15) << 5);
                 for (pi, p) in variant.parts.iter().enumerate() {
                     let alpha = self.catalog.mesh_alpha[p.mesh as usize];
                     let (flags, sbt) = if state == Lod::Mesh && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };
@@ -2859,7 +2880,8 @@ impl Renderer {
             }
             _ => [[0.0; 4]; 4],
         };
-        // Profiling switch (main.rgen): SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 3 neither.
+        // Profiling switch (main.rgen), bits: SI_PROF_SKIP=1 no sun shadow rays, 2 no AO rays, 4 no
+        // traced sky light, 8 no clouds in the view, 16 none in reflections, 32 no cloud shadows.
         g.params[0] = std::env::var("SI_PROF_SKIP").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) as f32;
         let dlss = self.dlss_mode.is_some();
         if dlss {
@@ -2873,6 +2895,9 @@ impl Renderer {
         // the sea state of the last ocean frame uploaded (globe/ocean.rs, main.rgen)
         if let Some(scene) = self.globe.as_ref() {
             g.ocean = scene.ocean_globals();
+            if let Some((ecef, rot, _)) = self.globe_view {
+                g.road = scene.road_globals(ecef, rot);
+            }
         }
         let globals = &g;
         let t_lod = Instant::now();
@@ -2901,9 +2926,17 @@ impl Renderer {
                 let band_flags = vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE | vk::GeometryInstanceFlagsKHR::FORCE_NO_OPAQUE;
                 let (insts, inst_data) = (&mut self.insts, &mut self.inst_data);
                 let (catalog, pack, blas, infos) = (&self.catalog, &self.pack, &self.blas, &self.imp_infos);
+                let roads = scene.road_now.clone();
                 scene.near_trees(ecef, reach, |rec, tile_c, r| {
                     let f = |k: usize| f32::from_bits(r[k]);
                     let v = (r[12] & 0xFF) as usize;
+                    // (nothing grows on a road: impostor.rint leaves its impostor out the same way)
+                    if roads.as_ref().is_some_and(|b| {
+                        let p = tile_c + glam::DVec3::new(f(3) as f64, f(7) as f64, f(11) as f64) - b.anchor;
+                        b.on_road(glam::DVec2::new(p.dot(b.east), p.dot(b.north)), 0.8)
+                    }) {
+                        return;
+                    }
                     let ls = catalog.variants[v].lod_scale;
                     let m = glam::Mat3::from_cols(glam::Vec3::new(f(0), f(4), f(8)), glam::Vec3::new(f(1), f(5), f(9)), glam::Vec3::new(f(2), f(6), f(10)));
                     // plant -> camera frame
@@ -2917,7 +2950,7 @@ impl Renderer {
                     states.insert(rec, state);
                     let seed = ((r[12] >> 8) & 0x1FFF) << 11;
                     let data = (rec & 0xFF_FFFF) | ((v as u32) << INST_VARIANT_SHIFT);
-                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1;
+                    let iflags = if state == 1 { INST_HAS_MESH } else { 0 } | ((r[12] >> 21) & 15) << 1 | ((r[12] >> 28) & 15) << 5;
                     for (pi, p) in pack.trees[v].parts.iter().enumerate() {
                         let alpha = catalog.mesh_alpha[p.mesh as usize];
                         let (flags, sbt) = if state == 2 && !alpha { (mesh_flags, 0) } else { (band_flags, 2) };

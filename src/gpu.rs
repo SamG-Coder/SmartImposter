@@ -401,6 +401,33 @@ impl Gpu {
 
     /// A 3D RGBA8 texture (one level) filled from `voxels` (x fastest), ready to sample.
     pub fn upload_volume(&self, n: u32, voxels: &[u8], name: &str) -> Result<Image> {
+        // the mip chain, box-filtered (2x2x2): far clouds read the noise blurred to their pixel's
+        // footprint instead of aliasing into speckle
+        let mut levels: Vec<Vec<u8>> = vec![voxels.to_vec()];
+        let mut m = n as usize;
+        while m > 1 {
+            let h = m / 2;
+            let src = levels.last().unwrap();
+            let mut dst = vec![0u8; h * h * h * 4];
+            for z in 0..h {
+                for y in 0..h {
+                    for x in 0..h {
+                        for c in 0..4 {
+                            let mut s = 0u32;
+                            for (dx, dy, dz) in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)] {
+                                s += src[(((2 * z + dz) * m + 2 * y + dy) * m + 2 * x + dx) * 4 + c] as u32;
+                            }
+                            dst[((z * h + y) * h + x) * 4 + c] = ((s + 4) / 8) as u8;
+                        }
+                    }
+                }
+            }
+            levels.push(dst);
+            m = h;
+        }
+        let nl = levels.len() as u32;
+        let voxels: Vec<u8> = levels.concat();
+        let voxels = &voxels[..];
         unsafe {
             let format = vk::Format::R8G8B8A8_UNORM;
             let raw = self.device.create_image(
@@ -408,7 +435,7 @@ impl Gpu {
                     .image_type(vk::ImageType::TYPE_3D)
                     .format(format)
                     .extent(vk::Extent3D { width: n, height: n, depth: n })
-                    .mip_levels(1)
+                    .mip_levels(nl)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .tiling(vk::ImageTiling::OPTIMAL)
@@ -427,7 +454,7 @@ impl Gpu {
             })?;
             self.device.bind_image_memory(raw, alloc.memory(), alloc.offset())?;
             let view = self.device.create_image_view(
-                &vk::ImageViewCreateInfo::default().image(raw).view_type(vk::ImageViewType::TYPE_3D).format(format).subresource_range(color_range(0, 1)),
+                &vk::ImageViewCreateInfo::default().image(raw).view_type(vk::ImageViewType::TYPE_3D).format(format).subresource_range(color_range(0, nl)),
                 None,
             )?;
             let mut staging = self.create_buffer(voxels.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC, MemoryLocation::CpuToGpu, "volume staging")?;
@@ -444,22 +471,24 @@ impl Gpu {
                         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                         .image(raw)
-                        .subresource_range(color_range(0, 1))]
+                        .subresource_range(color_range(0, nl))]
                 };
                 let t = vk::PipelineStageFlags2::TRANSFER;
                 let b1 = b(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags2::NONE, vk::AccessFlags2::TRANSFER_WRITE, vk::PipelineStageFlags2::NONE, t);
                 self.device.cmd_pipeline_barrier2(cb, &vk::DependencyInfo::default().image_memory_barriers(&b1));
-                self.device.cmd_copy_buffer_to_image(
-                    cb,
-                    staging.raw,
-                    raw,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[vk::BufferImageCopy {
-                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-                        image_extent: vk::Extent3D { width: n, height: n, depth: n },
+                let mut copies = Vec::new();
+                let (mut off, mut m) = (0u64, n);
+                for l in 0..nl {
+                    copies.push(vk::BufferImageCopy {
+                        buffer_offset: off,
+                        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: l, base_array_layer: 0, layer_count: 1 },
+                        image_extent: vk::Extent3D { width: m, height: m, depth: m },
                         ..Default::default()
-                    }],
-                );
+                    });
+                    off += (m as u64).pow(3) * 4;
+                    m = (m / 2).max(1);
+                }
+                self.device.cmd_copy_buffer_to_image(cb, staging.raw, raw, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copies);
                 let b2 = b(
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,

@@ -16,7 +16,7 @@
 #define FLAG_AIRCRAFT 16384u // the aircraft (aircraft.rchit): roughness, metal in the payload's trans, emission in wtan
 #define MAX_VARIANTS 256 // atlas slots (one per plant variant)
 #define MAX_SPECIES 64
-#define MAX_GROUND_TEX 81 // 3 per ground layer (26 layers); then the grass map (--lawn auto) and the far / near masks
+#define MAX_GROUND_TEX 84 // 3 per ground layer (27 layers); then the grass map (--lawn auto) and the far / near masks
 // world.rs: near ground mask over +-NEAR_HALF, far mask over +-TERRAIN_HALF, forest tiles to TILE_FAR
 #define NEAR_HALF 2048.0
 #define TERRAIN_HALF 60000.0
@@ -129,12 +129,41 @@ vec3 dryTint(vec3 alb, float dry) {
     return mix(alb, dusty, 0.62 * dry);
 }
 
+// Foliage looks: 4 bits per plant (forest.rs look(), world.rs foliage(), --foliage), one of a
+// small table: the leaves move towards a colour at their own brightness. Free to switch: no
+// textures, no re-bake (the atlases hold the plant's natural colour), a few instructions per hit.
+// 0 natural, 1 lush (deep tropical green), 2 mangrove (dark glossy olive-green), 3 boreal (dark
+// blue-green), 4 autumn (each tree gold, orange, red or still green), 5 spring (fresh yellow-green),
+// 6 dusty (sun-bleached grey-olive).
+vec3 foliageLook(vec3 alb, uint look, uint seed) {
+    if (look == 0u) return alb;
+    // the greens: a filter on the leaf's own colour, so each tree keeps its own shade (treeTint)
+    // and each leaf its texture
+    // (lush and mangrove: deeper and bluer, not more saturated: yellow-green reads as lime)
+    if (look == 1u) return alb * vec3(0.76, 0.86, 0.84);
+    if (look == 2u) return alb * vec3(0.62, 0.74, 0.70);
+    if (look == 3u) return alb * vec3(0.82, 0.96, 0.94);
+    if (look == 5u) return alb * vec3(1.06, 1.12, 0.74);
+    // the turned leaves: towards a colour at the leaf's own brightness
+    float l = dot(alb, vec3(0.30, 0.59, 0.11));
+    vec4 t; // rgb: the colour per unit of brightness; a: how far towards it
+    if (look == 4u) {
+        float h = float(pcg(seed * 3571u + 11u) & 0xFFFFu) / 65535.0;
+        t = h < 0.3 ? vec4(1.55, 1.18, 0.30, 0.85) : h < 0.55 ? vec4(1.85, 0.92, 0.22, 0.85)
+          : h < 0.75 ? vec4(1.80, 0.55, 0.28, 0.80) : vec4(1.15, 1.05, 0.40, 0.40);
+    } else if (look == 6u) t = vec4(1.19, 1.12, 0.90, 0.62);
+    else return alb;
+    return mix(alb, l * t.rgb, t.a);
+}
+
 vec3 treeTint(uint seed, float leafiness) {
     if (seed == 0u) return vec3(1.0);
-    uint s = pcg(seed * 7919u);
-    float h1 = float(s & 0xFFFFu) / 65535.0;
-    float h2 = float(s >> 16) / 65535.0;
-    vec3 leafT = mix(vec3(0.82, 1.0, 0.70), vec3(1.18, 1.02, 0.62), h1) * mix(0.78, 1.18, h2);
+    // The seed's low 6 bits are the hue (blue-green .. yellow-green), the 7 above the brightness:
+    // read as they are, so whoever plants the trees can give neighbours kindred seeds (the
+    // globe's stands, forest.rs) or random ones (the forest scenes: every tree its own).
+    float h1 = float(seed & 63u) / 63.0;
+    float h2 = float((seed >> 6) & 127u) / 127.0;
+    vec3 leafT = mix(vec3(0.80, 1.0, 0.74), vec3(1.20, 1.02, 0.60), h1) * mix(0.72, 1.22, h2);
     return mix(vec3(1.0), leafT, leafiness);
 }
 

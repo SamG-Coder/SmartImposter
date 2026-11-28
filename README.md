@@ -976,6 +976,7 @@ cargo run --release
 | `--bench-move 0.25` | move every frame and print frame-time statistics |
 | `--gallery` | every variant on flat ground, one row per species |
 | `--park` | hills of lawn with groves and single trees, walked (see [Lawn](#lawn-short-grass-with-no-geometry---lawn-on-experimental)); `--biome` picks the trees, `--lawn off` shows the bare ground texture |
+| `--foliage natural\|lush\|mangrove\|boreal\|autumn\|spring\|dusty` | every tree and shrub takes this leaf colour instead of its biome's own (the globe gives the wet tropics a deep green, mangroves dark olive crowns, the taiga blue-green; autumn turns each tree gold, orange, red or keeps it green). Four bits per plant and one table lookup in the shader: no re-bake, no textures, nothing measurable per frame |
 | `--walk on\|off` | start on foot instead of flying, in any scene: the forest, a site, the gallery, the globe, the park (its default). Key V switches |
 | `--test-flight` | fly an F-16C over the globe (see [Test flight](#the-earth-a-11-globe-and-real-places)); `--at lat,lon,height,heading,0` sets the start. Needs `assets/aircraft/` from `tools/make_f16.py` |
 | `--dump-atlas prefix` | write the first variant's uncompressed albedo atlas as a PNG |
@@ -997,7 +998,9 @@ cargo run --release
 | `SI_DLSS_JITTER` | DLSS jitter sign test: `+x` and / or `+y` pass the raw sample offset instead of the (measured sharpest) flipped one |
 | `SI_NO_SER` | disable Shader Execution Reordering |
 | `SI_VALIDATION` | same as `--validation` |
-| `SI_PROF_SKIP` | profiling: 1 no sun-shadow rays, 2 no AO rays, 3 neither |
+| `SI_PROF_SKIP` | profiling, a sum of: 1 no sun-shadow rays, 2 no AO rays, 4 no traced sky light, 8 no clouds in the view, 16 none in reflections, 32 no cloud shadows |
+| `SI_PROF_FRAMES=n` | with `--shot`: once the view has streamed in, hold it n more frames and time those alone (the profile line otherwise averages every frame since the start, loading included) |
+| `SI_ROADS=off\|offline` | globe: the main roads (motorway to tertiary) are fetched live from OpenStreetMap through the Overpass API as one flies, one request per ~40 km map tile, cached in `assets/earth/osm`, and painted on the ground (`src/globe/roads.rs`, `shaders/roads.glsl`); `off`: no roads, `offline`: only what is cached. Map data © OpenStreetMap contributors, ODbL |
 | `SI_TEX_MAX`, `SI_GROUND_TEX_MAX` | maximum plant / ground texture size (default 2048) |
 | `SI_GROUND_DIR` | Fab library cache with the ground surfaces |
 | `SI_IMPOSTOR_MB` | GPU memory for full impostor atlases (default 25% of VRAM) |

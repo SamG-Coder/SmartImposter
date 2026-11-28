@@ -71,9 +71,9 @@ pub fn understory_biomes(name: &str) -> u16 {
     } else if n.contains("dead_shrub") {
         bits(&[b::SAVANNA, b::TEMPERATE_GRASSLAND, b::MEDITERRANEAN, b::DESERT])
     } else if n.contains("palm") || n.contains("xanadu") {
-        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::SAVANNA, b::MANGROVES])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::SAVANNA, b::MANGROVES, b::SUBTROPICAL_FLOODED])
     } else if n.contains("leather_fern") {
-        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::MANGROVES])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::MANGROVES, b::SUBTROPICAL_FLOODED])
     } else if n.contains("tundra_grass") {
         bits(&[b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("ribbon") || n.contains("poppy") || n.contains("dandelion") {
@@ -81,7 +81,7 @@ pub fn understory_biomes(name: &str) -> u16 {
     } else if n.contains("marram") {
         bits(&[b::MEDITERRANEAN])
     } else if n.contains("reed") {
-        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::SAVANNA, b::TEMPERATE_GRASSLAND, b::FLOODED, b::MEDITERRANEAN, b::MANGROVES])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::SAVANNA, b::TEMPERATE_GRASSLAND, b::FLOODED, b::MEDITERRANEAN, b::MANGROVES, b::SUBTROPICAL_FLOODED])
     } else if n.contains("boulder") {
         bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::MONTANE, b::TUNDRA])
     } else if n.contains("logs") {
@@ -99,7 +99,7 @@ pub fn understory_biomes(name: &str) -> u16 {
     } else if n.contains("huckleberry") {
         bits(&[b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::MEDITERRANEAN])
     } else if n.contains("bracken") || n.contains("fern") {
-        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL])
+        bits(&[b::TROPICAL_MOIST, b::TROPICAL_DRY, b::TROPICAL_CONIFER, b::TEMPERATE_BROADLEAF, b::TEMPERATE_CONIFER, b::BOREAL, b::SUBTROPICAL_FLOODED])
     } else if n.contains("cotton") {
         bits(&[b::TEMPERATE_CONIFER, b::BOREAL, b::FLOODED, b::MONTANE, b::TUNDRA])
     } else if n.contains("dry_grass") || n.contains("dry grass") {
@@ -117,6 +117,28 @@ pub fn dryness(biome: u8) -> u32 {
         b::SAVANNA | b::MEDITERRANEAN => 10,
         b::TEMPERATE_GRASSLAND => 7,
         b::TROPICAL_DRY => 5,
+        _ => 0,
+    }
+}
+
+/// The biome for the plants at lat / lon: as Terrain::biome, with flooded grassland between
+/// 31 S and 31 N its own (biomes.rs SUBTROPICAL_FLOODED).
+pub fn tree_biome(terrain: &Terrain, lat: f64, lon: f64) -> u8 {
+    let b = terrain.biome(lat, lon);
+    if b == b::FLOODED && lat.abs() < 31.0 { b::SUBTROPICAL_FLOODED } else { b }
+}
+
+/// The foliage look of a biome's plants (shared.glsl foliageLook; `--foliage` overrides it):
+/// the deep green of the wet tropics, the dark glossy crowns of mangroves, the blue-green taiga.
+/// `understory`: shrubs and ferns under mangroves take the tropical green, not the mangrove's.
+pub fn look(biome: u8, understory: bool) -> u32 {
+    if let Some(l) = crate::world::foliage() {
+        return l;
+    }
+    match biome {
+        b::MANGROVES if !understory => 2,
+        b::TROPICAL_MOIST | b::TROPICAL_CONIFER | b::MANGROVES | b::SUBTROPICAL_FLOODED => 1,
+        b::BOREAL => 3,
         _ => 0,
     }
 }
@@ -176,9 +198,13 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                 let (r_keep, r_pick, r_size, r_yaw) = (rng.f(), rng.f(), rng.f(), rng.f());
                 let d = face_dir(id.face, u0 + fu * s, v0 + fv * s);
                 let (lat, lon) = lat_lon(d);
-                let Some(g) = terrain.cover.class_group(lat, lon) else { continue };
+                // (the class from a point up to ~7 m away: the land cover's 10 m pixels have
+                // straight edges and corners, and plants stopped at them as at a mown line; this
+                // way one cover thins out into the next over a few metres)
+                let (jn, je) = ((rng.f() - 0.5) * 14.0 / 111_320.0, (rng.f() - 0.5) * 14.0 / (111_320.0 * lat.to_radians().cos().max(0.05)));
+                let Some(g) = terrain.cover.class_group(lat + jn, lon + je) else { continue };
                 use super::landcover as lc;
-                let biome = terrain.biome(lat, lon);
+                let biome = tree_biome(terrain, lat, lon);
                 // deserts and dry scrub: dry grass only, and far fewer plants (mostly bare ground)
                 let arid = biome == b::DESERT;
                 let dryish = matches!(biome, b::SAVANNA | b::MEDITERRANEAN);
@@ -197,6 +223,9 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                     (0, lc::BARE) => (0.12, &sp.dry),
                     (0, lc::SHRUB) if r_pick < 0.35 && !sp.dry.is_empty() => (0.55, &sp.dry),
                     (2, lc::GRASS) => (0.9, &sp.grass),
+                    // (towns, until they have their buildings: yards and verges, grass and the odd shrub)
+                    (2, lc::BUILT) => (0.6, &sp.grass),
+                    (0, lc::BUILT) => (0.04, &sp.shrubs),
                     (2, lc::CROP) => (0.8, &sp.dry_grass),
                     (2, lc::WETLAND) => (0.85, &sp.wet_grass),
                     (2, lc::SHRUB) => (0.5, &sp.grass),
@@ -223,6 +252,15 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                         continue;
                     }
                 }
+                // Grass does not stand evenly: thick in clumps and drifts, thin between them
+                // (over ~6 m and ~30 m)
+                let p = if layer == 2 {
+                    let pk = d * R_EARTH;
+                    let clump = vnoise3(pk / 30.0 + DVec3::splat(3.0)) * 0.55 + vnoise3(pk / 6.0 + DVec3::splat(11.0)) * 0.45;
+                    p * (0.3 + 1.0 * smooth(0.3, 0.7, clump))
+                } else {
+                    p
+                };
                 let list = if list.is_empty() && layer < 3 && !(layer == 0 && g == lc::BARE) { if layer == 2 { &sp.grass } else { &sp.shrubs } } else { list };
                 if list.is_empty() || r_keep > p {
                     continue;
@@ -283,7 +321,8 @@ pub fn grow_understory(id: TileId, terrain: &Terrain, sp: &Species) -> TreeTile 
                         rec[ri * 4 + ci] = (*v as f32).to_bits();
                     }
                 }
-                rec[12] = vid as u32 | seed << 8 | dry << 21;
+                let lk = if layer <= 1 { look(biome, true) } else { 0 };
+                rec[12] = vid as u32 | seed << 8 | dry << 21 | lk << 28;
                 let (bmin, bmax) = (info.bmin, info.bmax);
                 let mut lo = [f32::MAX; 3];
                 let mut hi = [f32::MIN; 3];
@@ -375,7 +414,7 @@ impl Rng {
 /// where it belongs as soon as it is in the catalog; where none of a biome's are present, the
 /// temperate list stands in. Stand-ins for species Quixel has no scan of follow docs/EARTH_PLAN.md
 /// section 5 (e.g. birch for eucalyptus, oak for acacia and teak, poplar crowns for rainforest).
-const BIOME_TREES: [&[(&str, f32)]; 15] = [
+const BIOME_TREES: [&[(&str, f32)]; 16] = [
     /* 0 none     */ &[("Silver_Birch", 0.5), ("Norway_Spruce", 0.5)],
     // (broad, rounded crowns stand in for the rainforest canopy; no columnar poplars)
     /* 1 tropical moist */ &[("English_Oak", 0.3), ("European_Beech", 0.25), ("Norway_Maple", 0.15), ("Black_Alder", 0.12), ("Giant_Bamboo", 0.1), ("Common_Hazel", 0.08)],
@@ -391,7 +430,12 @@ const BIOME_TREES: [&[(&str, f32)]; 15] = [
     /* 11 tundra  */ &[("Silver_Birch", 0.5), ("Goat_Willow", 0.3), ("Baltic_Pine", 0.2)],
     /* 12 Mediterranean */ &[("Aleppo_Pine", 0.5), ("English_Oak", 0.35), ("Baltic_Pine", 0.15)],
     /* 13 desert  */ &[("Tropical_Palm", 0.5), ("Aleppo_Pine", 0.3), ("Goat_Willow", 0.2)],
-    /* 14 mangroves */ &[("Goat_Willow", 0.5), ("Black_Alder", 0.5)],
+    // (dense, low, rounded crowns: willow, alder, hazel and elder stand in for red and black
+    // mangrove; the mangrove look darkens them to the glossy olive-green of the real thing)
+    /* 14 mangroves */ &[("Goat_Willow", 0.34), ("Black_Alder", 0.3), ("Common_Hazel", 0.2), ("Elder", 0.16)],
+    // (hammocks in the sawgrass: oak for live oak, the tropical palm for the cabbage palm, alder,
+    // willow and hazel for the wet hardwoods)
+    /* 15 subtropical flooded */ &[("English_Oak", 0.32), ("Black_Alder", 0.2), ("Goat_Willow", 0.18), ("Tropical_Palm", 0.16), ("Common_Hazel", 0.14)],
 ];
 /// Wet ground (water nearby) favours these, in any biome where they are not out of place.
 const WET_TREES: &[(&str, f32)] = &[("Black_Alder", 2.5), ("Goat_Willow", 1.5), ("Black_Poplar", 0.8)];
@@ -401,7 +445,8 @@ const CONIFERS: &[&str] = &["Spruce", "Pine"];
 /// The catalog species of each biome (indices into `Species::species`, weights, conifer?).
 pub struct Roles {
     biome: Vec<Vec<(usize, f32, bool)>>,
-    wet: Vec<(usize, f32)>,
+    /// wet-ground species, weight, temperate only (not in the tropics)
+    wet: Vec<(usize, f32, bool)>,
 }
 
 impl Roles {
@@ -418,7 +463,7 @@ impl Roles {
                 *b = if temperate.is_empty() { any.clone() } else { temperate.clone() };
             }
         }
-        let wet = WET_TREES.iter().filter_map(|(n, w)| find(n).map(|i| (i, *w))).collect();
+        let wet = WET_TREES.iter().filter_map(|(n, w)| find(n).map(|i| (i, *w, n.contains("Poplar")))).collect();
         Roles { biome, wet }
     }
 
@@ -441,7 +486,11 @@ impl Roles {
             })
             .collect();
         if wet > 0.0 && biome != b::DESERT {
-            for &(i, wt) in &self.wet {
+            let tropical = matches!(biome, b::TROPICAL_MOIST | b::TROPICAL_DRY | b::TROPICAL_CONIFER | b::SAVANNA | b::MANGROVES | b::SUBTROPICAL_FLOODED);
+            for &(i, wt, temperate) in &self.wet {
+                if tropical && temperate {
+                    continue;
+                }
                 w.push((i, wt * wet * if biome == b::BOREAL || biome == b::TUNDRA { 0.5 } else { 1.0 } * field(i)));
             }
         }
@@ -543,7 +592,7 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
                 0.0
             };
             let field = |sp: usize| (CONTRAST as f32 * (field_at(sp, sp as f64, fu, fv) - 0.5)).exp();
-            let biome = terrain.biome(lat, lon);
+            let biome = tree_biome(terrain, lat, lon);
             let Some(sp) = roles.pick(biome, alt, wet, cool, &field, rng.f() as f32) else { continue };
             let vars = &im.species[sp].1;
             // variants run from old (large) to young: stands of an age, also as smooth bands
@@ -555,14 +604,31 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             let up = d;
             let east = DVec3::Z.cross(up).normalize();
             let north = up.cross(east);
+            // No two trees of a variant alike, and no forest one even carpet:
+            // - stands: over ~100 m the trees are taller or shorter together (soil, water, the
+            //   stand's age), over ~300 m a shade greener, yellower, lighter or darker together;
+            //   each tree varies round its stand;
+            // - a lean of a few degrees, the odd one more (wind, a neighbour's shade, soft ground).
+            // (Earth-fixed noise: the same at every tile level, so a tree keeps its look as the
+            // tiles refine.)
+            let pk = d * (R_EARTH / 1000.0);
+            let stand = vnoise3(pk * 9.0 + DVec3::splat(3.7)) * 0.65 + vnoise3(pk * 31.0 + DVec3::splat(8.1)) * 0.35;
+            let tone = vnoise3(pk * 3.3 + DVec3::splat(21.0)) * 0.6 + vnoise3(pk * 14.0 + DVec3::splat(5.0)) * 0.4;
+            let shade = vnoise3(pk * 5.1 + DVec3::splat(47.0)) * 0.6 + vnoise3(pk * 19.0 + DVec3::splat(13.0)) * 0.4;
             let a = rng.f() * std::f64::consts::TAU;
+            let (lean, lean_to) = (0.11 * rng.f().powi(3) + 0.02 * rng.f(), rng.f() * std::f64::consts::TAU);
+            let up = (up + (east * lean_to.cos() + north * lean_to.sin()) * lean.tan()).normalize();
             let x = east * a.cos() + north * a.sin();
+            let x = (x - up * x.dot(up)).normalize();
             let z = x.cross(up);
-            let sc = 0.85 + 0.3 * rng.f();
+            let sc = 0.62 + 0.5 * ((stand - 0.5) * 1.8 + 0.5).clamp(0.0, 1.0) + 0.26 * rng.f();
             let (x, y, z) = (x * sc, up * sc, z * sc);
             let t = d * (R_EARTH + h - 0.2) - center;
             let rows = [[x.x, y.x, z.x, t.x], [x.y, y.y, z.y, t.y], [x.z, y.z, z.z, t.z]];
-            let seed = 1 + (rng.f() * 8190.0) as u32;
+            // the tint's two numbers (shared.glsl treeTint: hue in the low 6 bits, brightness in
+            // the 7 above): the stand's, and the tree's own share
+            let mixed = |field: f64, r: f64| (((field - 0.5) * 1.7 + 0.5) * 0.6 + r * 0.4).clamp(0.0, 1.0);
+            let seed = (((mixed(tone, rng.f()) * 63.0) as u32) | ((mixed(shade, rng.f()) * 127.0) as u32) << 6).max(1);
             let mut rec = [0u32; REC_WORDS];
             for (ri, row) in rows.iter().enumerate() {
                 for (ci, v) in row.iter().enumerate() {
@@ -571,7 +637,7 @@ pub fn grow_tile(id: TileId, terrain: &Terrain, im: &Species, roles: &Roles) -> 
             }
             // levels coarser than the finest (impostor.rint thins the trees on with distance)
             let k = (TREE_LEVEL - id.level).min(7) as u32;
-            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21 | k << 25;
+            rec[12] = vid as u32 | seed << 8 | dryness(biome) << 21 | k << 25 | look(biome, false) << 28;
             // tile-local bounds of the transformed box
             let (bmin, bmax) = (info.bmin, info.bmax);
             let mut lo = [f32::MAX; 3];

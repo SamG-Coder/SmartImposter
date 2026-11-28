@@ -48,6 +48,8 @@ float plantDry(PlantRec p) { return float((p.data >> 21) & 15u) / 15.0; }
 // Globe tree tiles: how many levels coarser than the finest the plant's tile is (forest.rs: such a
 // tile keeps 1 / 4^k of the trees).
 uint plantThin(PlantRec p) { return (p.data >> 25) & 7u; }
+// The plant's foliage look (shared.glsl foliageLook).
+uint plantLook(PlantRec p) { return (p.data >> 28) & 15u; }
 
 // The tree density the globe aims for at distance d, as levels of thinning (continuous): tiles k
 // levels coarser cover [THIN_BASE 2^k, THIN_BASE 2^(k+1)) beyond THIN_NEAR (forest.rs
@@ -85,7 +87,7 @@ struct SpeciesInfo { vec4 leafTint; vec4 barkTint; vec4 transTint; };
 struct InstInfo {
     vec3 center;  // tree bounding-sphere centre (world)
     uint data;    // tree index (24 bits) | variant (bits 24..31)
-    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness; from bit 5: which part of the plant
+    uint flags;   // bit 0: the tree also has mesh instances (renderer.rs INST_HAS_MESH); bits 1..4: dryness; 5..8: foliage look; from bit 9: which part of the plant
 };
 uint instVariant(uint data) { return data >> 24; }
 

@@ -11,6 +11,7 @@
 // that faces the sun, which is effectively a per-tree shadow map.
 
 layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+#include "roads.glsl"
 layout(set = 0, binding = 5, scalar) readonly buffer Imps { ImpostorInfo imps[]; };
 // BC-compressed atlases: albedo+AO (BC3), depth+coverage (BC5), normal (BC5), visibility (BC3, half res)
 layout(set = 0, binding = 7) uniform sampler2D depthAtlas[MAX_VARIANTS];
@@ -178,6 +179,11 @@ void main() {
     ImpostorInfo info = imps[vid];
     // Plant records are in the instance's space: world for the forest scene (identity instances),
     // tile-local for the globe (instances placed relative to the camera).
+    // (nothing grows on a road)
+    if (g.planet.w > 0.5 && roadsOn()) {
+        RoadHit rh;
+        if (roadAt(roadXY(gl_ObjectToWorldEXT * vec4(po, 1.0)), 0.8, rh)) return;
+    }
     vec3 camO = gl_WorldToObjectEXT * vec4(g.camPos.xyz, 1.0);
     float dTree = distance(camO, M * info.centerRadius.xyz + po);
     float sc = info.lodScale; // LOD distances scale with plant size

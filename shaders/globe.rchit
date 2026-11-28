@@ -5,6 +5,8 @@
 // Terrain tiles: geometry, land cover and the ground material (tiles.rs vertex: position (3),
 // normal (3), elevation, land cover (3 x unorm4x8), texture coordinates in metres (2)).
 layout(set = 0, binding = 30) uniform GG { GlobeGlobals gg; };
+layout(set = 0, binding = 3) uniform GlobalsUBO { Globals g; };
+#include "roads.glsl"
 layout(set = 0, binding = 31, scalar) readonly buffer TileTable { uint64_t vtx[]; } table;
 layout(buffer_reference, scalar) readonly buffer Verts { float v[]; };
 layout(buffer_reference, scalar) readonly buffer Indices { uint i[]; };
@@ -30,6 +32,7 @@ const float GT = 2.048; // metres per texture repeat (divides tiles.rs TEX_PERIO
 // clay 0.2, tundra 0.1, lichen 0.12, boreal floor 0.1, glacier 0.55, mud 0.11, salt 0.45,
 // ploughed 0.15, lava sand 0.07, steppe soil 0.17, dry grass 0.24; very dark scans capped)
 const int LAYERS = 26;
+const int ASPHALT = 26; // (the roads' scan: a layer of its own, not blended by land cover)
 const float GAIN[LAYERS] = float[LAYERS](0.7, 2.4, 0.68, 0.5, 1.0, 1.0, 0.75, 1.0, 1.0, 1.0, 0.8, 1.0,
                                          1.02, 1.99, 4.0, 2.27, 3.3, 0.85, 0.58, 4.09, 3.69, 2.65, 2.62, 3.97, 3.44, 4.02);
 
@@ -61,7 +64,7 @@ float fbmN(vec2 p, int octaves) {
     for (int i = 0; i < octaves; ++i) {
         s += a * vnoise(p);
         norm += a;
-        p = p * 2.03 + vec2(7.3, 1.9);
+        p = mat2(0.8, 0.6, -0.6, 0.8) * p * 2.03 + vec2(7.3, 1.9); // (turned: no grid-aligned streaks)
         a *= 0.5;
     }
     return s / norm;
@@ -137,7 +140,9 @@ float organic(float a, float n, float sharp) {
 // Ground albedo, ambient occlusion and normal from the land cover fractions.
 // `bed` (0..1): the bottom of a lake, river or the sea; `shore`: the strip of land at the water.
 // `biome`: RESOLVE biome number (biomes.rs); `sea`: the water at the shore / over the bed is sea.
-vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, int biome, bool sea, out float ao) {
+// `coast` (0..1): within a beach's width of the water (only there is bare ground a beach).
+// `floorM`: the sea floor's depth there (m, ETOPO): the bed of a pond or a sheltered bay is mud.
+vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout vec3 n, float footprint, float bed, float shore, float coast, float floorM, int biome, bool sea, out float ao) {
     float slope = 1.0 - max(dot(n, up), 0.0);
     vec2 q = uvm;
     float desert = biome == 13 ? 1.0 : 0.0;
@@ -198,7 +203,11 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // land, in low contrast; never dark blotches
     float nb = fbmN(q * 0.035 + 61.0, 3);
     w[7] = (bare - rockBare) * (1.0 - scree);                                     // gravel
-    w[2] += built * 0.3 * (1.0 - dryLand) * smoothstep(0.55, 0.35, nb);
+    // (as the grassland beside it, a little drier and more worn: without its buildings a town
+    // must not stand out of the land as blotches of another colour)
+    w[2] += built * 0.55 * (1.0 - dryLand);
+    w[1] += built * 0.15 * (1.0 - dryLand);
+    w[3] += built * 0.22;
     w[8] = moss * 0.25;                                                           // lichen rock
     w[9] = 0.0;
     w[10] = 0.0;
@@ -243,8 +252,18 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     // flat bare ground: sand and arid soil in deserts, red soil in the tropics, arid soil in
     // Mediterranean scrub, tundra stones and lichen in the Arctic (the mountains keep their scree)
     float bareFlat = w[7];
-    // bare ground at sea level is a beach: sand, whatever the biome
-    if (sea && bed == 0.0) { w[12] += bareFlat * 0.85; w[7] = bareFlat * 0.15; bareFlat = 0.0; }
+    // bare ground along the sea is a beach: sand, whatever the biome. Only by the water: low land
+    // inland (all of south Florida is under 4 m) is not a beach, and sand there made white blots.
+    if (sea && bed == 0.0) {
+        float bch = bareFlat * coast;
+        w[12] += bch * 0.85;
+        w[7] -= bch * 0.85;
+        bareFlat -= bch;
+    }
+    // wet lowlands of the tropics and subtropics (the Everglades, mangrove swamps): bare ground is
+    // grey marl and mud, not gravel
+    float wetTrop = (biome == 9 && abs(degrees(asin(clamp(normalize(mat3(gl_WorldToObjectEXT) * up).z, -1.0, 1.0)))) < 31.0) || biome == 14 ? 1.0 : 0.0;
+    w[20] += bareFlat * wetTrop * 0.65;
     w[13] = bareFlat * desert * (0.55 + 0.3 * nB);
     w[14] = bareFlat * (desert * (0.45 - 0.3 * nB) + hot * 0.4 + med * 0.8);
     w[15] += bareFlat * hot * 0.5;
@@ -256,10 +275,12 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     w[1] += moss * 0.5;                                                           // moss, sedge
     w[2] += moss * 0.25;                                                          // sedge
     w[3] += moss * 0.1;
-    w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9, 0.0);
+    w[7] *= max(1.0 - desert - hot * 0.9 - med * 0.8 - arctic * 0.9 - wetTrop * 0.65, 0.0);
     w[8] *= 1.0 - 0.6 * arctic;
     // towns: grey gravel (never the biome's red earth or sand), on dry land half the local soil
-    w[7] += built * 0.55 * (1.0 - 0.5 * dryLand) * soil;
+    // (towns without their buildings yet: yards of worn earth and grass; a little gravel)
+    w[7] += built * 0.03 * (1.0 - 0.5 * dryLand) * soil;
+    w[22] += built * 0.07 * soil;
     // wetlands and mangroves: mud
     float marsh = (biome == 9 || biome == 14) ? 0.6 : 0.25;
     w[20] = w[11] * marsh;
@@ -268,14 +289,29 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     float sheet = snow * smoothstep(0.25, 0.1, slope);
     w[19] = sheet * 0.8;
     w[6] -= sheet * 0.8;
-    // under water: silt and moss on lake and river beds, sand under the sea, pebbles in the
-    // shallows; along the shore pebbles (lakes) or beach sand (sea)
-    for (int l = 0; l < LAYERS; ++l) w[l] *= (1.0 - bed) * (1.0 - shore);
+    // Open ground is not one sward: stretches where the grass has dried, in soft drifts of
+    // 60-200 m (no invented bare patches: bare ground is where the land cover data has it).
+    {
+        float dryP = smoothstep(0.35, 0.85, fbmN(q * 0.011 + 59.0, 4)) * 0.3;
+        float moved = (w[1] + w[2]) * dryP;
+        w[1] *= 1.0 - dryP; w[2] *= 1.0 - dryP;
+        w[3] += moved;
+    }
+    // Under water: silt and moss on lake and river beds; under the sea sand, but dark mud and
+    // seagrass in ponds and sheltered shallows. Along the shore: sand (sea) or pebbles (lakes)
+    // only where the land cover has bare ground at the water, a real beach; a shore of grass,
+    // marsh or mangrove runs into the water as wet ground and mud, with no white rim.
+    float sandy = smoothstep(0.06, 0.3, B.y);
+    float beach = shore * sandy, muddy = shore * (1.0 - sandy);
+    for (int l = 0; l < LAYERS; ++l) w[l] *= (1.0 - bed) * (1.0 - beach) * (1.0 - 0.55 * muddy);
+    w[20] += 0.55 * muddy;
     if (sea) {
-        w[12] += bed + shore;                                                     // sand
+        float mudBed = 1.0 - smoothstep(1.0, 6.0, floorM);
+        w[12] += beach + bed * (1.0 - 0.8 * mudBed);                              // sand
+        w[20] += bed * 0.8 * mudBed;                                              // mud
     } else {
         w[9] += bed * (0.45 + 0.4 * nA);                                          // riverbed
-        w[10] += bed * (0.55 - 0.4 * nA) + shore;                                 // pebbles
+        w[10] += bed * (0.55 - 0.4 * nA) + beach;                                 // pebbles
     }
     // the three strongest layers
     int L[3] = int[3](0, 0, 0);
@@ -294,13 +330,30 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     uint mask = floatBitsToUint(gg.params.w); // a bit mask stored as float bits (26 layers)
     Hex hx = hexTile(q / GT);
     bool near = footprint < 4.0;
+    // A scan is 2 m of ground: seen from more than a few metres up its detail is smaller than a
+    // pixel and the land was a flat tint. So each scan is laid a second time, 5.3 times larger
+    // (11 m, turned, and bent by noise so that its repeat never lines up): its light and dark,
+    // its stones and tufts, read as clumps and patches of 1-5 m from the air, and it modulates the
+    // fine laying (colour over the scan's own mean). The two together hold from the ground to a
+    // few hundred metres; beyond, the noise fields below.
+    const float MACRO = 5.3;
+    vec2 qm = mat2(0.8, 0.6, -0.6, 0.8) * (q + (vec2(fbmN(q * 0.06 + 5.0, 2), fbmN(q * 0.06 + 31.0, 2)) - 0.5) * 9.0) / (GT * MACRO);
+    // Where two materials meet, the higher (brighter, less occluded) parts of each stand through
+    // the other: grass tufts over soil, stones through sand; not a cross-fade (near only: from far
+    // a pixel holds both).
+    float sharpP = mix(4.0, 1.0, smoothstep(0.15, 2.5, footprint));
+    vec3 cols[3];
+    vec2 nrms[3];
+    float aos[3], wts[3];
+    float wsum = 0.0;
     for (int k = 0; k < 3; ++k) {
+        cols[k] = vec3(0.0); nrms[k] = vec2(0.0); aos[k] = 1.0; wts[k] = 0.0;
         if (W[k] <= 0.0) continue;
         float wk = W[k] / max(sum, 1e-4);
         int l = L[k];
         vec3 c;
         vec2 nn = vec2(0.0);
-        float o = 1.0;
+        float o = 1.0, rel = 1.0;
         if ((mask & (1u << uint(l))) == 0u) {
             c = l == 6 ? vec3(0.8) : (l == 4 || l == 5) ? vec3(0.15, 0.14, 0.12) : vec3(0.08, 0.09, 0.05);
         } else {
@@ -316,17 +369,45 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
             } else {
                 c = textureLod(groundTex[l * 3], q / GT, lod).rgb;
             }
+            vec3 mean = max(textureLod(groundTex[l * 3], vec2(0.5), 20.0).rgb, vec3(0.004));
+            vec3 macro = textureLod(groundTex[l * 3], qm, max(log2(footprint / (texel * MACRO)), 0.0)).rgb / mean;
+            // (its light and dark, its colour shifts at half; blade scans gently: a grass blade
+            // five times its size is straw laid with a brush, while soil, sand and stones only
+            // gain clods and patches)
+            float ml = dot(macro, vec3(0.3, 0.59, 0.11));
+            bool blades = l == 1 || l == 2 || l == 3 || l == 11 || l == 25;
+            c *= clamp(mix(vec3(1.0), mix(vec3(ml), macro, 0.5), blades ? 0.35 : 1.2), 0.5, 1.8);
+            rel = dot(c, vec3(0.3, 0.59, 0.11)) / dot(mean, vec3(0.3, 0.59, 0.11));
             c *= GAIN[l];
-            if (l == 7) c = mix(c, vec3(dot(c, vec3(0.33))), 0.7) * 1.1; // grey the reddish gravel scan
+            if (l == 7) c = mix(c, vec3(dot(c, vec3(0.33))), 0.7) * mix(1.1, 0.62, built); // grey the reddish gravel scan (towns: worn, darker)
             // the arid soil scan is a saturated brick red: dusty red-brown earth instead
             if (l == 14) c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))) * vec3(1.25, 0.95, 0.7), 0.55) * 0.85;
+            // (mud: a warm grey-brown, not slate)
+            if (l == 20) c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))) * vec3(1.14, 0.98, 0.8), 0.6) * 0.62;
+            // the ploughed-soil scan as plain bare earth: grey-brown
+            if (l == 22) c = mix(c, vec3(dot(c, vec3(0.3, 0.59, 0.11))) * vec3(1.12, 0.98, 0.82), 0.4) * 0.5;
+            // living ground is never one green: yellower and drier, bluer and lusher, in drifts
+            // of ~15 m and ~120 m (grasses, moss, marsh, the forest floor's herbs)
+            if (l <= 3 || l == 11 || l == 18 || l == 24 || l == 25) {
+                float hv = fbmN(q * 0.07 + float(l) * 3.1, 3) * 0.55 + fbmN(q * 0.0085 + float(l) * 7.7, 3) * 0.45;
+                c *= mix(vec3(1.08, 1.02, 0.86), vec3(0.93, 0.99, 1.02), smoothstep(0.2, 0.8, hv));
+            }
         }
-        alb += c * wk;
-        nxy += nn * wk;
-        ao += o * wk;
+        cols[k] = c; nrms[k] = nn; aos[k] = o;
+        wts[k] = pow(wk * (0.35 + 0.65 * clamp(rel * (0.6 + 0.4 * o), 0.0, 2.0)), sharpP);
+        wsum += wts[k];
     }
-    // large-scale variation so meadows and forests are not one flat colour from a distance
-    alb *= mix(0.8, 1.15, nB) * mix(0.9, 1.1, nA);
+    for (int k = 0; k < 3; ++k) {
+        float wk = wts[k] / max(wsum, 1e-9);
+        alb += cols[k] * wk;
+        nxy += nrms[k] * wk;
+        ao += aos[k] * wk;
+    }
+    // Large-scale variation, so the land is not one flat colour from high up either: lighter and
+    // darker over ~20 m and ~125 m (growth, moisture), and broad drifts of ~700 m. Gently: strong
+    // brightness noise reads as stains.
+    float nC = fbmN(q * 0.0014 + 29.0, 3);
+    alb *= mix(0.87, 1.12, nB) * mix(0.93, 1.07, nA) * mix(0.94, 1.06, nC);
     ao = mix(1.0, ao, 0.8);
     // east in Earth axes, into the camera frame the instance is placed in
     vec3 upE = normalize(mat3(gl_WorldToObjectEXT) * up);
@@ -337,6 +418,22 @@ vec3 groundMaterial(vec4 A, vec4 B, vec2 C, vec2 uvm, float elev, vec3 up, inout
     return alb;
 }
 
+
+// One ground scan's colour at uvm (metres), as groundMaterial reads it (hex-tiled near, plain far).
+vec3 scanColor(int l, vec2 uvm, float footprint, vec3 fallback) {
+    if ((floatBitsToUint(gg.params.w) & (1u << uint(l))) == 0u) return fallback;
+    float texel = GT / float(textureSize(groundTex[l * 3], 0).x);
+    float lod = max(log2(footprint / texel), 0.0);
+    vec3 c;
+    if (footprint < 4.0) {
+        Hex hx = hexTile(uvm / GT);
+        c = vec3(0.0);
+        for (int i = 0; i < 3; ++i) c += textureLod(groundTex[l * 3], hx.uv[i], lod).rgb * hx.w[i];
+    } else {
+        c = textureLod(groundTex[l * 3], uvm / GT, lod).rgb;
+    }
+    return c * GAIN[l];
+}
 
 // Land colour until the land-cover data arrives (milestone 3: ESA WorldCover + RESOLVE biomes):
 // a neutral stand-in from latitude and elevation only, so the relief can be judged.
@@ -443,15 +540,27 @@ void main() {
     // (inside the mapped water but above the level: by the height over the water)
     float shore = water ? 0.0 : smoothstep(band, band * 0.25, sd);
     int biome = int(biomeF + 0.5);
-    bool seaSide = elev < 4.0; // the water at this shore / over this bed is the sea
+    // the water at this shore / over this bed is the sea: low land with the ocean within ~15 km
+    // (ETOPO blurred: below sea level there). Low land alone is not enough: all of south Florida
+    // is under 4 m, and every pond in the Everglades got a beach.
+    bool seaSide = elev < 4.0 && elevAt(elevUV(upE), 3.0) < 0.5;
     if (water) {
         n = up;
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, biome, !lake, ao);
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 1.0, 0.0, 1.0, max(-elevAt(elevUV(upE), 0.0), 0.0), biome, !lake, ao);
     } else if (cover) {
-        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, biome, seaSide, ao);
-        // wet: right at the mapped water, and just above the water level along the contour
-        float damp = smoothstep(1.2 + 0.6 * nW0, 0.0, sd);
+        float coast = smoothstep(28.0 + 12.0 * nW0, 8.0, sd);
+        alb = groundMaterial(A, B, C.xy, uvm, elev, up, n, footprint, 0.0, shore, coast, 0.0, biome, seaSide, ao);
+        // wet: right at the mapped water, and just above the water level along the contour; on a
+        // sea beach the swash keeps a wider band of sand dark and wet
+        float damp = max(smoothstep(1.2 + 0.6 * nW0, 0.0, sd), seaSide ? 0.75 * smoothstep(4.5 + 3.0 * nW0, 0.6, sd) : 0.0);
         alb *= mix(1.0, 0.55, damp);
+        if (seaSide) {
+            // the wrack line: seaweed and driftwood left at the last high tide, a broken dark band
+            // a few metres up the beach (not where the trees stand)
+            float at = 7.5 + 4.0 * (fbmN(uvm * 0.05 + 9.0, 2) - 0.5);
+            float wr = smoothstep(1.4, 0.2, abs(sd - at)) * smoothstep(0.45, 0.7, fbmN(uvm * 0.7 + 3.0, 2)) * (1.0 - A.x);
+            alb = mix(alb, alb * vec3(0.42, 0.38, 0.30), wr * 0.85);
+        }
     } else {
         alb = landAlbedo(lat, elev, 1.0 - max(dot(n, up), 0.0));
     }
@@ -472,6 +581,77 @@ void main() {
         float canopy = A.x * 0.85 * (1.0 - kept);
         alb = mix(alb, vec3(0.040, 0.062, 0.024), canopy);
         ao = mix(ao, 0.55, canopy);
+    }
+    // Roads (roads.glsl): painted on the ground where OpenStreetMap has one. A road wins over
+    // mapped water (causeways, and bridges as far as the ground reaches): the 10 m land cover
+    // often has water where a narrow fill carries a road.
+    if (roadsOn() && footprint < 60.0) {
+        RoadHit rh;
+        vec2 rq = roadXY(p);
+        if (roadAt(rq, 3.5, rh)) {
+            vec3 asphalt = vec3(0.06);
+            if ((floatBitsToUint(gg.params.w) & (1u << uint(ASPHALT))) != 0u) {
+                float texel = GT / float(textureSize(groundTex[ASPHALT * 3], 0).x);
+                float lod = max(log2(footprint / texel), 0.0);
+                if (footprint < 4.0) {
+                    Hex hx = hexTile(uvm / GT);
+                    asphalt = vec3(0.0);
+                    for (int i = 0; i < 3; ++i) asphalt += textureLod(groundTex[ASPHALT * 3], hx.uv[i], lod).rgb * hx.w[i];
+                } else {
+                    asphalt = textureLod(groundTex[ASPHALT * 3], uvm / GT, lod).rgb;
+                }
+                // (the scan's texture at a worn asphalt's reflectance, ~6%: its own mean, the coarsest
+                // mip, taken out)
+                vec3 mean = textureLod(groundTex[ASPHALT * 3], vec2(0.5), 20.0).rgb;
+                asphalt *= 0.06 / max(dot(mean, vec3(0.2126, 0.7152, 0.0722)), 0.02);
+            }
+            float rcov, rpaint;
+            // (the centre line is yellow in the Americas, white elsewhere)
+            float lonE = degrees(atan(upE.y, upE.x));
+            vec3 rc = roadSurface(rh, rq, alb, asphalt, footprint, lonE > -170.0 && lonE < -30.0, rcov, rpaint);
+            if (water && rcov > 0.5) {
+                water = false;
+                lake = false;
+                depth = 0.0;
+                rcov = 1.0;
+            }
+            if (!water) {
+                // the verge: a strip of worn, packed ground along the seal (1-2 m), so a road has
+                // an edge against whatever it crosses
+                // The roadside, from the ground scans: a shoulder of crushed gravel against the
+                // seal, then packed dirt worn bare by tyres and mowing, of the place's own soil
+                // (sand on a coast, red clay in the tropics, pale arid soil where it is dry, dark
+                // mud where it is wet), in stretches of one or the other; grass creeps back in from
+                // outside in tongues, and the width changes along the road.
+                float out_ = -rh.edge; // metres outside the seal
+                if (out_ > 0.0 && footprint < 8.0) {
+                    float wob = fbmN(rq * 0.11 + 3.0, 2);
+                    float shoulderW = 0.5 + 0.9 * wob, dirtW = shoulderW + 0.5 + 1.6 * fbmN(rq * 0.07 + 9.0, 2);
+                    vec3 gravel = scanColor(7, uvm, footprint, vec3(0.16));
+                    gravel = mix(gravel, vec3(dot(gravel, vec3(0.33))), 0.6) * 0.8;
+                    int soilA = biome == 13 || biome == 12 ? 14 : (biome == 1 || biome == 2 || biome == 7) ? 15 : (biome == 9 || biome == 14) ? 20 : 14;
+                    int soilB = seaSide ? 12 : (biome == 13 ? 13 : 20);
+                    vec3 dirtA = scanColor(soilA, uvm, footprint, vec3(0.13, 0.10, 0.07));
+                    if (soilA == 14) dirtA = mix(dirtA, vec3(dot(dirtA, vec3(0.3, 0.59, 0.11))) * vec3(1.2, 0.97, 0.75), 0.55) * 0.8;
+                    vec3 dirtB = scanColor(soilB, uvm, footprint, vec3(0.20, 0.17, 0.12));
+                    // (a roadside's sand is trodden and dirty, not a beach's; its soil greyer than a field's)
+                    if (soilB == 12 || soilB == 13) dirtB = mix(dirtB, vec3(dot(dirtB, vec3(0.33))) * vec3(1.04, 1.0, 0.92), 0.4) * 0.5;
+                    dirtA = mix(dirtA, vec3(dot(dirtA, vec3(0.3, 0.59, 0.11))), 0.35) * 0.85;
+                    vec3 dirt = mix(dirtA, dirtB, smoothstep(0.4, 0.6, fbmN(rq * 0.025 + 31.0, 3)));
+                    dirt *= mix(0.75, 1.1, fbmN(rq * 0.9, 2));
+                    // (tyre marks pulled off the edge, darker and damp in places)
+                    dirt *= 1.0 - 0.3 * smoothstep(0.55, 0.8, fbmN(vec2(rh.along * 0.15, out_ * 1.5) + 5.0, 2));
+                    float ragged = (fbmN(rq * 0.6 + 2.0, 2) - 0.5) * 0.9;
+                    float inShoulder = 1.0 - smoothstep(shoulderW - 0.25, shoulderW + 0.15, out_ + ragged * 0.4);
+                    float inDirt = 1.0 - smoothstep(dirtW - 0.6, dirtW + 0.3, out_ + ragged);
+                    vec3 side = mix(dirt, gravel, inShoulder);
+                    alb = mix(alb, side, max(inDirt, inShoulder) * (1.0 - rcov) * smoothstep(8.0, 3.0, footprint));
+                }
+                alb = mix(alb, rc, rcov);
+                n = normalize(mix(n, up, 0.85 * rcov));
+                ao = mix(ao, 1.0, rcov);
+            }
+        }
     }
     uint dbg = uint(gg.params.z);
     if (dbg == 2u) alb = vec3(fract(elev / 500.0), clamp(elev / 5000.0, 0.0, 1.0), float(water));
