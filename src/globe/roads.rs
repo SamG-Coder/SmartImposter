@@ -53,8 +53,11 @@ pub const UNPAVED: u8 = 8;
 
 /// The map tiles asked for: zoom 10, ~40 km across.
 const TILE_Z: u32 = 10;
-/// Public Overpass servers: when one is at capacity (it says so often) the next is asked.
+/// Public Overpass servers. The first is the main one: often at capacity for a moment (it says
+/// so at once), but it answers. The mirrors are tried now and then (attempts 3 and 6 of every
+/// six), and given up on quickly: they are often down altogether.
 const API: [&str; 3] = ["https://overpass-api.de/api/interpreter", "https://overpass.private.coffee/api/interpreter", "https://overpass.kumi.systems/api/interpreter"];
+const ORDER: [usize; 6] = [0, 0, 1, 0, 0, 2];
 const FILTER: &str = "motorway|trunk|primary|secondary|tertiary|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link";
 
 #[derive(Clone)]
@@ -164,7 +167,7 @@ fn fetch(x: i32, y: i32, z: u32, server: usize) -> Option<Vec<Way>> {
     let (s, w, n, e) = tile_box(x, y, z);
     let query = format!("data=[out:json][timeout:120];way[\"highway\"~\"^({FILTER})$\"]({s:.6},{w:.6},{n:.6},{e:.6});out geom qt;");
     let out = std::process::Command::new("curl")
-        .args(["-s", "-m", "180", "-A", "SmartImposter-globe/0.1", "--data-urlencode", &query, API[server % API.len()]])
+        .args(["-s", "--connect-timeout", "8", "-m", if ORDER[server % ORDER.len()] == 0 { "120" } else { "40" }, "-A", "SmartImposter-globe/0.1", "--data-urlencode", &query, API[ORDER[server % ORDER.len()]]])
         .stdin(std::process::Stdio::null())
         .output()
         .ok()?;
@@ -353,7 +356,6 @@ impl Roads {
             .name("roads".into())
             .spawn(move || {
                 let mut loaded: HashMap<(u32, i32, i32), Arc<Vec<Way>>> = HashMap::new();
-                let mut failed: HashMap<(u32, i32, i32), Instant> = HashMap::new();
                 let mut cam: Option<DVec3> = None;
                 let mut built_at: Option<DVec3> = None;
                 let mut dirty = false;
@@ -414,7 +416,8 @@ impl Roads {
                     }
                     // then one missing tile from the network, the nearest (this takes its time)
                     let online = std::env::var("SI_ROADS").map(|v| v != "offline").unwrap_or(true);
-                    let next = want.iter().map(|(_, k)| *k).find(|k| !loaded.contains_key(k) && failed.get(k).is_none_or(|t| t.elapsed() > Duration::from_secs(20)));
+                    // (the nearest missing tile, again and again: it is the one under the camera)
+                    let next = want.iter().map(|(_, k)| *k).find(|k| !loaded.contains_key(k));
                     if let (true, Some(key)) = (online && Instant::now() >= wait_until, next) {
                         let t = Instant::now();
                         match fetch(key.1, key.2, key.0, server) {
@@ -427,10 +430,9 @@ impl Roads {
                             }
                             None => {
                                 println!("Roads: OpenStreetMap tile {}/{}/{} not received (trying again in {} s)", key.0, key.1, key.2, backoff.as_secs());
-                                failed.insert(key, Instant::now());
                                 server += 1;
                                 wait_until = Instant::now() + backoff;
-                                backoff = (backoff * 2).min(Duration::from_secs(120));
+                                backoff = (backoff * 2).min(Duration::from_secs(30));
                             }
                         }
                     }
