@@ -195,6 +195,10 @@ vec3 hazeColor(vec3 d) {
 // The forest scenes' volumetric clouds (clouds.glsl) over `col`, along from + dir * [0, t]
 // (`from` relative to the planet centre; t < 0: the ray went to the sky, and col is that sky).
 // The scene's own haze lies in front of them: far clouds fade into the sky behind them.
+// The share of the sunlight on an overcast sky's top that its base sends down as diffuse light,
+// per unit of mu0 (main(): the sky light of far land; set against the traced sky light).
+const float SKY_OVERCAST = 0.115;
+
 vec3 forestClouds(vec3 col, vec3 from, vec3 dir, float t, int steps, float jitter) {
     float tmax = t;
     if (t < 0.0) {
@@ -320,7 +324,11 @@ void main() {
         vec3 E = sunColor();
         vec3 gq = p - g.planet.xyz; // globe: position relative to the planet centre
         cFoot = pl.t * cloudPixAngle(); // (far ground: its cloud shadows from the blurred shapes)
-        if (globe()) E = vec3(g.sunDir.w) * extinction(lightDepth(gq, L)) * ((uint(g.params.x) & 32u) != 0u ? 1.0 : cloudShadow(gq, L, vec3(rnd(rng), rnd(rng), rnd(rng))));
+        vec3 Eclear = E; // the sun without the clouds' shadow
+        if (globe()) {
+            Eclear = vec3(g.sunDir.w) * extinction(lightDepth(gq, L));
+            E = Eclear * ((uint(g.params.x) & 32u) != 0u ? 1.0 : cloudShadow(gq, L, vec3(rnd(rng), rnd(rng), rnd(rng))));
+        }
         // (the forest scenes: the clouds' shadows drift over the land)
         float cloudSun = 1.0;
         if (!globe() && cloudsOn() && dbg == 0u) {
@@ -464,12 +472,26 @@ void main() {
             vec3 skyZ = atmosphere(gq, up, 1e30, L, g.sunDir.w, Tz);
             vec3 skyZ0 = skyZ;
             // under the clouds less sky light reaches the ground (an overcast sky is dimmer)
-            if (cloudsOn()) skyZ *= 1.0 - 0.45 * cloudCover(cloudEarth(gq));
+            float cFrac = 0.0;
+            if (cloudsOn()) {
+                float cov = cloudCover(cloudEarth(gq));
+                skyZ *= 1.0 - 0.45 * cov;
+                cFrac = pow(smoothstep(0.2, 0.5, cov), 1.4); // (the share of the sky that is cloud)
+            }
             skyUp = skyZ * PI;
             ground = skyUp * 0.25;
-            amb = skyZ * PI * (0.6 + 0.4 * dot(nDir, up));
-            // (water: its bed's light hardly shows; far land: the estimate above is as good there)
-            if (dbg == 0u && (profSkip & 4u) == 0u && (pl.flags & FLAG_WATER) == 0u && pl.t < 2500.0) {
+            // The sky's light without tracing it (far land, water): the clear dome (its mean is
+            // ~1.25 x the zenith: the horizon and the sun's surroundings are brighter) where the
+            // sky is clear, and where it is cloud the cloud base's own light: the sunlight the
+            // cloud passes down diffused (grey-white, and more than a blue sky gives: an overcast
+            // day's shade is brighter than a clear day's). As the traced light below averages:
+            // the land must not change tone where the tracing ends.
+            vec3 skyMean = mix(skyZ0 * 1.25, Eclear * max(dot(L, up), 0.0) * (SKY_OVERCAST / PI) + skyZ0 * 0.35, cFrac);
+            amb = skyMean * PI * (0.6 + 0.4 * dot(nDir, up));
+            vec3 ambFar = amb;
+            float traceW = 1.0 - smoothstep(1700.0, 2500.0, pl.t);
+            // (water: its bed's light hardly shows; far land: the estimate above)
+            if (dbg == 0u && (profSkip & 4u) == 0u && (pl.flags & FLAG_WATER) == 0u && traceW > 0.0) {
                 // Sky light, ray traced through the clouds: one cosine-weighted direction per
                 // pixel and frame (TAA / DLSS average them), E = PI L. What the ground sees there:
                 // the sky behind the clouds dimmed by them, plus the light they scatter. Under a
@@ -496,7 +518,7 @@ void main() {
                 // (the sky by the sun is many times the zenith's: kept from turning into speckle)
                 float cap = 6.0 * dot(skyZ0, vec3(0.2126, 0.7152, 0.0722)) + 1e-4;
                 Ls *= min(1.0, cap / max(dot(Ls, vec3(0.2126, 0.7152, 0.0722)), 1e-6));
-                amb = Ls * PI;
+                amb = mix(ambFar, Ls * PI, traceW);
             }
         }
         col = direct + alb * amb * ao;
